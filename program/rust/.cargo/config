@@ -1,0 +1,6 @@
+[build]
+target = "riscv64gc-unknown-linux-gnu"
+rustflags = ["-Ctarget-feature=+crt-static", "-C", "link-args=-Wl,--wrap=memcpy,--wrap=memset,--wrap=memmove,--wrap=memcmp,--wrap=strlen,--wrap=__memcmpeq"]
+
+[target.riscv64gc-unknown-linux-gnu]
+linker = "riscv64-linux-gnu-gcc-14"

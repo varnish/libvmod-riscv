@@ -1,0 +1,18 @@
+<MPD xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns="urn:mpeg:dash:schema:mpd:2011" xsi:schemaLocation="urn:mpeg:dash:schema:mpd:2011 DASH-MPD.xsd" type="dynamic" minimumUpdatePeriod="PT2S" timeShiftBufferDepth="PT30M" availabilityStartTime="2011-12-25T12:30:00" minBufferTime="PT4S" profiles="urn:mpeg:dash:profile:isoff-live:2011">
+  <BaseURL>http://cdn1.example.com/</BaseURL>
+  <BaseURL>http://cdn2.example.com/</BaseURL>
+  <Period id="1">
+    <!-- Video -->
+    <AdaptationSet mimeType="video/mp4" codecs="avc1.4D401F" frameRate="30000/1001" segmentAlignment="true" startWithSAP="1">
+      <BaseURL>video/</BaseURL>
+      <Representation id="video1" bandwidth="500000" width="640" height="360"/>
+	  <Representation id="video2" bandwidth="1000000" width="1280" height="720"/>
+	  <SegmentTemplate timescale="90000" media="video/seg_$Number$.m4s" initialization="video/init.m4s" startNumber="1">
+		<SegmentTimeline>
+		  <S t="0" d="4500000" r="3"/>
+		  <S d="4500000" r="1"/>
+		</SegmentTimeline>
+	  </SegmentTemplate>
+    </AdaptationSet>
+  </Period>
+</MPD>
