@@ -1,0 +1,12 @@
+[submodule "src/libriscv"]
+	path = src/libriscv
+	url = https://github.com/libriscv/libriscv.git
+[submodule "ext/json"]
+	path = ext/json
+	url = https://github.com/nlohmann/json.git
+[submodule "program/micro/ext/fmt"]
+	path = program/cpp/micro/ext/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "ext/tinyxml2"]
+	path = ext/tinyxml2
+	url = https://github.com/leethomason/tinyxml2.git

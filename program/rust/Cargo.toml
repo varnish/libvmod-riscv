@@ -1,0 +1,17 @@
+[package]
+name = "rusty"
+version = "0.1.0"
+authors = ["gonzo"]
+edition = "2021"
+
+[[bin]]
+name = "rusty"
+path = "src/main.rs"
+
+[dependencies]
+common-access-token = "0.2.6"
+
+[profile.release]
+lto=true
+opt-level=2
+#debug=true
