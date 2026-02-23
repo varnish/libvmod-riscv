@@ -28,7 +28,7 @@ void log(fmt::format_string<Args...> format, Args&&... args)
 {
 	strace("log(", args..., ")");
 	char buffer[4096];
-	const auto res = fmt::format_to_n(buffer, sizeof(buffer)-1, std::forward<Args> (args)...);
+	const auto res = fmt::format_to_n(buffer, sizeof(buffer)-1, format, std::forward<Args> (args)...);
 	const size_t len = res.size;
 	asm ("" ::: "memory"); // prevent dead-store optimization
 	syscall(ECALL_LOG, (long) buffer, len);

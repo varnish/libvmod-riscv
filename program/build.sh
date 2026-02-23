@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+export GCC_TRIPLE="riscv64-linux-gnu"
 source "detect_compiler.sh"
 
 mkdir -p $GCC_TRIPLE

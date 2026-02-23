@@ -79,7 +79,7 @@ function (add_micro_binary NAME)
 	target_link_libraries(${NAME} -Wl,--wrap=_memalign_r)
 	endif()
 	target_link_libraries(${NAME} -static -Wl,--whole-archive libc -Wl,--no-whole-archive)
-	target_link_libraries(${NAME} fmt nlohmann_json tinyxml2)
+	target_link_libraries(${NAME} fmt nlohmann_json tinyxml2 qjs m atomic)
 	# strip symbols but keep public API
 	if (STRIP_SYMBOLS AND NOT DEBUGGING)
 		add_custom_command(TARGET ${NAME} POST_BUILD

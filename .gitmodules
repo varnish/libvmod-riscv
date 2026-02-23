@@ -10,3 +10,9 @@
 [submodule "ext/tinyxml2"]
 	path = ext/tinyxml2
 	url = https://github.com/leethomason/tinyxml2.git
+[submodule "program/cpp/quickjs"]
+	path = program/cpp/micro/ext/quickjs
+	url = https://github.com/quickjs-ng/quickjs.git
+[submodule "program/cpp/micro/ext/quickjs"]
+	path = program/cpp/micro/ext/quickjs
+	url = https://github.com/fwsGonzo/quickjs-ng.git

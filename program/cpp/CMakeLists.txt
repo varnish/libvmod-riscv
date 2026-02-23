@@ -6,3 +6,5 @@ include(micro/micro.cmake)
 # Programs are built here
 
 add_micro_binary(basic basic.cpp)
+
+add_micro_binary(js js.cpp)
