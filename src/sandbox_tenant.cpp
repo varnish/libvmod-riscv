@@ -43,38 +43,43 @@ static std::string apply_dollar_vars(std::string str)
 SandboxTenant::SandboxTenant(VRT_CTX, const TenantConfig& conf)
 	: config{conf}
 {
+	(void) ctx;
+}
+
+void SandboxTenant::load(VRT_CTX)
+{
 	try {
-		std::string filename = conf.filename;
+		std::string filename = config.filename;
 		// Replace $vars in filename
 		filename = apply_dollar_vars(filename);
 		// If the filename ends with .cpp, build it first
-		if (conf.filename.size() > 4 &&
-		    conf.filename.substr(conf.filename.size() - 4) == ".cpp") {
-			auto code = file_loader(conf.filename);
+		if (config.filename.size() > 4 &&
+		    config.filename.substr(config.filename.size() - 4) == ".cpp") {
+			auto code = file_loader(config.filename);
 			auto bin = build_and_load(std::string(code.begin(), code.end()));
 			this->program =
 				std::make_shared<MachineInstance> (std::move(bin), ctx, this);
 			return;
 		}
 		// If the filename begins with "rust:", build it as a Rust project
-		if (conf.filename.size() > 5 &&
-		    conf.filename.substr(0, 5) == "rust:") {
-			std::string path = conf.filename.substr(5);
+		if (config.filename.size() > 5 &&
+		    config.filename.substr(0, 5) == "rust:") {
+			std::string path = config.filename.substr(5);
 			auto bin = build_and_load_rust(path);
 			this->program =
 				std::make_shared<MachineInstance> (std::move(bin), ctx, this);
 			return;
 		}
 		// Otherwise, load the file directly
-		auto elf = file_loader(conf.filename);
+		auto elf = file_loader(filename);
 		this->program =
 			std::make_shared<MachineInstance> (std::move(elf), ctx, this);
 	} catch (const std::exception& e) {
 		VSL(SLT_Error, 0,
-			"Exception when creating machine '%s': %s",
-			conf.name.c_str(), e.what());
+			"Exception when loading machine '%s': %s",
+			config.name.c_str(), e.what());
 		printf("Machine '%s' failed: %s\n",
-			conf.name.c_str(), e.what());
+			config.name.c_str(), e.what());
 		this->program = nullptr;
 	}
 }

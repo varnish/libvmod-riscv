@@ -23,7 +23,7 @@ void pause_for(const std::string&, int status = 403);
 PPT() void ban(Args&&... args);
 
 /* Hashing */
-void hash_data(const std::string& buffer);
+void hash_data(std::string_view buffer);
 void hash_data(const HeaderField&);
 
 /* Caching */
@@ -142,7 +142,8 @@ enum Callback {
 	CALLBACK_ON_RESUME_UPDATE,
 	CALLBACK_MAX
 };
-void set_on_deliver(void(*func)(Response));
+void set_on_deliver(void (*func)(Request, Response));
+void set_on_deliver(void (*func)(Request, Response, const char*));
 
 /*  */
 inline bool is_storage() {
@@ -163,6 +164,9 @@ inline bool is_debug() {
 
 extern "C" void sys_register_callback(int which, void(*func)());
 inline void set_on_deliver(void(*func)(Request, Response)) {
+	sys_register_callback(CALLBACK_ON_DELIVER, (void(*)())func);
+}
+inline void set_on_deliver(void(*func)(Request, Response, const char*)) {
 	sys_register_callback(CALLBACK_ON_DELIVER, (void(*)())func);
 }
 }

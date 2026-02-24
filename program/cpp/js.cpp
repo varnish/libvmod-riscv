@@ -120,11 +120,11 @@ static JSValue hdr_set(JSContext* ctx, api::gethdr_e where,
 {
     if (argc < 1)
         return JS_UNDEFINED;
-    const char* line = JS_ToCString(ctx, argv[0]);
+	size_t len;
+    const char* line = JS_ToCStringLen(ctx, &len, argv[0]);
     if (!line)
         return JS_EXCEPTION;
-    api::HTTP http{where};
-    http.append(line);
+    api::HTTP{where}.append({line, len});
     JS_FreeCString(ctx, line);
     return JS_UNDEFINED;
 }
@@ -245,10 +245,11 @@ static JSValue js_hash_data(JSContext* ctx, JSValueConst, int argc, JSValueConst
 {
     if (argc < 1)
         return JS_UNDEFINED;
-    const char* s = JS_ToCString(ctx, argv[0]);
-    if (!s)
+    size_t len;
+	const char *s = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (!s)
         return JS_EXCEPTION;
-    varnish::hash_data(std::string(s));
+    varnish::hash_data({s, len});
     JS_FreeCString(ctx, s);
     return JS_UNDEFINED;
 }
@@ -324,6 +325,7 @@ static void setup_quickjs(const char* js_code)
     JS_FreeValue(g_ctx, vns);
 
     /* Evaluate the user-supplied JS program */
+	varnish::print("Evaluating JS program:\n{}\n", js_code);
     JSValue result = JS_Eval(g_ctx, js_code, strlen(js_code),
                              "<script>", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(result)) {
@@ -341,7 +343,7 @@ static void setup_quickjs(const char* js_code)
 // C++ callbacks: extract primitive args and call into JS
 // ---------------------------------------------------------------------------
 
-static void on_recv(varnish::Request req)
+static void on_recv(varnish::Request req, varnish::Response, const char* arg)
 {
     if (!JS_IsFunction(g_ctx, g_hooks.on_recv))
         return;
@@ -387,13 +389,14 @@ static void on_deliver(varnish::Request req, varnish::Response resp)
 // Entry point
 // ---------------------------------------------------------------------------
 
-int main(int, char** argv)
+int main(int argc, char** argv)
 {
     varnish::print("{} main entered{}\n",
         varnish::is_storage() ? "Storage" : "Request",
         varnish::is_debug()   ? " (debug)" : "");
 
-    setup_quickjs(argv[1]);
+	// JavaScript code is in the last argument
+    setup_quickjs(argv[argc - 1]);
 
     varnish::set_on_deliver(on_deliver);
     varnish::wait_for_requests(on_recv);

@@ -11,6 +11,7 @@ struct SandboxTenant
 	using ghandler_t = std::function<void(Script&)>;
 
 	Script* vmfork(const vrt_ctx*, bool debug);
+	void load(const vrt_ctx*);
 	bool no_program_loaded() const noexcept { return this->program == nullptr; }
 
 	SandboxTenant(const vrt_ctx*, const TenantConfig&);

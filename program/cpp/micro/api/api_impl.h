@@ -42,6 +42,14 @@ inline void wait_for_requests(void(*on_recv)(Request))
 
 	asm volatile ("ecall" : : "r"(a0), "r"(a1), "m"(*a0), "r"(syscall_id) : "memory");
 }
+inline void wait_for_requests(void(*on_recv)(Request, Response, const char*))
+{
+	register void (*a0)() asm("a0") = (void(*)())on_recv;
+	register long a1 asm("a1") = 0; // We already set fast exit
+	register long syscall_id asm("a7") = ECALL_SET_DECISION;
+
+	asm volatile ("ecall" : : "r"(a0), "r"(a1), "m"(*a0), "r"(syscall_id) : "memory");
+}
 
 inline void sys_register_callback(Callback idx, void(*cb)())
 {
@@ -140,7 +148,7 @@ PPT() inline void ban(fmt::format_string<Args...> format, Args&&... args)
 	syscall(ECALL_BAN, (long) buffer, len);
 }
 
-inline void hash_data(const std::string& buffer)
+inline void hash_data(std::string_view buffer)
 {
 	strace("hash_data(", buffer, ")");
 	const size_t size = buffer.size();

@@ -146,3 +146,26 @@ void init_tenants_file(VRT_CTX, const char* filename)
 	const auto json = rvs::file_loader(filename);
 	rvs::init_tenants(ctx, json, filename);
 }
+
+extern "C"
+void finalize_tenants_impl(VRT_CTX)
+{
+	for (auto& [hash, tenant] : rvs::tenants(ctx)) {
+		if (tenant->no_program_loaded()) {
+			tenant->load(ctx);
+		}
+	}
+}
+
+extern "C"
+void tenant_append_main_argument(VRT_CTX, const char* tenant, const char* arg)
+{
+	auto t = tenant_find(ctx, tenant, strlen(tenant));
+	if (t) {
+		t->config.group.argv.push_back(arg);
+	} else {
+		VSL(SLT_Error, 0,
+			"Attempted to add main argument to non-existent tenant '%s'",
+			tenant);
+	}
+}

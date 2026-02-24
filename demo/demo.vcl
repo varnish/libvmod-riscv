@@ -9,13 +9,13 @@ backend default {
 }
 
 sub vcl_recv {
-	riscv.fork("rusty.com");
-	if (req.url != "/cat" && req.url != "/verify") {
-		/* Verify request signature, decoded from base64 */
-		if (!riscv.call("verify_signature", req.http.X-Signature)) {
-			return (synth(403, "Forbidden: Invalid Signature"));
-		}
-	}
+	//riscv.fork("qjs.com");
+	//if (req.url != "/cat" && req.url != "/verify") {
+	//	/* Verify request signature, decoded from base64 */
+	//	if (!riscv.call("verify_signature", req.http.X-Signature)) {
+	//		return (synth(403, "Forbidden: Invalid Signature"));
+	//	}
+	//}
 
 	/* Select a tenant to handle this request */
 	riscv.fork(req.http.Host);
@@ -71,9 +71,23 @@ sub vcl_init {
 			"filename": "/home/gonzo/github/libvmod-riscv/program/cpp/basic.cpp",
 			"arguments": ["Hello from RISC-V!"]
 		},
+		"qjs.com": {
+			"filename": "/home/gonzo/github/libvmod-riscv/program/cpp/js.cpp",
+			"arguments": ["Hello from QuickJS on RISC-V!"]
+		},
 		"rusty.com": {
 			"filename": "rust:/home/gonzo/github/libvmod-riscv/program/rust",
 			"arguments": ["Hello from Rust on RISC-V!"]
 		}
 	}""");
+	riscv.add_main_argument("qjs.com",
+		"""
+		function on_recv(url, method) {
+			return "pass";
+		}
+		function on_deliver(url, status) {
+			varnish.respSet("X-Handled-By: RISC-V JS");
+		}
+		""");
+	riscv.finalize_tenants();
 }

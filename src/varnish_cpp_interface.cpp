@@ -59,7 +59,7 @@ int  riscv_apply_hash(rvs::Script* script)
 }
 
 extern "C"
-long riscv_call_idx(rvs::Script* script, VRT_CTX, vcall_info info)
+long riscv_call_idx(rvs::Script* script, VRT_CTX, vcall_info info, const char* argument)
 {
 	using namespace rvs;
 
@@ -77,8 +77,9 @@ long riscv_call_idx(rvs::Script* script, VRT_CTX, vcall_info info)
 		TIMING_LOCATION(t1);
 	#endif
 		// VRT ctx can easily change even on the same request due to waitlist
+		argument = argument ? argument : "";
 		script->set_ctx(ctx);
-		int ret = script->call(addr, (int) info.arg1, (int) info.arg2);
+		int ret = script->call(addr, (int)info.arg1, (int)info.arg2, argument);
 	#ifdef ENABLE_TIMING
 		TIMING_LOCATION(t2);
 		timing_vmcall.add(t1, t2);

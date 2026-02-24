@@ -11,12 +11,14 @@
 
 extern void init_tenants_str(VRT_CTX, const char*);
 extern void init_tenants_file(VRT_CTX, const char*);
+extern void finalize_tenants_impl(VRT_CTX);
+extern void tenant_append_main_argument(VRT_CTX, const char*, const char*);
 
 extern void* riscv_fork(VRT_CTX, const char* ten, size_t tenlen, int dbg);
 // Functions operating on a machine already forked, which
 // is accessible through a priv_task.
 extern const char* riscv_current_call(VRT_CTX, const char*, const char*);
-extern long riscv_current_call_idx(VRT_CTX, vcall_info);
+extern long riscv_current_call_idx(VRT_CTX, vcall_info, const char*);
 extern long riscv_current_resume(VRT_CTX);
 extern const char* riscv_current_name(VRT_CTX);
 extern const char* riscv_current_group(VRT_CTX);
@@ -52,12 +54,27 @@ VCL_VOID vmod_embed_tenants(VRT_CTX, VCL_STRING str)
 
 	init_tenants_str(ctx, str);
 }
+/* Finalize tenant loading: actually instantiate all VM programs.
+   Call after embed_tenants/load_tenants and any add_main_argument calls. */
+VCL_VOID vmod_finalize_tenants(VRT_CTX)
+{
+	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+
+	finalize_tenants_impl(ctx);
+}
 /* Load tenant information from a JSON file */
 VCL_VOID vmod_load_tenants(VRT_CTX, VCL_STRING filename)
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
 	init_tenants_file(ctx, filename);
+}
+/* Append to a tenants main function arguments. */
+VCL_VOID vmod_add_main_argument(VRT_CTX, VCL_STRING tenant, VCL_STRING arg)
+{
+	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+
+	tenant_append_main_argument(ctx, tenant, arg);
 }
 
 /* Fork into a new VM. The VM is freed when the
@@ -80,9 +97,9 @@ VCL_INT vmod_vcall(VRT_CTX, VCL_ENUM e)
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
-	return riscv_current_call_idx(ctx, enum_to_idx(e));
+	return riscv_current_call_idx(ctx, enum_to_idx(e), NULL);
 }
-VCL_INT vmod_run(VRT_CTX)
+VCL_INT vmod_run(VRT_CTX, VCL_STRING arg)
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
@@ -111,7 +128,7 @@ VCL_INT vmod_run(VRT_CTX)
 		return -1;
 	}
 
-	return riscv_current_call_idx(ctx, enum_to_idx(e));
+	return riscv_current_call_idx(ctx, enum_to_idx(e), arg);
 }
 VCL_STRING vmod_call(VRT_CTX, VCL_STRING function, VCL_STRING arg)
 {

@@ -66,6 +66,17 @@ $Function VOID embed_tenants(STRING json)
 
 - Load tenants directly from embedded JSON. See below.
 
+$Function VOID add_main_argument(STRING tenant, STRING arg)
+
+- Appends to a tenants main arguments
+- Supports multi-line strings in VCL
+
+$Function VOID finalize_tenants()
+
+- Finalize tenant loading by instantiating all VM programs.
+- Must be called after embed_tenants/load_tenants and any
+  add_main_argument calls, at the end of vcl_init.
+
 $Function VOID load_tenants(STRING json_filepath)
 
 - Load tenants from a JSON file in this format:
@@ -124,7 +135,7 @@ $Function INT     vcall(ENUM {
   (starting at zero), in the currently active machine.
   Req/resp HTTP index arguments are added to the call.
 
-$Function INT     run()
+$Function INT     run(STRING arg = 0)
 
 - Runs a function in the tenants program that depends on the current VCL state.
   eg. if in vcl_synth, vcall(ON_SYNTH) will be called.

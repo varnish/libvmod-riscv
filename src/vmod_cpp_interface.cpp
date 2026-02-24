@@ -3,7 +3,7 @@
 extern "C" {
 #include "update_result.h"
 }
-extern "C" long riscv_call_idx(rvs::Script*, VRT_CTX, vcall_info);
+extern "C" long riscv_call_idx(rvs::Script*, VRT_CTX, vcall_info, const char*);
 
 //#define ENABLE_TIMING
 #ifdef ENABLE_TIMING
@@ -43,13 +43,13 @@ const rvs::SandboxTenant* riscv_current_machine(VRT_CTX)
 }
 
 extern "C"
-long riscv_current_call_idx(VRT_CTX, vcall_info info)
+long riscv_current_call_idx(VRT_CTX, vcall_info info, const char* argument)
 {
 	using namespace rvs;
 
 	auto* script = get_machine(ctx);
 	if (script) {
-		return riscv_call_idx(script, ctx, info);
+		return riscv_call_idx(script, ctx, info, argument);
 	}
 	VRT_fail(ctx, "current_call_idx() failed (no running machine)");
 	return -1;
