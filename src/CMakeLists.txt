@@ -44,4 +44,15 @@ add_vmod_tests(vmod_riscv vmod_riscv
 	tests/faulty_loop.vtc
 	tests/hello_backend_world.vtc
 	tests/hello_synth_world.vtc
+	tests/js_synth_basic.vtc
+	tests/js_url_routing.vtc
+	tests/js_recv_headers.vtc
+	tests/js_varnish_decision.vtc
+	tests/js_deliver_headers.vtc
+	tests/js_method_routing.vtc
+	tests/js_recv_get_header.vtc
+	tests/js_varnish_helpers.vtc
+	tests/js_header_case_insensitive.vtc
+	tests/js_header_edge_cases.vtc
+	tests/js_resp_setstatus.vtc
 )

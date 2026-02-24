@@ -1,0 +1,94 @@
+varnishtest "QuickJS - varnish.log, varnish.print, varnish.hashData don't crash"
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/js"
+			}
+		}""");
+		riscv.add_main_argument("test.com", """
+function on_recv(req) {
+	varnish.log("Processing: " + req.url);
+	varnish.print("Method: " + req.method + " URL: " + req.url + "\n");
+	varnish.hashData(req.url);
+	varnish.hashData(req.method);
+	varnish.hashData(req.get("Host") || "");
+	varnish.hashData(req.get("X-Tenant") || "none");
+	return ["synth", 200];
+}
+""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(500));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	# Round 1 - various URLs and methods exercise the helpers
+	txreq -url "/test" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/other" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/api/v1" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/health" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/with-tenant" -hdr "Host: test.com" -hdr "X-Tenant: acme"
+	rxresp
+	expect resp.status == 200
+
+	# Round 2 - repeat to verify no state corruption from hashData
+	txreq -url "/test" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/other" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/api/v1" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	# Round 3
+	txreq -url "/health" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/with-tenant" -hdr "Host: test.com" -hdr "X-Tenant: beta"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/test" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -run

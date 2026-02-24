@@ -1,0 +1,126 @@
+varnishtest "QuickJS - URL routing with multiple paths"
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/js"
+			}
+		}""");
+		riscv.add_main_argument("test.com", """
+function on_recv(req) {
+	var url = req.url;
+	if (url == "/ok")           return ["synth", 200];
+	if (url == "/created")      return ["synth", 201];
+	if (url == "/accepted")     return ["synth", 202];
+	if (url == "/no-content")   return ["synth", 204];
+	if (url == "/not-found")    return ["synth", 404];
+	if (url == "/forbidden")    return ["synth", 403];
+	if (url == "/error")        return ["synth", 500];
+	if (url == "/unavailable")  return ["synth", 503];
+	return ["synth", 400];
+}
+""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(500));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	# Round 1 - success codes
+	txreq -url "/ok" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/created" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 201
+
+	txreq -url "/accepted" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 202
+
+	txreq -url "/no-content" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 204
+
+	# Round 1 - error codes
+	txreq -url "/not-found" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 404
+
+	txreq -url "/forbidden" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 403
+
+	txreq -url "/error" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 500
+
+	txreq -url "/unavailable" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 503
+
+	txreq -url "/unknown" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 400
+
+	# Round 2 - repeat all to check consistency
+	txreq -url "/ok" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/not-found" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 404
+
+	txreq -url "/forbidden" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 403
+
+	txreq -url "/error" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 500
+
+	txreq -url "/unknown" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 400
+
+	# Round 3
+	txreq -url "/created" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 201
+
+	txreq -url "/no-content" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 204
+
+	txreq -url "/unavailable" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 503
+
+	txreq -url "/ok" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -run

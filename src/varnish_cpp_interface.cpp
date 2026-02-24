@@ -79,6 +79,10 @@ long riscv_call_idx(rvs::Script* script, VRT_CTX, vcall_info info, const char* a
 		// VRT ctx can easily change even on the same request due to waitlist
 		argument = argument ? argument : "";
 		script->set_ctx(ctx);
+		VSLb(ctx->vsl, SLT_VCL_Log,
+			"[%s] VM call '%s' (idx=%d) invoked, argument: '%s'",
+			script->name().c_str(),
+			callback_names.at(info.idx), info.idx, argument);
 		int ret = script->call(addr, (int)info.arg1, (int)info.arg2, argument);
 	#ifdef ENABLE_TIMING
 		TIMING_LOCATION(t2);

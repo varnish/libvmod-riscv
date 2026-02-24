@@ -1,0 +1,91 @@
+varnishtest "QuickJS - Basic synth response"
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/js"
+			}
+		}""");
+		riscv.add_main_argument("test.com", """
+function on_recv(req) {
+	if (req.url == "/")        return ["synth", 200];
+	if (req.url == "/health")  return ["synth", 200];
+	if (req.url == "/api")     return ["synth", 200];
+	return ["synth", 404];
+}
+""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(500));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	# Round 1
+	txreq -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/health" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/api" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/other" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 404
+
+	txreq -url "/nope" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 404
+
+	# Round 2 - repeat to exercise repeated forking
+	txreq -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/health" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/other" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 404
+
+	# Round 3
+	txreq -url "/api" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/missing" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 404
+} -run

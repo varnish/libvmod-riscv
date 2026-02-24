@@ -43,7 +43,7 @@ Script::Script(
 	const SandboxTenant* ten, MachineInstance& inst)
 	: m_machine(source.machine(), {
 		.memory_max = 0,
-		.minimal_fork = true,
+		.minimal_fork = false,
 		.use_memory_arena = false,
 	  }),
 	  m_parent(&source.machine()),
@@ -60,7 +60,9 @@ Script::Script(
 	this->machine_setup(machine(), false);
 
 	/* Transfer allocations from the source machine, to fully replicate heap */
-	machine().transfer_arena_from(source.machine());
+	if (source.machine().has_arena()) {
+		machine().transfer_arena_from(source.machine());
+	}
 	/* Load the compiled regexes of the source */
 	m_regex.loan_from(source.m_regex);
 	/* Load the directors of the source */
@@ -146,6 +148,7 @@ void Script::machine_initialize()
 		handle_exception(machine().cpu.pc());
 		throw;
 	}
+	return;
 	// For each entry point, try to optimize the return path
 	for (auto& entry : m_inst.callback_entries) {
 		if (entry != 0) {
@@ -227,17 +230,17 @@ void Script::machine_setup(machine_t& machine, bool init)
 				riscv::OUT_OF_MEMORY, "Out of memory (max_memory limit reached)",
 					pageno * riscv::Page::size());
 		});
-		machine.memory.set_page_readf_handler(
-		[] (const riscv::Memory<MARCH>& mem, gaddr_t pageno) -> const riscv::Page& {
-			//printf("Reading page %zu @ 0x%lX\n", pageno, long(pageno * 4096u));
-			Script& script = *mem.machine().template get_userdata<Script>();
-			const riscv::Page& foreign_page = script.m_parent->memory.get_pageno(pageno);
-			// Install the page as a non-owning, COW page
-			riscv::PageAttributes attr = foreign_page.attr;
-			attr.non_owning = true;
-			attr.is_cow = true;
-			return const_cast<riscv::Memory<MARCH>&>(mem).allocate_page(pageno, attr, foreign_page.page());
-		});
+		//machine.memory.set_page_readf_handler(
+		//[] (const riscv::Memory<MARCH>& mem, gaddr_t pageno) -> const riscv::Page& {
+		//	//printf("Reading page %zu @ 0x%lX\n", pageno, long(pageno * 4096u));
+		//	Script& script = *mem.machine().template get_userdata<Script>();
+		//	const riscv::Page& foreign_page = script.m_parent->memory.get_pageno(pageno);
+		//	// Install the page as a non-owning, COW page
+		//	riscv::PageAttributes attr = foreign_page.attr;
+		//	attr.non_owning = true;
+		//	attr.is_cow = true;
+		//	return const_cast<riscv::Memory<MARCH>&>(mem).allocate_page(pageno, attr, foreign_page.page());
+		//});
 	}
 	else {
 		machine.memory.set_page_fault_handler(

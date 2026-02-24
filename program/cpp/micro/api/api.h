@@ -15,9 +15,9 @@ PPT() void print(fmt::format_string<Args...> format, Args&&... args);
 PPT() void log(fmt::format_string<Args...> format, Args&&... args);
 
 /* Make a VCL decision, such as "lookup" */
-void decision(const std::string&, int status = 403);
+void decision(std::string_view, int status = 403);
 /* Make a VCL decision, then pause machine (for synth) */
-void pause_for(const std::string&, int status = 403);
+void pause_for(std::string_view, int status = 403);
 
 /* Bans */
 PPT() void ban(Args&&... args);

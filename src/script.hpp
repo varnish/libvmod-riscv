@@ -146,8 +146,6 @@ template <typename... Args>
 inline long Script::call(gaddr_t address, Args&&... args)
 {
 	try {
-		// reset the stack pointer to an initial location (deliberately)
-		machine().cpu.reset_stack_pointer();
 		// setup calling convention
 		machine().setup_call(std::forward<Args>(args)...);
 		// GDB debugger attachment

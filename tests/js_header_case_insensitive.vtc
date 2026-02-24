@@ -1,0 +1,94 @@
+varnishtest "QuickJS - req.get() is case-insensitive"
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/js"
+			}
+		}""");
+		riscv.add_main_argument("test.com", """
+function on_recv(req) {
+	/* req.get() must be case-insensitive per HTTP spec */
+	var url = req.url;
+
+	if (url == "/exact") {
+		/* Read header with the exact case it was sent */
+		var v = req.get("X-Mixed-Case");
+		req.set("X-Result: " + (v === null ? "null" : v));
+	} else if (url == "/lower") {
+		/* Lookup with all-lower case */
+		var v = req.get("x-mixed-case");
+		req.set("X-Result: " + (v === null ? "null" : v));
+	} else if (url == "/upper") {
+		/* Lookup with all-upper case */
+		var v = req.get("X-MIXED-CASE");
+		req.set("X-Result: " + (v === null ? "null" : v));
+	}
+	return ["synth", 200];
+}
+""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(500));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			if (req.http.X-Result) {
+				set resp.http.X-Result = req.http.X-Result;
+			}
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	# Round 1: exact case matches
+	txreq -url "/exact" -hdr "Host: test.com" -hdr "X-Mixed-Case: hello"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "hello"
+
+	# Round 1: lowercase lookup finds mixed-case header
+	txreq -url "/lower" -hdr "Host: test.com" -hdr "X-Mixed-Case: hello"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "hello"
+
+	# Round 1: uppercase lookup finds mixed-case header
+	txreq -url "/upper" -hdr "Host: test.com" -hdr "X-Mixed-Case: hello"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "hello"
+
+	# Round 2: different header value, still case-insensitive
+	txreq -url "/exact" -hdr "Host: test.com" -hdr "X-Mixed-Case: world"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "world"
+
+	txreq -url "/lower" -hdr "Host: test.com" -hdr "X-Mixed-Case: world"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "world"
+
+	txreq -url "/upper" -hdr "Host: test.com" -hdr "X-Mixed-Case: world"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "world"
+} -run

@@ -51,6 +51,7 @@ varnish v1 -vcl+backend {
 				"group": "test"
 			}
 		}""");
+		riscv.finalize_tenants();
 	}
 
 	sub vcl_recv {

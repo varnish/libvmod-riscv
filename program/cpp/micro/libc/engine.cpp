@@ -13,7 +13,10 @@ __attribute__((noinline)) void halt()
 
 asm(".pushsection .text, \"ax\", @progbits\n");
 GENERATE_SYSCALL_WRAPPER(sys_register_callback, ECALL_REGISTER_CB);
+GENERATE_SYSCALL_WRAPPER(sys_field_retrieve,    ECALL_FIELD_RETRIEVE);
 GENERATE_SYSCALL_WRAPPER(sys_field_retrieve_str, ECALL_FIELD_RETRIEVE_STR);
+GENERATE_SYSCALL_WRAPPER(sys_field_set,         ECALL_FIELD_SET);
+GENERATE_SYSCALL_WRAPPER(sys_field_append,      ECALL_FIELD_APPEND);
 asm(".popsection\n");
 
 extern "C" __attribute__((noinline))

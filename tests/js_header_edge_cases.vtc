@@ -1,0 +1,171 @@
+varnishtest "QuickJS - Header edge cases: empty values, no-space format, unset semantics, duplicate append"
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/js"
+			}
+		}""");
+		riscv.add_main_argument("test.com", """
+function on_recv(req) {
+	var url = req.url;
+
+	if (url == "/empty-value") {
+		/* Set a header with empty value (colon-space, nothing after) */
+		req.set("X-Empty: ");
+		var v = req.get("X-Empty");
+		/* v is "" (empty string), not null — header exists, value is empty */
+		if (v === null)         req.set("X-Result: null");
+		else if (v === "")      req.set("X-Result: empty-string");
+		else                    req.set("X-Result: " + v);
+
+	} else if (url == "/no-space-colon") {
+		/* Missing space after colon: "Name:Value" instead of "Name: Value".
+		   The host-side value() function looks for ": " (colon+space).
+		   Header IS findable (http_findhdr only checks for ':'), but
+		   value() returns "" because the ": " separator is absent. */
+		req.set("X-Nsp:hidden");
+		var v = req.get("X-Nsp");
+		/* v is "" (empty string), not null and not "hidden" */
+		if (v === null)         req.set("X-Result: null");
+		else if (v === "")      req.set("X-Result: empty-string");
+		else if (v === "hidden") req.set("X-Result: leaked");
+		else                    req.set("X-Result: other:" + v);
+
+	} else if (url == "/unset-nonexistent") {
+		/* Unset a header that was never set — must be a safe no-op */
+		req.unset("X-Does-Not-Exist");
+		req.unset("X-Also-Gone");
+		req.set("X-Result: ok");
+
+	} else if (url == "/set-then-unset") {
+		/* Set a header, then immediately unset it.
+		   Subsequent get must return null. */
+		req.set("X-Temp: temporary");
+		req.unset("X-Temp");
+		var v = req.get("X-Temp");
+		if (v === null) req.set("X-Result: null");
+		else            req.set("X-Result: still-there");
+
+	} else if (url == "/duplicate-append") {
+		/* req.set() always appends — it never overwrites.
+		   Setting the same header twice creates two entries.
+		   req.get() returns the first match. */
+		req.set("X-Dup: first");
+		req.set("X-Dup: second");
+		var v1 = req.get("X-Dup");          /* "first" */
+		req.unset("X-Dup");                 /* removes first entry */
+		var v2 = req.get("X-Dup");          /* "second" is now first */
+		req.set("X-Result: " + v1 + "/" + v2);
+
+	} else if (url == "/client-header-unset") {
+		/* Unset a header the client sent, then verify it's gone */
+		req.unset("X-Client-Sent");
+		var v = req.get("X-Client-Sent");
+		if (v === null) req.set("X-Result: null");
+		else            req.set("X-Result: still:" + v);
+	}
+
+	return ["synth", 200];
+}
+""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(500));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			if (req.http.X-Result) {
+				set resp.http.X-Result = req.http.X-Result;
+			}
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	# Empty value: header exists but value is ""
+	txreq -url "/empty-value" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "empty-string"
+
+	# No space after colon: header is findable but value() returns "" not "hidden"
+	txreq -url "/no-space-colon" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "empty-string"
+
+	# Unset of non-existent headers is a safe no-op
+	txreq -url "/unset-nonexistent" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "ok"
+
+	# Set then unset: get returns null
+	txreq -url "/set-then-unset" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "null"
+
+	# Duplicate append semantics: get returns first, unset exposes second
+	txreq -url "/duplicate-append" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "first/second"
+
+	# Unset a client-sent header
+	txreq -url "/client-header-unset" -hdr "Host: test.com" \
+		-hdr "X-Client-Sent: client-value"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "null"
+
+	# Round 2 - repeat all cases for stability
+	txreq -url "/empty-value" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "empty-string"
+
+	txreq -url "/no-space-colon" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "empty-string"
+
+	txreq -url "/unset-nonexistent" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "ok"
+
+	txreq -url "/set-then-unset" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "null"
+
+	txreq -url "/duplicate-append" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "first/second"
+
+	txreq -url "/client-header-unset" -hdr "Host: test.com" \
+		-hdr "X-Client-Sent: other-value"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Result == "null"
+} -run

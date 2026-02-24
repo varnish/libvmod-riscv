@@ -4,7 +4,7 @@
 
 namespace rvs {
 struct TenantGroup {
-	uint64_t max_instructions  = 2'500'000ull;
+	uint64_t max_instructions  = 20'000'000ull;
 	uint32_t max_memory_mb     = 32; // 32MB
 	uint32_t max_heap_mb       = 512; // 512MB
 	size_t   max_backends = 8;

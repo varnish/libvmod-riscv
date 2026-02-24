@@ -1,0 +1,109 @@
+varnishtest "QuickJS - on_deliver sets response headers"
+
+server s1 {
+	rxreq
+	txresp -hdr "X-From-Backend: yes" -body "Hello from backend"
+	rxreq
+	txresp -hdr "X-From-Backend: yes" -body "Page two body"
+	rxreq
+	txresp -hdr "X-From-Backend: yes" -body "Page three body"
+	rxreq
+	txresp -hdr "X-From-Backend: yes" -body "Round two"
+	rxreq
+	txresp -hdr "X-From-Backend: yes" -body "Round two b"
+	rxreq
+	txresp -hdr "X-From-Backend: yes" -body "Round three"
+} -start
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default {
+		.host = "${s1_addr}";
+		.port = "${s1_port}";
+	}
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/js"
+			}
+		}""");
+		riscv.add_main_argument("test.com", """
+function on_recv(req) {
+	return "pass";
+}
+function on_deliver(req, resp) {
+	resp.set("X-Delivered-By: QuickJS");
+	resp.set("X-Request-URL: " + req.url);
+	resp.set("X-Method: " + req.method);
+}
+""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "pass") {
+			return (pass);
+		}
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(500));
+	}
+
+	sub vcl_deliver {
+		if (riscv.active()) {
+			riscv.run();
+		}
+	}
+} -start
+
+client c1 {
+	# Round 1 - different URLs, verify URL is reflected
+	txreq -url "/check" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Delivered-By == "QuickJS"
+	expect resp.http.X-Request-URL  == "/check"
+	expect resp.http.X-Method       == "GET"
+
+	txreq -url "/page2" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Delivered-By == "QuickJS"
+	expect resp.http.X-Request-URL  == "/page2"
+	expect resp.http.X-Method       == "GET"
+
+	txreq -url "/api/v1/status" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Delivered-By == "QuickJS"
+	expect resp.http.X-Request-URL  == "/api/v1/status"
+	expect resp.http.X-Method       == "GET"
+
+	# Round 2 - repeat to verify stability
+	txreq -url "/check" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Delivered-By == "QuickJS"
+	expect resp.http.X-Request-URL  == "/check"
+
+	txreq -url "/page2" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Delivered-By == "QuickJS"
+	expect resp.http.X-Request-URL  == "/page2"
+
+	# Round 3
+	txreq -url "/final" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Delivered-By == "QuickJS"
+	expect resp.http.X-Request-URL  == "/final"
+} -run

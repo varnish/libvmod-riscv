@@ -1,0 +1,114 @@
+varnishtest "QuickJS - Request header manipulation in on_recv"
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/js"
+			}
+		}""");
+		riscv.add_main_argument("test.com", """
+function on_recv(req) {
+	/* req.get() reads an existing header */
+	var input = req.get("X-Input");
+	if (input !== null) {
+		req.set("X-Processed: " + input + "-processed");
+	}
+	/* req.set() adds a new header */
+	req.set("X-JS-Added: yes");
+	/* req.unset() removes a header */
+	req.unset("X-Remove-Me");
+	return ["synth", 200];
+}
+""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(500));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			/* Reflect the headers JS set/unset so the client can verify them */
+			if (req.http.X-Processed) {
+				set resp.http.X-Processed = req.http.X-Processed;
+			}
+			set resp.http.X-JS-Added  = req.http.X-JS-Added;
+			if (req.http.X-Remove-Me) {
+				set resp.http.X-Remove-Me = req.http.X-Remove-Me;
+			}
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	# Case 1: header present and removed
+	txreq -url "/" -hdr "Host: test.com" \
+		-hdr "X-Input: hello" \
+		-hdr "X-Remove-Me: original"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Processed == "hello-processed"
+	expect resp.http.X-JS-Added  == "yes"
+	expect resp.http.X-Remove-Me == <undef>
+
+	# Case 2: different X-Input value
+	txreq -url "/page2" -hdr "Host: test.com" \
+		-hdr "X-Input: world" \
+		-hdr "X-Remove-Me: delete-this"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Processed == "world-processed"
+	expect resp.http.X-JS-Added  == "yes"
+	expect resp.http.X-Remove-Me == <undef>
+
+	# Case 3: no X-Input, X-Processed should be absent
+	txreq -url "/page3" -hdr "Host: test.com" \
+		-hdr "X-Remove-Me: gone"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Processed == <undef>
+	expect resp.http.X-JS-Added  == "yes"
+	expect resp.http.X-Remove-Me == <undef>
+
+	# Case 4: no X-Remove-Me, should stay absent
+	txreq -url "/page4" -hdr "Host: test.com" \
+		-hdr "X-Input: test-value"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Processed == "test-value-processed"
+	expect resp.http.X-JS-Added  == "yes"
+	expect resp.http.X-Remove-Me == <undef>
+
+	# Round 2 - repeat cases 1 and 2 for consistency
+	txreq -url "/" -hdr "Host: test.com" \
+		-hdr "X-Input: hello" \
+		-hdr "X-Remove-Me: original"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Processed == "hello-processed"
+	expect resp.http.X-JS-Added  == "yes"
+	expect resp.http.X-Remove-Me == <undef>
+
+	txreq -url "/again" -hdr "Host: test.com" \
+		-hdr "X-Input: repeat"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Processed == "repeat-processed"
+	expect resp.http.X-JS-Added  == "yes"
+	expect resp.http.X-Remove-Me == <undef>
+} -run

@@ -1,0 +1,56 @@
+varnishtest "QuickJS - req.get() header access control"
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/js"
+			}
+		}""");
+		riscv.add_main_argument("test.com", """
+function on_recv(req) {
+	var auth = req.get("X-Authorization");
+	varnish.log("on_recv: X-Authorization header value: " + auth);
+	/* Missing header returns null */
+	if (auth === null)              return ["synth", 401];
+	if (auth == "Bearer secret")    return ["synth", 200];
+	/* Present but wrong */
+	return ["synth", 403];
+}
+""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(500));
+	}
+} -start
+
+client c1 {
+	# No Authorization header -> 401
+	txreq -url "/1" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 401
+
+	# Wrong token -> 403
+	txreq -url "/2" -hdr "Host: test.com" -hdr "X-Authorization: Bearer wrong"
+	rxresp
+	expect resp.status == 403
+
+	# Correct token -> 200
+	txreq -url "/3" -hdr "Host: test.com" -hdr "X-Authorization: Bearer secret"
+	rxresp
+	expect resp.status == 200
+} -run

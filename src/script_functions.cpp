@@ -358,6 +358,12 @@ APICALL(set_decision)
 			machine.sysargs<riscv::Buffer, gaddr_t, bool> ();
 		auto& script = get_script(machine);
 		script.set_result(result.to_string(), status, paused);
+		if (script.ctx()->vsl != nullptr)
+			VSLb(script.ctx()->vsl, SLT_VCL_Log,
+				"[%s] Decision: %.*s (status: %d)",
+				script.name().c_str(),
+				(int) result.size(), result.c_str(),
+				(int) status);
 	} else {
 		// An initializing tenant VM
 		auto [on_recv, on_exit] = machine.sysargs<gaddr_t, gaddr_t>();

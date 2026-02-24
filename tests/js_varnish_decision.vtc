@@ -1,0 +1,116 @@
+varnishtest "QuickJS - Explicit varnish.decision() vs return value"
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/js"
+			}
+		}""");
+		riscv.add_main_argument("test.com", """
+function on_recv(req) {
+	if (req.url == "/explicit") {
+		/* Explicit varnish.decision() without a return value */
+		varnish.decision("synth", 200);
+		return;
+	}
+	if (req.url == "/array") {
+		/* Array return: ["decision", status] */
+		return ["synth", 201];
+	}
+	if (req.url == "/string") {
+		return ["synth", 202];
+	}
+	if (req.url == "/explicit-404") {
+		varnish.decision("synth", 404);
+		return;
+	}
+	if (req.url == "/explicit-503") {
+		varnish.decision("synth", 503);
+		return;
+	}
+	return ["synth", 400];
+}
+""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(500));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	# Round 1 - all cases
+	txreq -url "/explicit" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/array" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 201
+
+	txreq -url "/string" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 202
+
+	txreq -url "/explicit-404" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 404
+
+	txreq -url "/explicit-503" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 503
+
+	txreq -url "/other" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 400
+
+	# Round 2 - repeat to verify stability
+	txreq -url "/explicit" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/array" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 201
+
+	txreq -url "/explicit-404" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 404
+
+	txreq -url "/other" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 400
+
+	# Round 3
+	txreq -url "/string" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 202
+
+	txreq -url "/explicit-503" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 503
+
+	txreq -url "/explicit" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -run

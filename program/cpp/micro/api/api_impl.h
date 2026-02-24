@@ -34,10 +34,11 @@ void log(fmt::format_string<Args...> format, Args&&... args)
 	syscall(ECALL_LOG, (long) buffer, len);
 }
 
+extern "C" void fast_exit();
 inline void wait_for_requests(void(*on_recv)(Request))
 {
 	register void (*a0)() asm("a0") = (void(*)())on_recv;
-	register long a1 asm("a1") = 0; // We already set fast exit
+	register long a1 asm("a1") = (long)fast_exit;
 	register long syscall_id asm("a7") = ECALL_SET_DECISION;
 
 	asm volatile ("ecall" : : "r"(a0), "r"(a1), "m"(*a0), "r"(syscall_id) : "memory");
@@ -45,7 +46,7 @@ inline void wait_for_requests(void(*on_recv)(Request))
 inline void wait_for_requests(void(*on_recv)(Request, Response, const char*))
 {
 	register void (*a0)() asm("a0") = (void(*)())on_recv;
-	register long a1 asm("a1") = 0; // We already set fast exit
+	register long a1 asm("a1") = (long)fast_exit;
 	register long syscall_id asm("a7") = ECALL_SET_DECISION;
 
 	asm volatile ("ecall" : : "r"(a0), "r"(a1), "m"(*a0), "r"(syscall_id) : "memory");
@@ -60,19 +61,28 @@ inline void sys_register_callback(Callback idx, void(*cb)())
 	asm volatile ("ecall" : : "r"(a0), "r"(a1), "m"(*a1), "r"(syscall_id) : "memory");
 }
 
-inline void decision(const std::string& dec, int status)
+inline void decision(std::string_view dec, int status)
 {
-	strace("decision(", dec, ", ", status, ")");
-	asm ("" ::: "memory"); // prevent dead-store optimization
-	syscall(ECALL_SET_DECISION, (long) dec.c_str(), dec.size(), status, false);
+	strace("decision({}, {})", dec, status);
+	register const char* a0 asm("a0") = dec.data();
+	register size_t      a1 asm("a1") = dec.size();
+	register int         a2 asm("a2") = status;
+	register int         a3 asm("a3") = false; // paused
+	register int 	     a7 asm("a7") = ECALL_SET_DECISION;
+
+	asm volatile("ecall" : : "r"(a0), "m"(*(const char (*)[a1])a0), "r"(a1), "r"(a2), "r"(a3), "r"(a7) : "memory");
 	//__builtin_unreachable();
 }
-inline void pause_for(const std::string& dec, int status)
+inline void pause_for(std::string_view dec, int status)
 {
-	strace("decision(", dec, ", ", status, ", paused=", true, ")");
-	asm ("" ::: "memory"); // prevent dead-store optimization
-	syscall(ECALL_SET_DECISION, (long) dec.c_str(), dec.size(), status, true);
-	asm ("" ::: "memory"); // avoid reordering for unpause
+	strace("decision({}, {}, paused={})", dec, status, true);
+	register const char* a0 asm("a0") = dec.data();
+	register size_t      a1 asm("a1") = dec.size();
+	register int         a2 asm("a2") = status;
+	register int         a3 asm("a3") = true; // paused
+	register int 	     a7 asm("a7") = ECALL_SET_DECISION;
+
+	asm volatile ("ecall" : : "r"(a0), "m"(*(const char (*)[a1])a0), "r"(a1), "r"(a2), "r"(a3), "r"(a7) : "memory");
 }
 using backend_function_a = response(*)();
 using backend_function_b = response(*)(Request, Response);
@@ -81,28 +91,28 @@ extern "C" response backend_trampoline(backend_function_b);
 extern "C" response backend_trampoline_post(backend_function_c);
 inline void forge(Cache c, backend_function_a func)
 {
-	strace("forge(backend, ", (void*) func, ")");
+	strace("forge(backend(), {})", (void*)func);
 	syscall(ECALL_BACKEND_DECISION, (int) c, (long)backend_trampoline, (long)func);
 }
 inline void forge(Cache c, backend_function_b func)
 {
-	strace("forge(backend, ", (void*) func, ")");
+	strace("forge(backend, {})", (void*) func);
 	syscall(ECALL_BACKEND_DECISION, (int) c, (long)backend_trampoline, (long)func);
 }
 inline void forge(Cache c, backend_function_c func)
 {
-	strace("forge(backend, ", (void*) func, ")");
+	strace("forge(backend, {})", (void*) func);
 	syscall(ECALL_BACKEND_DECISION, (int) c, (long)backend_trampoline_post, (long)func);
 }
 inline void forge(void(*func)(void(*)()), long farg)
 {
-	strace("forge(backend, ", (void*) func, ", ", (void*) farg, ")");
+	strace("forge(backend, callback {})", (void*) func);
 	syscall(ECALL_BACKEND_DECISION, (long) func, farg);
 }
 
 inline void kvm_compute(Cache c, const std::string& arg)
 {
-	strace("kvm_compute(", arg, ")");
+	strace("kvm_compute({}, {})", (int)c, arg);
 	asm ("" ::: "memory"); // prevent dead-store optimization
 	syscall(ECALL_BACKEND_DECISION, (int)c, 0x0, (long)arg.c_str(), arg.size());
 	//__builtin_unreachable();
@@ -110,12 +120,13 @@ inline void kvm_compute(Cache c, const std::string& arg)
 
 inline void synth(uint16_t status)
 {
-	strace("synth(status=", status, ")");
+	strace("synth(status={})", status);
 	syscall(ECALL_SYNTH, status, 0, 0, 0, 0);
 }
 inline void synth(uint16_t status, const char* ctype, size_t clen, const char* data, size_t dlen)
 {
-	strace("synth(status=", status, "\"", ctype, "\", len = ", dlen, ")");
+	strace("synth(status={}, ctype=\"{}\", len={}, data={}, dlen={})",
+		status, ctype, clen, (void*) data, dlen);
 	asm ("" ::: "memory"); // prevent dead-store optimization
 	syscall(ECALL_SYNTH, status, (long) ctype, clen, (long) data, dlen);
 	__builtin_unreachable();
@@ -127,7 +138,8 @@ inline void synth(uint16_t status, const std::string& ctype, const std::string& 
 inline void synth(uint16_t status, const char* ctype, size_t clen,
 	const char* data, size_t dlen, std::function<void(Response)> content_function)
 {
-	strace("synth(status=", status, "\"", ctype, "\", len = ", dlen, ", callback=", &content_function, ")");
+	strace("synth(status={}, ctype=\"{}\", len={}, callback={})",
+		status, ctype, dlen, (void*) &content_function);
 	content_function({HDR_RESP});
 	synth(status, ctype, clen, data, dlen);
 }
@@ -183,17 +195,26 @@ inline void HeaderField::unset()
 	this->deleted = true;
 }
 
-extern "C" void sys_field_retrieve_str(int where, uint32_t index, std::string* out);
+extern "C" int sys_field_retrieve(int where, uint32_t index, char* buffer, size_t buflen);
+extern "C" int sys_field_retrieve_str(int where, uint32_t index, std::string *out);
 inline std::string HeaderField::to_string() const
 {
 	std::string val;
-	register int      a0 asm("a0") = this->where;
-	register uint32_t a1 asm("a1") = this->index;
-	register std::string* a2 asm("a2") = &val;
+	if (false) {
+		register int      a0 asm("a0") = this->where;
+		register uint32_t a1 asm("a1") = this->index;
+		register std::string* a2 asm("a2") = &val;
 
-	asm volatile(".insn i 0b1011011, 0, x0, x0, %4" // dyncall
-		:	"=m"(*a2)
-		:	"r"(a0), "r"(a1), "r"(a2), "I"(ECALL_FIELD_RETRIEVE_STR - SYSCALL_BASE));
+		asm volatile(".insn i 0b1011011, 0, x0, x0, %4" // dyncall
+			:	"+r"(a0), "=m"(*a2)
+			:	"r"(a1), "r"(a2), "I"(ECALL_FIELD_RETRIEVE_STR - SYSCALL_BASE));
+	} else {
+		int len = sys_field_retrieve(this->where, this->index, nullptr, 0);
+		if (len < 0)
+			return "";
+		val.resize(len);
+		sys_field_retrieve(this->where, this->index, val.data(), val.size());
+	}
 
 	strace("HeaderField(", wstr(where), ", ", HFIDX(index), ")::to_string() = \"", val, "\"");
 	return val;
@@ -210,7 +231,7 @@ inline std::string HeaderField::value() const
 inline
 HeaderField& HeaderField::set(const char* buffer, size_t len)
 {
-	strace("HeaderField(", wstr(where), ", ", HFIDX(index), ")::set(", std::string(buffer, buffer + len), ")");
+	strace("HeaderField({}, {})::set({}, {})", wstr(where), HFIDX(index), std::string_view(buffer, len));
 	asm ("" ::: "memory"); // prevent dead-store optimization
 	syscall(ECALL_FIELD_SET, this->where, this->index, (long) buffer, len);
 	return *this;
@@ -218,21 +239,21 @@ HeaderField& HeaderField::set(const char* buffer, size_t len)
 inline
 HeaderField& HeaderField::set(const HeaderField& other)
 {
-	strace("HeaderField(", wstr(where), ", ", HFIDX(index), ")::set(HeaderField(", other.where, ", ", other.index, "))");
+	strace("HeaderField({}, {})::set(HeaderField({}, {}))",
+		wstr(where), HFIDX(index), wstr(other.where), HFIDX(other.index));
 	asm ("" ::: "memory"); // prevent dead-store optimization
 	syscall(ECALL_FIELD_COPY, where, index, other.where, other.index);
 	return *this;
 }
+extern "C" int sys_field_set(int where, uint32_t index, const char* buffer, size_t len);
 PPT() inline
 HeaderField& HeaderField::set(fmt::format_string<Args...> format, Args&&... args)
 {
-	strace("HeaderField(", wstr(where), ", ", HFIDX(index), ")::set(", args..., ")");
+	strace("HeaderField({}, {})::set(", wstr(where), ", ", HFIDX(index), ")", args..., ")");
 	char buffer[4096];
 	auto res = fmt::format_to_n(buffer, sizeof(buffer)-1, format, std::forward<Args>(args)...);
-	const size_t len = res.size();
 
-	asm ("" ::: "memory"); // prevent dead-store optimization
-	syscall(ECALL_FIELD_SET, this->where, this->index, (long) buffer, len);
+	sys_field_set(this->where, this->index, buffer, res.size());
 	return *this;
 }
 PPT() inline
@@ -354,19 +375,25 @@ inline HeaderField HTTP::append(const HeaderField& hf)
 {
 	return hf.append_to(*this);
 }
+extern "C" int sys_field_append(int where, const char* buffer, size_t len);
 inline HeaderField HTTP::append(const std::string_view str)
 {
 	strace("HTTP(", wstr(where), ")::append(", str, ")");
 
-	register uint32_t a0 asm("a0") = where;
-	register const char* a1 asm("a1") = str.begin();
-	register size_t  a2 asm("a2") = str.size();
+	if (false) {
+		register uint32_t a0 asm("a0") = where;
+		register const char* a1 asm("a1") = str.begin();
+		register size_t  a2 asm("a2") = str.size();
 
-	asm volatile(".insn i 0b1011011, 0, x0, x0, %4" // dyncall
-		:	"+r"(a0)
-		:	"r"(a1), "r"(a2), "m"(*a1), "I"(ECALL_FIELD_APPEND - SYSCALL_BASE));
+		asm volatile(".insn i 0b1011011, 0, x0, x0, %4" // dyncall
+			:	"+r"(a0)
+			:	"r"(a1), "r"(a2), "m"(*a1), "I"(ECALL_FIELD_APPEND - SYSCALL_BASE));
 
-	return {this->where, a0};
+		return {this->where, a0};
+	} else {
+		const int idx = sys_field_append(this->where, str.data(), str.size());
+		return {this->where, (unsigned) idx};
+	}
 }
 PPT() inline HeaderField HTTP::appendf(fmt::format_string<Args...> format, Args&&... args)
 {

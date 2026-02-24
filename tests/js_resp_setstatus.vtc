@@ -1,0 +1,94 @@
+varnishtest "QuickJS - resp.setStatus() and resp.status snapshot in on_deliver"
+
+server s1 {
+	rxreq
+	txresp -status 200 -body "teapot route"
+	rxreq
+	txresp -status 200 -body "normal route"
+	rxreq
+	txresp -status 200 -body "second teapot"
+	rxreq
+	txresp -status 200 -body "second normal"
+} -start
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default {
+		.host = "${s1_addr}";
+		.port = "${s1_port}";
+	}
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/js"
+			}
+		}""");
+		riscv.add_main_argument("test.com", """
+function on_recv(req) {
+	return "pass";
+}
+function on_deliver(req, resp) {
+	/* resp.status is a read-only snapshot taken when the object was built.
+	   It does NOT change if resp.setStatus() is called later. */
+	var snap = resp.status;
+	resp.set("X-Snap-Status: " + snap);
+
+	if (req.url == "/teapot") {
+		/* Change to 418 */
+		resp.setStatus(418);
+	} else if (req.url == "/forbidden") {
+		/* Change to 403 */
+		resp.setStatus(403);
+	}
+	/* For /normal: no setStatus call, original 200 is kept */
+}
+""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "pass") {
+			return (pass);
+		}
+		return (synth(500));
+	}
+
+	sub vcl_deliver {
+		if (riscv.active()) {
+			riscv.run();
+		}
+	}
+} -start
+
+client c1 {
+	# /teapot: backend sends 200, on_deliver changes to 418
+	txreq -url "/teapot" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 418
+	# Snapshot was 200 (taken before setStatus)
+	expect resp.http.X-Snap-Status == "200"
+
+	# /normal: no setStatus call, backend 200 passes through unchanged
+	txreq -url "/normal" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Snap-Status == "200"
+
+	# Round 2 - repeat for stability
+	txreq -url "/teapot" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 418
+	expect resp.http.X-Snap-Status == "200"
+
+	txreq -url "/normal" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Snap-Status == "200"
+} -run

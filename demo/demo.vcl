@@ -67,26 +67,30 @@ sub vcl_backend_response {
 sub vcl_init {
 	/* Initialize some tenants from JSON */
 	riscv.embed_tenants("""{
-		"test.com": {
-			"filename": "/home/gonzo/github/libvmod-riscv/program/cpp/basic.cpp",
-			"arguments": ["Hello from RISC-V!"]
-		},
 		"qjs.com": {
 			"filename": "/home/gonzo/github/libvmod-riscv/program/cpp/js.cpp",
 			"arguments": ["Hello from QuickJS on RISC-V!"]
-		},
-		"rusty.com": {
-			"filename": "rust:/home/gonzo/github/libvmod-riscv/program/rust",
-			"arguments": ["Hello from Rust on RISC-V!"]
 		}
 	}""");
 	riscv.add_main_argument("qjs.com",
 		"""
-		function on_recv(url, method) {
+		function on_recv(req) {
+			varnish.log("Handling " + req.url + " in QuickJS tenant");
+			if (req.url == "/test") {
+				varnish.log("Handling /test in RISC-V JS tenant");
+				return ["synth", 200];
+			}
 			return "pass";
 		}
-		function on_deliver(url, status) {
-			varnish.respSet("X-Handled-By: RISC-V JS");
+		function on_deliver(req, resp) {
+			resp.set("X-Handled-By: RISC-V JS");
+		}
+		function on_backend_fetch(bereq) {
+			bereq.set("X-Forwarded-By: RISC-V JS");
+		}
+		function on_backend_response(bereq, beresp) {
+			beresp.set("X-Backend-Processed: true");
+			beresp.set("X-Forwarded-By: RISC-V JS");
 		}
 		""");
 	riscv.finalize_tenants();

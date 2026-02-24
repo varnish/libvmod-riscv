@@ -13,27 +13,29 @@
  *   - JS_FreeValue inside callbacks is GC hygiene within a single request;
  *     it is not required for cross-request correctness.
  *
- * argv[1] is the JavaScript program string evaluated once at startup.
+ * The last argument is the JavaScript program string evaluated once at startup.
  * The program may define any of the following hooks as global functions:
  *
- *   function on_recv(url, method)    { ... }  // vcl_recv
- *   function on_deliver(url, status) { ... }  // vcl_deliver
+ *   function on_recv(req)              { ... }  // vcl_recv
+ *   function on_deliver(req, resp)     { ... }  // vcl_deliver
+ *   function on_backend_fetch(bereq)   { ... }  // vcl_backend_fetch
+ *   function on_backend_response(bereq, beresp) { ... }  // vcl_backend_response
+ *
+ * req / bereq properties and methods:
+ *   req.url            -> string  (read-only snapshot)
+ *   req.method         -> string  (read-only snapshot)
+ *   req.get(name)      -> string | null
+ *   req.set(line)      -> void    // full "Name: Value" line
+ *   req.unset(name)    -> void
+ *
+ * resp / beresp properties and methods:
+ *   resp.status           -> number  (read-only snapshot)
+ *   resp.get(name)        -> string | null
+ *   resp.set(line)        -> void
+ *   resp.unset(name)      -> void
+ *   resp.setStatus(code)  -> void
  *
  * The varnish namespace (global object "varnish") exposes:
- *
- *   Header access — request (HDR_REQ):
- *     varnish.reqGet(name)    -> string | null
- *     varnish.reqSet(line)    -> void   // full "Name: Value" line
- *     varnish.reqUnset(name)  -> void
- *     varnish.reqUrl()        -> string
- *     varnish.reqMethod()     -> string
- *
- *   Header access — response (HDR_RESP):
- *     varnish.respGet(name)      -> string | null
- *     varnish.respSet(line)      -> void
- *     varnish.respUnset(name)    -> void
- *     varnish.respStatus()       -> number
- *     varnish.respSetStatus(code)-> void
  *
  *   Caching:
  *     varnish.setCacheable(bool)  -> void
@@ -52,8 +54,6 @@
 
 namespace varnish = api;
 
-#define COUNTOF(a) (sizeof(a) / sizeof(*(a)))
-
 // ---------------------------------------------------------------------------
 // Global QuickJS state (lives for the entire process lifetime)
 // ---------------------------------------------------------------------------
@@ -63,8 +63,10 @@ static JSValue    g_global   = JS_UNDEFINED;
 
 // JS function references cached once after eval — avoids per-call property lookup
 static struct {
-    JSValue on_recv;
-    JSValue on_deliver;
+	JSValue on_recv;
+	JSValue on_deliver;
+	JSValue on_backend_fetch;
+	JSValue on_backend_response;
 } g_hooks;
 
 // ---------------------------------------------------------------------------
@@ -73,24 +75,24 @@ static struct {
 
 static void js_dump_exception(JSContext* ctx)
 {
-    JSValue exc = JS_GetException(ctx);
+	JSValue exc = JS_GetException(ctx);
 
-    const char* msg = JS_ToCString(ctx, exc);
-    if (msg) {
-        varnish::print("JS exception: {}\n", msg);
-        JS_FreeCString(ctx, msg);
-    }
+	const char* msg = JS_ToCString(ctx, exc);
+	if (msg) {
+		varnish::print("JS exception: {}\n", msg);
+		JS_FreeCString(ctx, msg);
+	}
 
-    JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
-    if (!JS_IsUndefined(stack) && !JS_IsNull(stack)) {
-        const char* s = JS_ToCString(ctx, stack);
-        if (s) {
-            varnish::print("{}\n", s);
-            JS_FreeCString(ctx, s);
-        }
-    }
-    JS_FreeValue(ctx, stack);
-    JS_FreeValue(ctx, exc);
+	JSValue stack = JS_GetPropertyStr(ctx, exc, "stack");
+	if (!JS_IsUndefined(stack) && !JS_IsNull(stack)) {
+		const char* s = JS_ToCString(ctx, stack);
+		if (s) {
+			varnish::print("{}\n", s);
+			JS_FreeCString(ctx, s);
+		}
+	}
+	JS_FreeValue(ctx, stack);
+	JS_FreeValue(ctx, exc);
 }
 
 // ---------------------------------------------------------------------------
@@ -99,108 +101,81 @@ static void js_dump_exception(JSContext* ctx)
 // ---------------------------------------------------------------------------
 
 static JSValue hdr_get(JSContext* ctx, api::gethdr_e where,
-                       int argc, JSValueConst* argv)
+					   int argc, JSValueConst* argv)
 {
-    if (argc < 1)
-        return JS_NULL;
-    const char* name = JS_ToCString(ctx, argv[0]);
-    if (!name)
-        return JS_EXCEPTION;
-    api::HTTP http{where};
-    const auto hf = http.find(name);
-    JS_FreeCString(ctx, name);
-    if (!hf)
-        return JS_NULL;
-    const auto val = hf.value();
-    return JS_NewStringLen(ctx, val.c_str(), val.size());
+	if (argc < 1)
+		return JS_NULL;
+	const char* name = JS_ToCString(ctx, argv[0]);
+	if (!name)
+		return JS_EXCEPTION;
+	api::HTTP http{where};
+	const auto hf = http.find(name);
+	JS_FreeCString(ctx, name);
+	if (!hf)
+		return JS_NULL;
+	const auto val = hf.value();
+	return JS_NewStringLen(ctx, val.c_str(), val.size());
 }
 
 static JSValue hdr_set(JSContext* ctx, api::gethdr_e where,
-                       int argc, JSValueConst* argv)
+					   int argc, JSValueConst* argv)
 {
-    if (argc < 1)
-        return JS_UNDEFINED;
+	if (argc < 1)
+		return JS_UNDEFINED;
 	size_t len;
-    const char* line = JS_ToCStringLen(ctx, &len, argv[0]);
-    if (!line)
-        return JS_EXCEPTION;
-    api::HTTP{where}.append({line, len});
-    JS_FreeCString(ctx, line);
-    return JS_UNDEFINED;
+	const char* line = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (!line)
+		return JS_EXCEPTION;
+	api::HTTP{where}.append({line, len});
+	JS_FreeCString(ctx, line);
+	return JS_UNDEFINED;
 }
 
 static JSValue hdr_unset(JSContext* ctx, api::gethdr_e where,
-                         int argc, JSValueConst* argv)
+						 int argc, JSValueConst* argv)
 {
-    if (argc < 1)
-        return JS_UNDEFINED;
-    const char* name = JS_ToCString(ctx, argv[0]);
-    if (!name)
-        return JS_EXCEPTION;
-    api::HTTP http{where};
-    auto hf = http.find(name);
-    JS_FreeCString(ctx, name);
-    if (hf)
-        hf.unset();
-    return JS_UNDEFINED;
+	if (argc < 1)
+		return JS_UNDEFINED;
+	const char* name = JS_ToCString(ctx, argv[0]);
+	if (!name)
+		return JS_EXCEPTION;
+	api::HTTP http{where};
+	auto hf = http.find(name);
+	JS_FreeCString(ctx, name);
+	if (hf)
+		hf.unset();
+	return JS_UNDEFINED;
 }
 
 // ---------------------------------------------------------------------------
-// varnish.req* — request headers (HDR_REQ)
+// JSCFunctionData wrappers: 'magic' carries the gethdr_e value so each
+// method object on req/resp/bereq/beresp can dispatch to the right headers
+// without heap allocation or JS closures.
 // ---------------------------------------------------------------------------
 
-static JSValue js_req_get(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
-    { return hdr_get(ctx, api::HDR_REQ, argc, argv); }
+static JSValue js_hdr_get_fn(JSContext* ctx, JSValueConst,
+							  int argc, JSValueConst* argv, int magic, JSValue*)
+	{ return hdr_get(ctx, (api::gethdr_e)magic, argc, argv); }
 
-static JSValue js_req_set(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
-    { return hdr_set(ctx, api::HDR_REQ, argc, argv); }
+static JSValue js_hdr_set_fn(JSContext* ctx, JSValueConst,
+							  int argc, JSValueConst* argv, int magic, JSValue*)
+	{ return hdr_set(ctx, (api::gethdr_e)magic, argc, argv); }
 
-static JSValue js_req_unset(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
-    { return hdr_unset(ctx, api::HDR_REQ, argc, argv); }
+static JSValue js_hdr_unset_fn(JSContext* ctx, JSValueConst,
+								int argc, JSValueConst* argv, int magic, JSValue*)
+	{ return hdr_unset(ctx, (api::gethdr_e)magic, argc, argv); }
 
-static JSValue js_req_url(JSContext* ctx, JSValueConst, int, JSValueConst*)
+static JSValue js_resp_setstatus_fn(JSContext* ctx, JSValueConst,
+									int argc, JSValueConst* argv, int magic, JSValue*)
 {
-    varnish::Request req{api::HDR_REQ};
-    const auto s = req.url();
-    return JS_NewStringLen(ctx, s.c_str(), s.size());
-}
-
-static JSValue js_req_method(JSContext* ctx, JSValueConst, int, JSValueConst*)
-{
-    varnish::Request req{api::HDR_REQ};
-    const auto s = req.method();
-    return JS_NewStringLen(ctx, s.c_str(), s.size());
-}
-
-// ---------------------------------------------------------------------------
-// varnish.resp* — response headers (HDR_RESP)
-// ---------------------------------------------------------------------------
-
-static JSValue js_resp_get(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
-    { return hdr_get(ctx, api::HDR_RESP, argc, argv); }
-
-static JSValue js_resp_set(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
-    { return hdr_set(ctx, api::HDR_RESP, argc, argv); }
-
-static JSValue js_resp_unset(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
-    { return hdr_unset(ctx, api::HDR_RESP, argc, argv); }
-
-static JSValue js_resp_status(JSContext* ctx, JSValueConst, int, JSValueConst*)
-{
-    varnish::Response resp{api::HDR_RESP};
-    return JS_NewInt32(ctx, (int32_t)resp.status());
-}
-
-static JSValue js_resp_set_status(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
-{
-    if (argc < 1)
-        return JS_UNDEFINED;
-    int32_t code = 200;
-    if (JS_ToInt32(ctx, &code, argv[0]))
-        return JS_EXCEPTION;
-    varnish::Response resp{api::HDR_RESP};
-    resp.set_status((uint16_t)code);
-    return JS_UNDEFINED;
+	if (argc < 1)
+		return JS_UNDEFINED;
+	int32_t code = 200;
+	if (JS_ToInt32(ctx, &code, argv[0]))
+		return JS_EXCEPTION;
+	varnish::Response resp{(api::gethdr_e)magic};
+	resp.set_status((uint16_t)code);
+	return JS_UNDEFINED;
 }
 
 // ---------------------------------------------------------------------------
@@ -209,73 +184,127 @@ static JSValue js_resp_set_status(JSContext* ctx, JSValueConst, int argc, JSValu
 
 static JSValue js_set_cacheable(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
 {
-    if (argc < 1)
-        return JS_UNDEFINED;
-    varnish::Response::set_cacheable(JS_ToBool(ctx, argv[0]) != 0);
-    return JS_UNDEFINED;
+	if (argc < 1)
+		return JS_UNDEFINED;
+	varnish::Response::set_cacheable(JS_ToBool(ctx, argv[0]) != 0);
+	return JS_UNDEFINED;
 }
 
 static JSValue js_set_ttl(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
 {
-    if (argc < 1)
-        return JS_UNDEFINED;
-    double secs = 0.0;
-    if (JS_ToFloat64(ctx, &secs, argv[0]))
-        return JS_EXCEPTION;
-    varnish::Response::set_ttl((float)secs);
-    return JS_UNDEFINED;
+	if (argc < 1)
+		return JS_UNDEFINED;
+	double secs = 0.0;
+	if (JS_ToFloat64(ctx, &secs, argv[0]))
+		return JS_EXCEPTION;
+	varnish::Response::set_ttl((float)secs);
+	return JS_UNDEFINED;
 }
 
 static JSValue js_decision(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
 {
-    if (argc < 1)
-        return JS_UNDEFINED;
-    const char* dec = JS_ToCString(ctx, argv[0]);
-    if (!dec)
-        return JS_EXCEPTION;
-    int32_t status = 403;
-    if (argc >= 2)
-        JS_ToInt32(ctx, &status, argv[1]);
-    varnish::decision(std::string(dec), status);
-    JS_FreeCString(ctx, dec);
-    return JS_UNDEFINED;
+	if (argc < 1)
+		return JS_UNDEFINED;
+	size_t len;
+	const char* dec = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (!dec)
+		return JS_EXCEPTION;
+	int32_t status = 403;
+	if (argc >= 2)
+		JS_ToInt32(ctx, &status, argv[1]);
+	varnish::decision({dec, len}, status);
+	JS_FreeCString(ctx, dec);
+	return JS_UNDEFINED;
 }
 
 static JSValue js_hash_data(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
 {
-    if (argc < 1)
-        return JS_UNDEFINED;
-    size_t len;
-	const char *s = JS_ToCStringLen(ctx, &len, argv[0]);
+	if (argc < 1)
+		return JS_UNDEFINED;
+	size_t len;
+	const char* s = JS_ToCStringLen(ctx, &len, argv[0]);
 	if (!s)
-        return JS_EXCEPTION;
-    varnish::hash_data({s, len});
-    JS_FreeCString(ctx, s);
-    return JS_UNDEFINED;
+		return JS_EXCEPTION;
+	varnish::hash_data({s, len});
+	JS_FreeCString(ctx, s);
+	return JS_UNDEFINED;
 }
 
 static JSValue js_print(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
 {
-    for (int i = 0; i < argc; i++) {
-        const char* s = JS_ToCString(ctx, argv[i]);
-        if (!s)
-            return JS_EXCEPTION;
-        varnish::print("{}", s);
-        JS_FreeCString(ctx, s);
-    }
-    return JS_UNDEFINED;
+	for (int i = 0; i < argc; i++) {
+		const char* s = JS_ToCString(ctx, argv[i]);
+		if (!s)
+			return JS_EXCEPTION;
+		varnish::print("{}", s);
+		JS_FreeCString(ctx, s);
+	}
+	return JS_UNDEFINED;
 }
 
 static JSValue js_log(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
 {
-    for (int i = 0; i < argc; i++) {
-        const char* s = JS_ToCString(ctx, argv[i]);
-        if (!s)
-            return JS_EXCEPTION;
-        varnish::log("{}", s);
-        JS_FreeCString(ctx, s);
-    }
-    return JS_UNDEFINED;
+	for (int i = 0; i < argc; i++) {
+		const char* s = JS_ToCString(ctx, argv[i]);
+		if (!s)
+			return JS_EXCEPTION;
+		varnish::log("{}", s);
+		JS_FreeCString(ctx, s);
+	}
+	return JS_UNDEFINED;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP object factories
+// Pass one of these to a JS hook instead of bare primitive arguments.
+// ---------------------------------------------------------------------------
+
+// Request-side object: req or bereq
+static JSValue make_req_obj(JSContext* ctx, api::gethdr_e where)
+{
+	varnish::Request req{where};
+	JSValue obj = JS_NewObject(ctx);
+
+	// Pre-computed read-only properties
+	const auto url = req.url();
+	JS_SetPropertyStr(ctx, obj, "url",
+		JS_NewStringLen(ctx, url.c_str(), url.size()));
+	const auto method = req.method();
+	JS_SetPropertyStr(ctx, obj, "method",
+		JS_NewStringLen(ctx, method.c_str(), method.size()));
+
+	// Header manipulation methods (magic = gethdr_e)
+	JS_SetPropertyStr(ctx, obj, "get",
+		JS_NewCFunctionData(ctx, js_hdr_get_fn,   1, (int)where, 0, nullptr));
+	JS_SetPropertyStr(ctx, obj, "set",
+		JS_NewCFunctionData(ctx, js_hdr_set_fn,   1, (int)where, 0, nullptr));
+	JS_SetPropertyStr(ctx, obj, "unset",
+		JS_NewCFunctionData(ctx, js_hdr_unset_fn, 1, (int)where, 0, nullptr));
+
+	return obj;
+}
+
+// Response-side object: resp or beresp
+static JSValue make_resp_obj(JSContext* ctx, api::gethdr_e where)
+{
+	varnish::Response resp{where};
+	JSValue obj = JS_NewObject(ctx);
+
+	// Pre-computed read-only status property
+	JS_SetPropertyStr(ctx, obj, "status",
+		JS_NewInt32(ctx, (int32_t)resp.status()));
+
+	// Header manipulation methods (magic = gethdr_e)
+	JS_SetPropertyStr(ctx, obj, "get",
+		JS_NewCFunctionData(ctx, js_hdr_get_fn,        1, (int)where, 0, nullptr));
+	JS_SetPropertyStr(ctx, obj, "set",
+		JS_NewCFunctionData(ctx, js_hdr_set_fn,        1, (int)where, 0, nullptr));
+	JS_SetPropertyStr(ctx, obj, "unset",
+		JS_NewCFunctionData(ctx, js_hdr_unset_fn,      1, (int)where, 0, nullptr));
+	JS_SetPropertyStr(ctx, obj, "setStatus",
+		JS_NewCFunctionData(ctx, js_resp_setstatus_fn, 1, (int)where, 0, nullptr));
+
+	return obj;
 }
 
 // ---------------------------------------------------------------------------
@@ -284,105 +313,155 @@ static JSValue js_log(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv
 
 static void setup_quickjs(const char* js_code)
 {
-    JSRuntime* rt = JS_NewRuntime();
-    g_ctx = JS_NewContext(rt);
+	JSRuntime* rt = JS_NewRuntime();
+	g_ctx = JS_NewContext(rt);
 
-    g_global = JS_GetGlobalObject(g_ctx);
+	g_global = JS_GetGlobalObject(g_ctx);
 
-    /* Build the varnish namespace object in main(), matching the reference style */
-    JSValue vns = JS_NewObject(g_ctx);
-    JS_SetPropertyStr(g_ctx, g_global, "varnish", JS_DupValue(g_ctx, vns));
+	JSValue vns = JS_NewObject(g_ctx);
+	JS_SetPropertyStr(g_ctx, g_global, "varnish", JS_DupValue(g_ctx, vns));
 
 #define BIND(name, func, nargs) \
-    JS_SetPropertyStr(g_ctx, vns, name, JS_NewCFunction(g_ctx, func, name, nargs))
+	JS_SetPropertyStr(g_ctx, vns, name, JS_NewCFunction(g_ctx, func, name, nargs))
 
-    /* Request */
-    BIND("reqGet",    js_req_get,    1);
-    BIND("reqSet",    js_req_set,    1);
-    BIND("reqUnset",  js_req_unset,  1);
-    BIND("reqUrl",    js_req_url,    0);
-    BIND("reqMethod", js_req_method, 0);
-
-    /* Response */
-    BIND("respGet",       js_resp_get,        1);
-    BIND("respSet",       js_resp_set,        1);
-    BIND("respUnset",     js_resp_unset,      1);
-    BIND("respStatus",    js_resp_status,     0);
-    BIND("respSetStatus", js_resp_set_status, 1);
-
-    /* Caching */
-    BIND("setCacheable", js_set_cacheable, 1);
-    BIND("setTTL",       js_set_ttl,       1);
-
-    /* Decisions / misc */
-    BIND("decision", js_decision, 1);
-    BIND("hashData", js_hash_data, 1);
-    BIND("print",    js_print,    1);
-    BIND("log",      js_log,      1);
+	BIND("setCacheable", js_set_cacheable, 1);
+	BIND("setTTL",       js_set_ttl,       1);
+	BIND("decision",     js_decision,      1);
+	BIND("hashData",     js_hash_data,     1);
+	BIND("print",        js_print,         1);
+	BIND("log",          js_log,           1);
 
 #undef BIND
 
-    JS_FreeValue(g_ctx, vns);
+	JS_FreeValue(g_ctx, vns);
 
-    /* Evaluate the user-supplied JS program */
+	/* Evaluate the user-supplied JS program */
 	varnish::print("Evaluating JS program:\n{}\n", js_code);
-    JSValue result = JS_Eval(g_ctx, js_code, strlen(js_code),
-                             "<script>", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(result)) {
-        varnish::print("JS eval error:\n");
-        js_dump_exception(g_ctx);
-    }
-    JS_FreeValue(g_ctx, result);
+	JSValue result = JS_Eval(g_ctx, js_code, strlen(js_code),
+							 "<script>", JS_EVAL_TYPE_GLOBAL);
+	if (JS_IsException(result)) {
+		varnish::print("JS eval error:\n");
+		js_dump_exception(g_ctx);
+	}
+	JS_FreeValue(g_ctx, result);
 
-    /* Cache hook function references; missing hooks are silently ignored */
-    g_hooks.on_recv    = JS_GetPropertyStr(g_ctx, g_global, "on_recv");
-    g_hooks.on_deliver = JS_GetPropertyStr(g_ctx, g_global, "on_deliver");
+	/* Cache hook function references; missing hooks are silently ignored */
+	g_hooks.on_recv              = JS_GetPropertyStr(g_ctx, g_global, "on_recv");
+	g_hooks.on_deliver           = JS_GetPropertyStr(g_ctx, g_global, "on_deliver");
+	g_hooks.on_backend_fetch     = JS_GetPropertyStr(g_ctx, g_global, "on_backend_fetch");
+	g_hooks.on_backend_response  = JS_GetPropertyStr(g_ctx, g_global, "on_backend_response");
 }
 
 // ---------------------------------------------------------------------------
-// C++ callbacks: extract primitive args and call into JS
+// Return-value → VCL decision mapping
+//
+//   return "pass"         → decision("pass")
+//   return ["synth", 200] → decision("synth", 200)
+//   return null/undefined → no-op (explicit varnish.decision() already called)
 // ---------------------------------------------------------------------------
 
-static void on_recv(varnish::Request req, varnish::Response, const char* arg)
+static void apply_return_decision(JSContext* ctx, JSValue ret)
 {
-    if (!JS_IsFunction(g_ctx, g_hooks.on_recv))
-        return;
+	if (JS_IsString(ret)) {
+		size_t len;
+		const char* s = JS_ToCStringLen(ctx, &len, ret);
+		if (s) {
+			varnish::decision({s, len});
+			JS_FreeCString(ctx, s);
+		}
+	} else if (JS_IsArray(ret)) {
+		JSValue v0 = JS_GetPropertyUint32(ctx, ret, 0);
+		JSValue v1 = JS_GetPropertyUint32(ctx, ret, 1);
+		size_t len;
+		const char* s = JS_ToCStringLen(ctx, &len, v0);
+		int32_t status = 200;
+		JS_ToInt32(ctx, &status, v1);
+		if (s) {
+			varnish::decision({s, len}, status);
+			JS_FreeCString(ctx, s);
+		}
+		JS_FreeValue(ctx, v0);
+		JS_FreeValue(ctx, v1);
+	}
+	// null / undefined / other → no-op
+}
 
-    const auto url    = req.url();
-    const auto method = req.method();
+// ---------------------------------------------------------------------------
+// C++ callbacks: build HTTP objects and call into JS
+// ---------------------------------------------------------------------------
 
-    JSValue args[2];
-    args[0] = JS_NewStringLen(g_ctx, url.c_str(),    url.size());
-    args[1] = JS_NewStringLen(g_ctx, method.c_str(), method.size());
+static void on_recv(varnish::Request req, varnish::Response, const char*)
+{
+	if (!JS_IsFunction(g_ctx, g_hooks.on_recv))
+		return;
 
-    JSValue ret = JS_Call(g_ctx, g_hooks.on_recv, JS_UNDEFINED, 2, args);
-    if (JS_IsException(ret))
-        js_dump_exception(g_ctx);
+	JSValue req_obj = make_req_obj(g_ctx, req.where);
 
-    JS_FreeValue(g_ctx, ret);
-    JS_FreeValue(g_ctx, args[0]);
-    JS_FreeValue(g_ctx, args[1]);
+	JSValue ret = JS_Call(g_ctx, g_hooks.on_recv, JS_UNDEFINED, 1, &req_obj);
+	if (JS_IsException(ret))
+		js_dump_exception(g_ctx);
+	else
+		apply_return_decision(g_ctx, ret);
+
+	//JS_FreeValue(g_ctx, ret);
+	//JS_FreeValue(g_ctx, req_obj);
 }
 
 static void on_deliver(varnish::Request req, varnish::Response resp)
 {
-    if (!JS_IsFunction(g_ctx, g_hooks.on_deliver))
-        return;
+	if (!JS_IsFunction(g_ctx, g_hooks.on_deliver))
+		return;
 
-    const auto url    = req.url();
-    const int  status = (int)resp.status();
+	JSValue args[2];
+	args[0] = make_req_obj(g_ctx, req.where);
+	args[1] = make_resp_obj(g_ctx, resp.where);
 
-    JSValue args[2];
-    args[0] = JS_NewStringLen(g_ctx, url.c_str(), url.size());
-    args[1] = JS_NewInt32(g_ctx, status);
+	JSValue ret = JS_Call(g_ctx, g_hooks.on_deliver, JS_UNDEFINED, 2, args);
+	if (JS_IsException(ret))
+		js_dump_exception(g_ctx);
+	else
+		apply_return_decision(g_ctx, ret);
 
-    JSValue ret = JS_Call(g_ctx, g_hooks.on_deliver, JS_UNDEFINED, 2, args);
-    if (JS_IsException(ret))
-        js_dump_exception(g_ctx);
+	//JS_FreeValue(g_ctx, ret);
+	//JS_FreeValue(g_ctx, args[0]);
+	//JS_FreeValue(g_ctx, args[1]);
+}
 
-    JS_FreeValue(g_ctx, ret);
-    JS_FreeValue(g_ctx, args[0]);
-    JS_FreeValue(g_ctx, args[1]);
+static void on_backend_fetch(varnish::Request bereq, varnish::Response)
+{
+	if (!JS_IsFunction(g_ctx, g_hooks.on_backend_fetch))
+		return;
+
+	JSValue bereq_obj = make_req_obj(g_ctx, bereq.where);
+
+	JSValue ret = JS_Call(g_ctx, g_hooks.on_backend_fetch, JS_UNDEFINED, 1, &bereq_obj);
+	if (JS_IsException(ret))
+		js_dump_exception(g_ctx);
+	else
+		apply_return_decision(g_ctx, ret);
+
+	//JS_FreeValue(g_ctx, ret);
+	//JS_FreeValue(g_ctx, bereq_obj);
+}
+
+static void on_backend_response(varnish::Request bereq, varnish::Response beresp)
+{
+	if (!JS_IsFunction(g_ctx, g_hooks.on_backend_response))
+		return;
+
+	JSValue args[2];
+	args[0] = make_req_obj(g_ctx, bereq.where);
+	args[1] = make_resp_obj(g_ctx, beresp.where);
+
+	JSValue ret = JS_Call(g_ctx, g_hooks.on_backend_response, JS_UNDEFINED, 2, args);
+	if (JS_IsException(ret))
+		js_dump_exception(g_ctx);
+	else
+		apply_return_decision(g_ctx, ret);
+
+	//JS_FreeValue(g_ctx, ret);
+	//JS_FreeValue(g_ctx, args[0]);
+	//JS_FreeValue(g_ctx, args[1]);
 }
 
 // ---------------------------------------------------------------------------
@@ -391,13 +470,18 @@ static void on_deliver(varnish::Request req, varnish::Response resp)
 
 int main(int argc, char** argv)
 {
-    varnish::print("{} main entered{}\n",
-        varnish::is_storage() ? "Storage" : "Request",
-        varnish::is_debug()   ? " (debug)" : "");
+	varnish::print("{} main entered{}\n",
+		varnish::is_storage() ? "Storage" : "Request",
+		varnish::is_debug()   ? " (debug)" : "");
 
 	// JavaScript code is in the last argument
-    setup_quickjs(argv[argc - 1]);
+	setup_quickjs(argv[argc - 1]);
 
-    varnish::set_on_deliver(on_deliver);
-    varnish::wait_for_requests(on_recv);
+	varnish::sys_register_callback(varnish::CALLBACK_ON_BACKEND_FETCH,
+		(void(*)())on_backend_fetch);
+	varnish::sys_register_callback(varnish::CALLBACK_ON_BACKEND_RESPONSE,
+		(void(*)())on_backend_response);
+
+	varnish::set_on_deliver(on_deliver);
+	varnish::wait_for_requests(on_recv);
 }

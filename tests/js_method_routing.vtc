@@ -1,0 +1,111 @@
+varnishtest "QuickJS - req.method routing"
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/js"
+			}
+		}""");
+		riscv.add_main_argument("test.com", """
+function on_recv(req) {
+	if (req.method == "GET")     return ["synth", 200];
+	if (req.method == "POST")    return ["synth", 201];
+	if (req.method == "PUT")     return ["synth", 200];
+	if (req.method == "PATCH")   return ["synth", 200];
+	if (req.method == "DELETE")  return ["synth", 204];
+	if (req.method == "HEAD")    return ["synth", 200];
+	if (req.method == "OPTIONS") return ["synth", 200];
+	return ["synth", 405];
+}
+""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(500));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	# Round 1 - all methods
+	txreq -req GET -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -req POST -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 201
+
+	txreq -req PUT -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -req PATCH -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -req DELETE -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 204
+
+	txreq -req HEAD -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -req OPTIONS -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -req TRACE -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 405
+
+	# Round 2 - repeat key methods
+	txreq -req GET -url "/page" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -req POST -url "/submit" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 201
+
+	txreq -req DELETE -url "/item" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 204
+
+	txreq -req TRACE -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 405
+
+	# Round 3
+	txreq -req GET -url "/again" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -req PUT -url "/update" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -req PATCH -url "/partial" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -run
