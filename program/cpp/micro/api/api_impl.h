@@ -200,7 +200,7 @@ extern "C" int sys_field_retrieve_str(int where, uint32_t index, std::string *ou
 inline std::string HeaderField::to_string() const
 {
 	std::string val;
-	if (true) {
+	if (IS_NEWLIB) {
 		register int      a0 asm("a0") = this->where;
 		register uint32_t a1 asm("a1") = this->index;
 		register std::string* a2 asm("a2") = &val;
@@ -380,7 +380,7 @@ inline HeaderField HTTP::append(const std::string_view str)
 {
 	strace("HTTP(", wstr(where), ")::append(", str, ")");
 
-	if (true) {
+	if (IS_NEWLIB) {
 		register uint32_t a0 asm("a0") = where;
 		register const char* a1 asm("a1") = str.begin();
 		register size_t  a2 asm("a2") = str.size();

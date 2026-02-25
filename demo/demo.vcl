@@ -35,6 +35,8 @@ sub vcl_recv {
 		} else {
 			return (hash);
 		}
+	} else if (riscv.want_result() == "pass") {
+		return (pass);
 	}
 }
 
@@ -88,7 +90,7 @@ sub vcl_init {
 				varnish.log("Handling /test in RISC-V JS tenant");
 				return ["synth", 200];
 			}
-			return "pass";
+			return "hash";
 		}
 		function on_deliver(req, resp) {
 			resp.set("X-Handled-By: RISC-V JS");

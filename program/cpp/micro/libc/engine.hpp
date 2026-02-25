@@ -5,6 +5,11 @@
 #include <include/libc.hpp>
 #include <include/function.hpp>
 #include <include/tuplecall.hpp>
+#if __has_include(<reent.h>)
+#define IS_NEWLIB 1
+#else
+#define IS_NEWLIB 0
+#endif
 
 #define string_hash(x) crc32(value)
 

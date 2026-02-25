@@ -28,12 +28,15 @@ endif()
 # we have a linker script with separated text and rodata
 if (GCC_TRIPLE STREQUAL "riscv64-linux-gnu")
 	set(COMMON "-march=rv64gc_zba_zbb_zbc_zbs_zicond -mabi=lp64d ${COMMON}")
+	option(LIBC_WRAP_NATIVE "" OFF)
 elseif (GCC_TRIPLE STREQUAL "riscv64-unknown-elf")
 	set(COMMON "-march=rv64g_zba_zbb_zbc_zbs_zicond -mabi=lp64d ${COMMON}")
 	set (XO_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/script64.ld")
+	option(LIBC_WRAP_NATIVE "" ON)
 else()
 	set(COMMON "-march=rv32g_zba_zbb_zbc_zbs_zicond -mabi=ilp32d ${COMMON}")
 	set (XO_SCRIPT "${CMAKE_CURRENT_LIST_DIR}/script32.ld")
+	option(LIBC_WRAP_NATIVE "" ON)
 endif()
 if (XO_SCRIPT)
 	set(EXECUTE_ONLY TRUE)
@@ -59,7 +62,6 @@ set(CMAKE_SHARED_LIBRARY_LINK_CXX_FLAGS "") # remove -rdynamic
 set(USE_NEWLIB ON)
 
 # enforce correct global include order for our tiny libc
-option(LIBC_WRAP_NATIVE "" ON)
 include_directories(${CMAKE_CURRENT_LIST_DIR}/libc)
 set (BBLIBCPATH "${CMAKE_CURRENT_LIST_DIR}/ext/libriscv/binaries/barebones/libc")
 include_directories(${BBLIBCPATH})
