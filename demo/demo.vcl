@@ -67,6 +67,14 @@ sub vcl_backend_response {
 sub vcl_init {
 	/* Initialize some tenants from JSON */
 	riscv.embed_tenants("""{
+		"test.com": {
+			"filename": "/home/gonzo/github/libvmod-riscv/program/cpp/basic.cpp",
+			"arguments": ["Hello from RISC-V!"]
+		},
+		"rusty.com": {
+			"filename": "rust:/home/gonzo/github/libvmod-riscv/program/rust",
+			"arguments": ["Hello from Rust on RISC-V!"]
+		},
 		"qjs.com": {
 			"filename": "/home/gonzo/github/libvmod-riscv/program/cpp/js.cpp",
 			"arguments": ["Hello from QuickJS on RISC-V!"]

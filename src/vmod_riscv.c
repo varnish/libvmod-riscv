@@ -41,6 +41,8 @@ static inline vcall_info enum_to_idx(VCL_ENUM e)
 	if (e == VENUM(ON_BACKEND_RESPONSE)) return (vcall_info){5, HDR_BEREQ, HDR_BERESP};
 	if (e == VENUM(ON_BACKEND_ERROR)) return (vcall_info){6, HDR_BEREQ, HDR_BERESP};
 	if (e == VENUM(ON_DELIVER)) return (vcall_info){7, HDR_REQ, HDR_RESP};
+	if (e == VENUM(ON_HIT))    return (vcall_info){8, HDR_REQ, HDR_OBJ};
+	if (e == VENUM(ON_MISS))   return (vcall_info){9, HDR_REQ, HDR_BEREQ};
 
 	if (e == VENUM(ON_LIVE_UPDATE)) return (vcall_info){10, HDR_INVALID, HDR_INVALID};
 	if (e == VENUM(ON_RESUME_UPDATE)) return (vcall_info){11, HDR_INVALID, HDR_INVALID};
@@ -117,6 +119,10 @@ VCL_INT vmod_run(VRT_CTX, VCL_STRING arg)
 		e = VENUM(ON_BACKEND_RESPONSE); break;
 	case VCL_MET_BACKEND_ERROR:
 		e = VENUM(ON_BACKEND_ERROR); break;
+	case VCL_MET_HIT:
+		e = VENUM(ON_HIT); break;
+	case VCL_MET_MISS:
+		e = VENUM(ON_MISS); break;
 	case VCL_MET_DELIVER:
 		e = VENUM(ON_DELIVER); break;
 	default:
