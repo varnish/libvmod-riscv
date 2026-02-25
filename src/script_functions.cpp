@@ -437,7 +437,12 @@ APICALL(synth)
 		if (UNLIKELY(status < 100))
 			throw std::runtime_error("Invalid synth status code: " + std::to_string(status));
 
+#ifdef VARNISH_PLUS
 		http_SetStatus(hp, status);
+#else
+		const char *reason = http_Status2Reason(status, NULL);
+		http_SetStatus(hp, status, reason ? reason : "Unknown reason");
+#endif
 		http_PrintfHeader(hp, "Content-Length: %u", data.size());
 		if (type.is_sequential())
 			http_PrintfHeader(hp, "Content-Type: %.*s", (int)type.size(), type.data());
@@ -447,6 +452,12 @@ APICALL(synth)
 		auto* vsb = (struct vsb *)ctx->specific;
 		assert(vsb != nullptr);
 
+#ifndef VARNISH_PLUS
+		// There is no VSB_new in open-source Varnish
+		VSB_clear(vsb);
+		const std::string buf = data.to_string();
+		VSB_bcat(vsb, buf.data(), buf.size());
+#else
 		// riscv::Buffer tries to accumulate the data in a way
 		// that preserves continuity even if it crosses many pages.
 		// Sadly, even if just one data range is different, we need
@@ -482,6 +493,7 @@ APICALL(synth)
 			vsb->s_len  = data.size();
 			vsb->s_flags = VSB_DYNAMIC;
 		}
+#endif
 		machine.stop();
 #ifdef ENABLE_TIMING
 		TIMING_LOCATION(t1);

@@ -14,7 +14,12 @@ struct http {
 	uint8_t        conds;
 };
 
+#ifdef VARNISH_PLUS
 void http_SetStatus(struct http *hp, uint16_t status);
+#else
+void http_SetStatus(struct http *to, uint16_t status, const char *reason);
+const char *http_Status2Reason(uint16_t status, const char **pdefault);
+#endif
 void http_SetH(struct http *to, unsigned n, const char *fm);
 void http_UnsetIdx(struct http *hp, unsigned idx);
 unsigned HTTP_FindHdr(const struct http *hp, unsigned l, const char *hdr);

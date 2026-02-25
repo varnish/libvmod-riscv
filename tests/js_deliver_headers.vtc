@@ -19,11 +19,6 @@ varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
 	vcl 4.1;
 	import riscv;
 
-	backend default {
-		.host = "${s1_addr}";
-		.port = "${s1_port}";
-	}
-
 	sub vcl_init {
 		riscv.embed_tenants("""{
 			"test.com": {

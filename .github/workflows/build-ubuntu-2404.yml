@@ -1,0 +1,83 @@
+name: Ubuntu Linux 24.04
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-ubuntu-24.04
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Ubuntu Linux 24.04
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Varnish Cache 7.6
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y apt-transport-https
+          curl -s https://packagecloud.io/install/repositories/varnishcache/varnish76/script.deb.sh | sudo bash
+          sudo apt-get update
+          sudo apt-get install -y varnish varnish-dev
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get install -y \
+            g++-14-riscv64-linux-gnu \
+            clang-18 \
+            lld-18 \
+            cmake \
+            ninja-build \
+            libssl-dev \
+            libjemalloc-dev \
+            python3 \
+            pkg-config \
+            ccache
+
+      - name: '🚧 CCache setup'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ubuntu-linux-24.04
+          max-size: 200M
+
+      - name: Build RISC-V programs
+        working-directory: program
+        run: |
+          export GCC_TRIPLE="riscv64-linux-gnu"
+          source detect_compiler.sh
+          mkdir -p $GCC_TRIPLE
+          cd $GCC_TRIPLE
+          cmake ../cpp \
+            -DGCC_TRIPLE=$GCC_TRIPLE \
+            -DCMAKE_TOOLCHAIN_FILE=micro/toolchain.cmake
+          make -j4
+
+      - name: Update test symlinks
+        run: ln -sfn ../program/riscv64-linux-gnu/js tests/js
+
+      - name: Configure
+        env:
+          CC: ccache clang-18
+          CXX: ccache clang++-18
+        run: >
+          cmake -S. -Bbuild
+          -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DVARNISH_PLUS=OFF
+          -DPython3_EXECUTABLE=$(which python3)
+
+      - name: Build
+        run: cmake --build build --config Release -j4
+
+      - name: Install VMOD
+        run: sudo cp build/libvmod_riscv.so $(pkg-config --variable=vmoddir varnishapi)
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j4
