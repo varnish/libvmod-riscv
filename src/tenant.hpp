@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -11,7 +12,10 @@ struct TenantGroup {
 	size_t   max_regex    = 32;
 	bool	 verbose      = false;
 
-	std::vector<std::string> argv;
+	/* Atomically swappable: readers snapshot this shared_ptr, writers
+	   create a new vector and exchange the pointer. */
+	std::shared_ptr<std::vector<std::string>> argv =
+		std::make_shared<std::vector<std::string>>();
 };
 
 struct TenantConfig

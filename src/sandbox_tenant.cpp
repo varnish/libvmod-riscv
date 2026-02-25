@@ -19,7 +19,7 @@ static Timing timing_destr {"destructor"};
 
 std::vector<uint8_t> file_loader(const std::string& file);
 
-static std::string apply_dollar_vars(std::string str)
+std::string apply_dollar_vars(std::string str)
 {
 	// Replace $HOME with the home directory
 	auto find_home = str.find("$HOME");

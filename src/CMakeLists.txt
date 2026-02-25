@@ -55,4 +55,5 @@ add_vmod_tests(vmod_riscv vmod_riscv
 	tests/js_header_case_insensitive.vtc
 	tests/js_header_edge_cases.vtc
 	tests/js_resp_setstatus.vtc
+	tests/js_live_update_file.vtc
 )

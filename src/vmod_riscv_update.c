@@ -3,12 +3,14 @@
 #include "update_result.h"
 
 #include <malloc.h>
+#include <string.h>
 #include "vcl.h"
 #include "vcc_if.h"
 
 extern struct update_result riscv_update(VRT_CTX, struct vmod_riscv_machine*, const struct update_params*);
+extern int riscv_update_file(VRT_CTX, struct vmod_riscv_machine*, const char*, const char*);
 extern const struct vmod_riscv_machine* riscv_current_machine(VRT_CTX);
-extern struct vmod_riscv_machine* tenant_find(VRT_CTX, const char*);
+extern struct vmod_riscv_machine* tenant_find(VRT_CTX, const char*, size_t);
 
 static void v_matchproto_(vdi_panic_f)
 riscvbe_panic(const struct director *dir, struct vsb *vsb)
@@ -256,7 +258,7 @@ VCL_BACKEND vmod_live_update(VRT_CTX, VCL_STRING tenant, VCL_BYTES max_size)
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
-	struct vmod_riscv_machine *rvm = tenant_find(ctx, tenant);
+	struct vmod_riscv_machine *rvm = tenant_find(ctx, tenant, strlen(tenant));
 	if (rvm == NULL) {
 		VRT_fail(ctx, "Could not find tenant: %s", tenant);
 		return NULL;
@@ -283,7 +285,7 @@ VCL_BACKEND vmod_live_debug(
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
-	struct vmod_riscv_machine *rvm = tenant_find(ctx, tenant);
+	struct vmod_riscv_machine *rvm = tenant_find(ctx, tenant, strlen(tenant));
 	if (rvm == NULL) {
 		VRT_fail(ctx, "Could not find tenant: %s", tenant);
 		return NULL;
@@ -304,4 +306,23 @@ VCL_BACKEND vmod_live_debug(
 	rvu_director(ctx, &rvu->dir, rvu);
 
 	return &rvu->dir;
+}
+
+VCL_BOOL vmod_live_update_file(VRT_CTX,
+	VCL_STRING tenant, VCL_STRING filename, VCL_STRING append_argument)
+{
+	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+
+	if (tenant == NULL || filename == NULL) {
+		VRT_fail(ctx, "live_update_file: tenant and filename are required");
+		return 0;
+	}
+
+	struct vmod_riscv_machine *rvm = tenant_find(ctx, tenant, strlen(tenant));
+	if (rvm == NULL) {
+		VRT_fail(ctx, "live_update_file: Could not find tenant: %s", tenant);
+		return 0;
+	}
+
+	return riscv_update_file(ctx, rvm, filename, append_argument);
 }

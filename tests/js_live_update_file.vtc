@@ -1,0 +1,72 @@
+varnishtest "live_update_file - reload same binary with new JS via append_argument"
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/js"
+			}
+		}""");
+		riscv.add_main_argument("test.com", """
+function on_recv(req) {
+	return ["synth", 200];
+}
+""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/update") {
+			if (!riscv.live_update_file("test.com", "${testdir}/js", """
+function on_recv(req) {
+	return ["synth", 418];
+}
+""")) {
+				return (synth(500, "Update failed"));
+			}
+			return (synth(200, "Updated"));
+		}
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(500));
+	}
+} -start
+
+client c1 {
+	# Before update: JS returns 200 for any URL
+	txreq -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/other" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	# Trigger live_update_file - reloads the same js binary with new JS source
+	txreq -url "/update" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	# After update: new JS returns 418 for any URL
+	txreq -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 418
+
+	txreq -url "/other" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 418
+
+	txreq -url "/health" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 418
+} -run

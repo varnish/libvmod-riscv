@@ -109,6 +109,11 @@ $Function BACKEND live_update(STRING tenant, BYTES max_size = 2097152)
   will be kept running.
 - Tenant name must be specified to avoid accidents.
 
+$Function BOOL live_update_file(STRING tenant, STRING filename, STRING append_argument = 0)
+
+- Reload a tenant using the given filename, which can be the same filename as before.
+- If append_argument is given, the string is appended to the main() arguments of the program.
+
 $Function BACKEND live_debug(STRING tenant, BYTES max_size = 2097152)
 
 - Receive a binary suitable for debugging, then

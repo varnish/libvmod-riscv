@@ -19,6 +19,9 @@ function on_recv(req) {
 	if (req.url == "/api")     return ["synth", 200];
 	return ["synth", 404];
 }
+function on_deliver(req, resp) {
+	resp.set("X-Deliver: true");
+}
 """);
 		riscv.finalize_tenants();
 	}
@@ -34,10 +37,8 @@ function on_recv(req) {
 		return (synth(500));
 	}
 
-	sub vcl_synth {
-		if (riscv.active()) {
-			return (deliver);
-		}
+	sub vcl_deliver {
+		riscv.run();
 	}
 } -start
 

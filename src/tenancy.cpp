@@ -43,7 +43,8 @@ static void configure_tenant(TenantGroup& group, const T& obj)
 		group.max_instructions = obj["max_instructions"];
 	}
 	if (obj.contains("arguments")) {
-		group.argv = obj["arguments"].template get<std::vector<std::string>>();
+		group.argv = std::make_shared<std::vector<std::string>>(
+			obj["arguments"].template get<std::vector<std::string>>());
 	}
 }
 
@@ -162,7 +163,10 @@ void tenant_append_main_argument(VRT_CTX, const char* tenant, const char* arg)
 {
 	auto t = tenant_find(ctx, tenant, strlen(tenant));
 	if (t) {
-		t->config.group.argv.push_back(arg);
+		/* vcl_init is single-threaded, but use copy-and-swap for consistency */
+		auto new_argv = std::make_shared<std::vector<std::string>>(*t->config.group.argv);
+		new_argv->push_back(arg);
+		std::atomic_store(&t->config.group.argv, std::move(new_argv));
 	} else {
 		VSL(SLT_Error, 0,
 			"Attempted to add main argument to non-existent tenant '%s'",
