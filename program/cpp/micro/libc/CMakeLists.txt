@@ -6,7 +6,7 @@ set(LIBC_SOURCES
 	${BBLIBCPATH}/libc.cpp
 	${BBLIBCPATH}/libcxx.cpp
   )
-if (GCC_TRIPLE STREQUAL "riscv32-unknown-elf")
+if (GCC_TRIPLE STREQUAL "riscv32-unknown-elf" OR GCC_TRIPLE STREQUAL "riscv64-unknown-elf")
 	# There is a problem with heap on 64-bit
 	list(APPEND LIBC_SOURCES
 		assert.cpp

@@ -59,7 +59,7 @@ set(CMAKE_SHARED_LIBRARY_LINK_CXX_FLAGS "") # remove -rdynamic
 set(USE_NEWLIB ON)
 
 # enforce correct global include order for our tiny libc
-option(LIBC_WRAP_NATIVE "" OFF)
+option(LIBC_WRAP_NATIVE "" ON)
 include_directories(${CMAKE_CURRENT_LIST_DIR}/libc)
 set (BBLIBCPATH "${CMAKE_CURRENT_LIST_DIR}/ext/libriscv/binaries/barebones/libc")
 include_directories(${BBLIBCPATH})
@@ -74,13 +74,13 @@ set(CHPERM  ${CMAKE_CURRENT_LIST_DIR}/chperm)
 function (add_micro_binary NAME)
 	add_executable(${NAME} ${ARGN})
 	if (LIBC_WRAP_NATIVE)
-	#target_link_libraries(${NAME} -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free,--wrap=_sbrk)
-	#target_link_libraries(${NAME} -Wl,--wrap=_malloc_r,--wrap=_calloc_r,--wrap=_realloc_r,--wrap=_free_r)
+	target_link_libraries(${NAME} -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free,--wrap=_sbrk)
+	target_link_libraries(${NAME} -Wl,--wrap=_malloc_r,--wrap=_calloc_r,--wrap=_realloc_r,--wrap=_free_r)
 	target_link_libraries(${NAME} -Wl,--wrap=memalign,--wrap=posix_memalign,--wrap=aligned_alloc)
 	target_link_libraries(${NAME} -Wl,--wrap=_memalign_r)
 	endif()
 	target_link_libraries(${NAME} -static -Wl,--whole-archive libc -Wl,--no-whole-archive)
-	target_link_libraries(${NAME} fmt nlohmann_json tinyxml2 qjs m atomic)
+	target_link_libraries(${NAME} fmt nlohmann_json tinyxml2 qjs)
 	# strip symbols but keep public API
 	if (STRIP_SYMBOLS AND NOT DEBUGGING)
 		add_custom_command(TARGET ${NAME} POST_BUILD

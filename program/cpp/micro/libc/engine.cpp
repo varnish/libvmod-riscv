@@ -17,6 +17,9 @@ GENERATE_SYSCALL_WRAPPER(sys_field_retrieve,    ECALL_FIELD_RETRIEVE);
 GENERATE_SYSCALL_WRAPPER(sys_field_retrieve_str, ECALL_FIELD_RETRIEVE_STR);
 GENERATE_SYSCALL_WRAPPER(sys_field_set,         ECALL_FIELD_SET);
 GENERATE_SYSCALL_WRAPPER(sys_field_append,      ECALL_FIELD_APPEND);
+#if __has_include(<reent.h>)
+GENERATE_SYSCALL_WRAPPER(clock_gettime, 113);
+#endif
 asm(".popsection\n");
 
 extern "C" __attribute__((noinline))
