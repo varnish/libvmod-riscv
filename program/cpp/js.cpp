@@ -131,7 +131,7 @@ static JSValue hdr_get(JSContext* ctx, api::gethdr_e where,
 		return JS_EXCEPTION;
 	api::HTTP http{where};
 	const auto hf = http.find(name);
-	JS_FreeCString(ctx, name);
+	// JS_FreeCString omitted: request heap resets at request end
 	if (!hf)
 		return JS_NULL;
 	const auto val = hf.value();
@@ -148,7 +148,7 @@ static JSValue hdr_set(JSContext* ctx, api::gethdr_e where,
 	if (!line)
 		return JS_EXCEPTION;
 	api::HTTP{where}.append({line, len});
-	JS_FreeCString(ctx, line);
+	// JS_FreeCString omitted: request heap resets at request end
 	return JS_UNDEFINED;
 }
 
@@ -162,7 +162,7 @@ static JSValue hdr_unset(JSContext* ctx, api::gethdr_e where,
 		return JS_EXCEPTION;
 	api::HTTP http{where};
 	auto hf = http.find(name);
-	JS_FreeCString(ctx, name);
+	// JS_FreeCString omitted: request heap resets at request end
 	if (hf)
 		hf.unset();
 	return JS_UNDEFINED;
@@ -319,7 +319,7 @@ static JSValue js_decision(JSContext* ctx, JSValueConst, int argc, JSValueConst*
 	if (argc >= 2)
 		JS_ToInt32(ctx, &status, argv[1]);
 	varnish::decision({dec, len}, status);
-	JS_FreeCString(ctx, dec);
+	// JS_FreeCString omitted: request heap resets at request end
 	return JS_UNDEFINED;
 }
 
@@ -332,7 +332,7 @@ static JSValue js_hash_data(JSContext* ctx, JSValueConst, int argc, JSValueConst
 	if (!s)
 		return JS_EXCEPTION;
 	varnish::hash_data({s, len});
-	JS_FreeCString(ctx, s);
+	// JS_FreeCString omitted: request heap resets at request end
 	return JS_UNDEFINED;
 }
 
@@ -343,7 +343,7 @@ static JSValue js_print(JSContext* ctx, JSValueConst, int argc, JSValueConst* ar
 		if (!s)
 			return JS_EXCEPTION;
 		varnish::print("{}", s);
-		JS_FreeCString(ctx, s);
+		// JS_FreeCString omitted: request heap resets at request end
 	}
 	return JS_UNDEFINED;
 }
@@ -355,7 +355,7 @@ static JSValue js_log(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv
 		if (!s)
 			return JS_EXCEPTION;
 		varnish::log("{}", s);
-		JS_FreeCString(ctx, s);
+		// JS_FreeCString omitted: request heap resets at request end
 	}
 	return JS_UNDEFINED;
 }
@@ -433,10 +433,9 @@ static void apply_return_decision(JSContext* ctx, JSValue ret)
 	if (JS_IsString(ret)) {
 		size_t len;
 		const char* s = JS_ToCStringLen(ctx, &len, ret);
-		if (s) {
+		if (s)
 			varnish::decision({s, len});
-			JS_FreeCString(ctx, s);
-		}
+		// JS_FreeCString omitted: request heap resets at request end
 	} else if (JS_IsArray(ret)) {
 		JSValue v0 = JS_GetPropertyUint32(ctx, ret, 0);
 		JSValue v1 = JS_GetPropertyUint32(ctx, ret, 1);
@@ -444,12 +443,9 @@ static void apply_return_decision(JSContext* ctx, JSValue ret)
 		const char* s = JS_ToCStringLen(ctx, &len, v0);
 		int32_t status = 200;
 		JS_ToInt32(ctx, &status, v1);
-		if (s) {
+		if (s)
 			varnish::decision({s, len}, status);
-			JS_FreeCString(ctx, s);
-		}
-		JS_FreeValue(ctx, v0);
-		JS_FreeValue(ctx, v1);
+		// JS_FreeCString / JS_FreeValue omitted: request heap resets at request end
 	}
 	// null / undefined / other → no-op
 }
@@ -472,9 +468,6 @@ static void on_recv(varnish::Request, varnish::Response, const char*)
 
 static void on_hash(varnish::Request, varnish::Response)
 {
-	if (!JS_IsFunction(g_ctx, g_hooks.on_hash))
-		return;
-
 	// req headers are available in vcl_hash even though vcall passes HDR_INVALID
 	JSValue ret = JS_Call(g_ctx, g_hooks.on_hash, JS_UNDEFINED, 1, &g_objects.req);
 	if (JS_IsException(ret))
@@ -485,9 +478,6 @@ static void on_hash(varnish::Request, varnish::Response)
 
 static void on_synth(varnish::Request, varnish::Response)
 {
-	if (!JS_IsFunction(g_ctx, g_hooks.on_synth))
-		return;
-
 	JSValue args[2] = { g_objects.req, g_objects.resp };
 	JSValue ret = JS_Call(g_ctx, g_hooks.on_synth, JS_UNDEFINED, 2, args);
 	if (JS_IsException(ret))
@@ -498,9 +488,6 @@ static void on_synth(varnish::Request, varnish::Response)
 
 static void on_hit(varnish::Request, varnish::Response)
 {
-	if (!JS_IsFunction(g_ctx, g_hooks.on_hit))
-		return;
-
 	JSValue args[2] = { g_objects.req, g_objects.obj };
 	JSValue ret = JS_Call(g_ctx, g_hooks.on_hit, JS_UNDEFINED, 2, args);
 	if (JS_IsException(ret))
@@ -511,9 +498,6 @@ static void on_hit(varnish::Request, varnish::Response)
 
 static void on_miss(varnish::Request, varnish::Response)
 {
-	if (!JS_IsFunction(g_ctx, g_hooks.on_miss))
-		return;
-
 	// bereq (HDR_BEREQ) is the newly-created backend request, presented as req-like
 	JSValue args[2] = { g_objects.req, g_objects.bereq };
 	JSValue ret = JS_Call(g_ctx, g_hooks.on_miss, JS_UNDEFINED, 2, args);
@@ -525,9 +509,6 @@ static void on_miss(varnish::Request, varnish::Response)
 
 static void on_deliver(varnish::Request, varnish::Response)
 {
-	if (!JS_IsFunction(g_ctx, g_hooks.on_deliver))
-		return;
-
 	JSValue args[2] = { g_objects.req, g_objects.resp };
 	JSValue ret = JS_Call(g_ctx, g_hooks.on_deliver, JS_UNDEFINED, 2, args);
 	if (JS_IsException(ret))
@@ -538,9 +519,6 @@ static void on_deliver(varnish::Request, varnish::Response)
 
 static void on_backend_fetch(varnish::Request, varnish::Response)
 {
-	if (!JS_IsFunction(g_ctx, g_hooks.on_backend_fetch))
-		return;
-
 	JSValue ret = JS_Call(g_ctx, g_hooks.on_backend_fetch, JS_UNDEFINED, 1, &g_objects.bereq);
 	if (JS_IsException(ret))
 		js_dump_exception(g_ctx);
@@ -550,9 +528,6 @@ static void on_backend_fetch(varnish::Request, varnish::Response)
 
 static void on_backend_response(varnish::Request, varnish::Response)
 {
-	if (!JS_IsFunction(g_ctx, g_hooks.on_backend_response))
-		return;
-
 	JSValue args[2] = { g_objects.bereq, g_objects.beresp };
 	JSValue ret = JS_Call(g_ctx, g_hooks.on_backend_response, JS_UNDEFINED, 2, args);
 	if (JS_IsException(ret))
@@ -563,9 +538,6 @@ static void on_backend_response(varnish::Request, varnish::Response)
 
 static void on_backend_error(varnish::Request, varnish::Response)
 {
-	if (!JS_IsFunction(g_ctx, g_hooks.on_backend_error))
-		return;
-
 	JSValue args[2] = { g_objects.bereq, g_objects.beresp };
 	JSValue ret = JS_Call(g_ctx, g_hooks.on_backend_error, JS_UNDEFINED, 2, args);
 	if (JS_IsException(ret))
@@ -587,23 +559,25 @@ int main(int argc, char** argv)
 	// JavaScript code is in the last argument
 	setup_quickjs(argv[argc - 1], !varnish::is_storage());
 
-	varnish::sys_register_callback(varnish::CALLBACK_ON_RECV,
-		(void(*)())on_recv);
-	varnish::sys_register_callback(varnish::CALLBACK_ON_HASH,
-		(void(*)())on_hash);
-	varnish::sys_register_callback(varnish::CALLBACK_ON_SYNTH,
-		(void(*)())on_synth);
-	varnish::sys_register_callback(varnish::CALLBACK_ON_HIT,
-		(void(*)())on_hit);
-	varnish::sys_register_callback(varnish::CALLBACK_ON_MISS,
-		(void(*)())on_miss);
-	varnish::sys_register_callback(varnish::CALLBACK_ON_BACKEND_FETCH,
-		(void(*)())on_backend_fetch);
-	varnish::sys_register_callback(varnish::CALLBACK_ON_BACKEND_RESPONSE,
-		(void(*)())on_backend_response);
-	varnish::sys_register_callback(varnish::CALLBACK_ON_BACKEND_ERROR,
-		(void(*)())on_backend_error);
+	// Only register VCL callbacks for hooks the JS program actually defines.
+	// This avoids the ecall overhead for every unused VCL state on every request.
+#define REGISTER_IF(hook, cb, constant) \
+	if (JS_IsFunction(g_ctx, g_hooks.hook)) \
+		varnish::sys_register_callback(varnish::constant, (void(*)())cb)
 
-	varnish::set_on_deliver(on_deliver);
+	REGISTER_IF(on_recv,             on_recv,             CALLBACK_ON_RECV);
+	REGISTER_IF(on_hash,             on_hash,             CALLBACK_ON_HASH);
+	REGISTER_IF(on_synth,            on_synth,            CALLBACK_ON_SYNTH);
+	REGISTER_IF(on_hit,              on_hit,              CALLBACK_ON_HIT);
+	REGISTER_IF(on_miss,             on_miss,             CALLBACK_ON_MISS);
+	REGISTER_IF(on_backend_fetch,    on_backend_fetch,    CALLBACK_ON_BACKEND_FETCH);
+	REGISTER_IF(on_backend_response, on_backend_response, CALLBACK_ON_BACKEND_RESPONSE);
+	REGISTER_IF(on_backend_error,    on_backend_error,    CALLBACK_ON_BACKEND_ERROR);
+
+#undef REGISTER_IF
+
+	if (JS_IsFunction(g_ctx, g_hooks.on_deliver))
+		varnish::set_on_deliver(on_deliver);
+
 	varnish::wait_for_requests(on_recv);
 }
