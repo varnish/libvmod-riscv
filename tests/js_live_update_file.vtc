@@ -21,10 +21,26 @@ function on_recv(req) {
 	}
 
 	sub vcl_recv {
-		if (req.url == "/update") {
+		if (req.url == "/update1") {
 			if (!riscv.live_update_file("test.com", "${testdir}/js", """
 function on_recv(req) {
-	return ["synth", 418];
+	return ["synth", 404];
+}
+function on_synth(req, resp) {
+	resp.set("X-Updated1: true");
+}
+""")) {
+				return (synth(500, "Update failed"));
+			}
+			return (synth(200, "Updated"));
+		}
+		if (req.url == "/update2") {
+			if (!riscv.live_update_file("test.com", "${testdir}/js", """
+function on_recv(req) {
+	return ["synth", 404];
+}
+function on_synth(req, resp) {
+	resp.set("X-Updated2: true");
 }
 """)) {
 				return (synth(500, "Update failed"));
@@ -40,6 +56,9 @@ function on_recv(req) {
 		}
 		return (synth(500));
 	}
+	sub vcl_synth {
+		riscv.run();
+	}
 } -start
 
 client c1 {
@@ -53,20 +72,27 @@ client c1 {
 	expect resp.status == 200
 
 	# Trigger live_update_file - reloads the same js binary with new JS source
-	txreq -url "/update" -hdr "Host: test.com"
+	txreq -url "/update1" -hdr "Host: test.com"
 	rxresp
 	expect resp.status == 200
 
-	# After update: new JS returns 418 for any URL
+	# After update: new JS returns 404 for any URL
 	txreq -url "/" -hdr "Host: test.com"
 	rxresp
-	expect resp.status == 418
+	expect resp.status == 404
+	expect resp.http.X-Updated1 == "true"
 
 	txreq -url "/other" -hdr "Host: test.com"
 	rxresp
-	expect resp.status == 418
+	expect resp.status == 404
 
-	txreq -url "/health" -hdr "Host: test.com"
+	txreq -url "/update2" -hdr "Host: test.com"
 	rxresp
-	expect resp.status == 418
+	expect resp.status == 200
+
+	# After second update: new JS returns 404 for any URL
+	txreq -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 404
+	expect resp.http.X-Updated2 == "true"
 } -run

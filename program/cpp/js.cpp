@@ -30,15 +30,17 @@
  * req / bereq properties and methods:
  *   req.url            -> string  (lazy: fetched on access)
  *   req.method         -> string  (lazy: fetched on access)
- *   req.get(name)      -> string | null
- *   req.set(line)      -> void    // full "Name: Value" line
- *   req.unset(name)    -> void
+ *   req.get(name)           -> string | null
+ *   req.set(line)           -> void    // full "Name: Value" line
+ *   req.set(name, value)    -> void    // separate name and value
+ *   req.unset(name)         -> void
  *
  * resp / beresp / obj properties and methods:
- *   resp.status           -> number  (lazy: fetched on access)
- *   resp.get(name)        -> string | null
- *   resp.set(line)        -> void
- *   resp.unset(name)      -> void
+ *   resp.status              -> number  (lazy: fetched on access)
+ *   resp.get(name)           -> string | null
+ *   resp.set(line)           -> void
+ *   resp.set(name, value)    -> void
+ *   resp.unset(name)         -> void
  *   resp.setStatus(code)  -> void
  *
  * The varnish namespace (global object "varnish") exposes:
@@ -143,6 +145,19 @@ static JSValue hdr_set(JSContext* ctx, api::gethdr_e where,
 {
 	if (argc < 1)
 		return JS_UNDEFINED;
+	if (argc >= 2) {
+		// Two-argument form: set("Name", "Value")
+		const char* name = JS_ToCString(ctx, argv[0]);
+		if (!name)
+			return JS_EXCEPTION;
+		size_t vlen;
+		const char* value = JS_ToCStringLen(ctx, &vlen, argv[1]);
+		if (!value)
+			return JS_EXCEPTION;
+		api::HTTP{where}.appendf("{}: {}", name, std::string_view{value, vlen});
+		// JS_FreeCString omitted: request heap resets at request end
+		return JS_UNDEFINED;
+	}
 	size_t len;
 	const char* line = JS_ToCStringLen(ctx, &len, argv[0]);
 	if (!line)

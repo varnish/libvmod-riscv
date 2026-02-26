@@ -51,7 +51,8 @@ long riscv_current_call_idx(VRT_CTX, vcall_info info, const char* argument)
 	if (script) {
 		return riscv_call_idx(script, ctx, info, argument);
 	}
-	VRT_fail(ctx, "current_call_idx() failed (no running machine)");
+	if (ctx && ctx->vsl)
+		VSLb(ctx->vsl, SLT_VCL_Log, "riscv_current_call_idx() skipped: no running machine");
 	return -1;
 }
 extern "C"
