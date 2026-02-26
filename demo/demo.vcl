@@ -84,11 +84,19 @@ sub vcl_init {
 	}""");
 	riscv.add_main_argument("qjs.com",
 		"""
+		function on_forge(bereq, beresp, body) {
+			varnish.log("Handling forge in RISC-V JS tenant");
+			return {
+				status: 200,
+				contentType: "text/plain",
+				body: "Forged response from RISC-V JS tenant! Body was: " + (body || "null")
+			};
+		}
 		function on_recv(req) {
 			varnish.log("Handling " + req.url + " in QuickJS tenant");
 			if (req.url == "/test") {
 				varnish.log("Handling /test in RISC-V JS tenant");
-				return ["synth", 200];
+				varnish.forge(true);
 			}
 			return "hash";
 		}

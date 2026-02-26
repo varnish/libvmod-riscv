@@ -49,6 +49,18 @@
  *     varnish.setCacheable(bool)  -> void
  *     varnish.setTTL(secs)        -> void
  *
+ *   Forging backend responses:
+ *     varnish.forge()      -> void   // synthesize backend response (not cached)
+ *     varnish.forge(true)  -> void   // cached
+ *
+ *   Requires a global on_forge function to be defined in the JS program:
+ *     function on_forge(bereq, beresp, body) { return { status, contentType, body }; }
+ *   body is a string with the POST body content, or null if there is no body.
+ *
+ *   NOTE: on_forge runs in the backend VM instance — a separate copy of the
+ *   program state. Only snapshot-stable (init-time) values are shared across
+ *   the instance boundary; request-time closures cannot cross it.
+ *
  *   Decisions / misc:
  *     varnish.decision(name [, status]) -> void
  *     varnish.hashData(str)             -> void
@@ -80,6 +92,7 @@ static struct {
 	JSValue on_backend_fetch;
 	JSValue on_backend_response;
 	JSValue on_backend_error;
+	JSValue on_forge;
 } g_hooks;
 
 // Pre-built HTTP objects — created once in main(), reused every request.
@@ -376,6 +389,76 @@ static JSValue js_log(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv
 }
 
 // ---------------------------------------------------------------------------
+// forge: synthesize a backend response from a JS callback
+// ---------------------------------------------------------------------------
+
+// C++ backend function: called by js_backend_trampoline_post when the host is
+// ready to produce the forge response.  Uses g_hooks.on_forge, which was
+// looked up once at init time — valid in every VM instance (backend or frontend)
+// because all instances run the same deterministic initialization.
+static varnish::response js_forge_backend_fn(varnish::Request, varnish::Response,
+                                              const void* body_data, size_t body_size)
+{
+	JSContext* ctx = g_ctx;
+	JSValue body = (body_size > 0)
+		? JS_NewStringLen(ctx, (const char*)body_data, body_size)
+		: JS_NULL;
+	JSValue args[3] = { g_objects.bereq, g_objects.beresp, body };
+	JSValue ret = JS_Call(ctx, g_hooks.on_forge, JS_UNDEFINED, 3, args);
+	if (JS_IsException(ret)) {
+		js_dump_exception(ctx);
+		return varnish::response{500, std::string("text/plain"),
+		                         std::string_view("Internal JS error", 17)};
+	}
+
+	// Expect: { status: number, contentType: string, body: string }
+	JSValue status_val = JS_GetPropertyStr(ctx, ret, "status");
+	JSValue ctype_val  = JS_GetPropertyStr(ctx, ret, "contentType");
+	JSValue body_val   = JS_GetPropertyStr(ctx, ret, "body");
+
+	int32_t status = 200;
+	JS_ToInt32(ctx, &status, status_val);
+
+	size_t ctype_len = 0, data_len = 0;
+	const char* ctype = JS_ToCStringLen(ctx, &ctype_len, ctype_val);
+	const char* data  = JS_ToCStringLen(ctx, &data_len,  body_val);
+
+	std::string      content_type(ctype && ctype_len ? ctype : "text/plain",
+	                              ctype && ctype_len ? ctype_len : 10u);
+	std::string_view content(data, data_len);
+	// JS_FreeCString omitted: request heap resets at request end
+	return varnish::response{(uint16_t)status, content_type, content};
+	// ^ response constructor calls forge_response (noreturn ecall)
+}
+
+// Called by the host when the backend response needs to be produced.
+// No pointer reconstruction needed — g_hooks.on_forge is init-time stable.
+extern "C"
+varnish::response js_backend_trampoline_post(void* /*unused*/, void* data, size_t size)
+{
+	constexpr auto bereq  = api::Request {api::HDR_BEREQ};
+	constexpr auto beresp = api::Response{api::HDR_BERESP};
+	return js_forge_backend_fn(bereq, beresp, data, size);
+}
+
+// varnish.forge()      — synthesize backend response, not cached
+// varnish.forge(true)  — same but cached
+// Requires a global 'on_forge(bereq, beresp)' function in the JS program.
+static JSValue js_forge(JSContext* ctx, JSValueConst, int argc, JSValueConst* argv)
+{
+	if (!JS_IsFunction(g_ctx, g_hooks.on_forge))
+		return JS_ThrowReferenceError(ctx, "forge: no 'on_forge' function defined");
+
+	varnish::Cache cache = varnish::NotCached;
+	if (argc >= 1) {
+		int cached = JS_ToBool(ctx, argv[0]);
+		cache = (cached > 0) ? varnish::Cached : varnish::NotCached;
+	}
+	syscall(ECALL_BACKEND_DECISION, (int)cache, (long)js_backend_trampoline_post, 0L);
+	return JS_UNDEFINED;
+}
+
+// ---------------------------------------------------------------------------
 // main: build the varnish namespace, eval the user script, cache hooks
 // ---------------------------------------------------------------------------
 
@@ -398,6 +481,7 @@ static void setup_quickjs(const char* js_code, bool verbose)
 	BIND("hashData",     js_hash_data,     1);
 	BIND("print",        js_print,         1);
 	BIND("log",          js_log,           1);
+	BIND("forge",        js_forge,         2);
 
 #undef BIND
 
@@ -433,6 +517,7 @@ static void setup_quickjs(const char* js_code, bool verbose)
 	g_hooks.on_backend_fetch    = JS_GetPropertyStr(g_ctx, g_global, "on_backend_fetch");
 	g_hooks.on_backend_response = JS_GetPropertyStr(g_ctx, g_global, "on_backend_response");
 	g_hooks.on_backend_error    = JS_GetPropertyStr(g_ctx, g_global, "on_backend_error");
+	g_hooks.on_forge            = JS_GetPropertyStr(g_ctx, g_global, "on_forge");
 }
 
 // ---------------------------------------------------------------------------
