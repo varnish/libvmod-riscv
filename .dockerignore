@@ -1,0 +1,6 @@
+# Host build artifacts that contain hardcoded paths
+program/riscv32-unknown-elf/
+program/riscv64-unknown-elf/
+program/riscv64-linux-gnu/
+build/
+.build/
