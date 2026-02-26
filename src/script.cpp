@@ -59,9 +59,32 @@ Script::Script(
 	/* No initialization */
 	this->machine_setup(machine(), false);
 
-	/* Transfer allocations from the source machine, to fully replicate heap */
+	/* Set up a fresh arena starting at the master's high-water mark.
+	 * This is O(1): no chunk-list copy, no pointer fixups.
+	 * The fork's allocator covers only [watermark, heap_end), i.e. the region
+	 * beyond everything the master has ever allocated.  Master-owned addresses
+	 * are "unknown" to this arena; the callbacks below handle the two cases
+	 * that would otherwise fail:
+	 *   free()    – silently succeed; the fork is short-lived so the space is
+	 *               recovered when the fork is destroyed.
+	 *   realloc() – allocate fresh memory in the fork's range, return the old
+	 *               size so the ecall layer can memcpy the contents. */
 	if (source.machine().has_arena()) {
-		machine().transfer_arena_from(source.machine());
+		const auto arena_base = source.machine().memory.heap_address();
+		const auto watermark  = source.m_arena_watermark;
+		const auto remaining  = vrm()->config.max_heap() - (watermark - arena_base);
+		machine().setup_native_heap(NATIVE_SYSCALLS_BASE, watermark, remaining);
+
+		machine().arena().on_unknown_free(
+			[](auto /*ptr*/, auto* /*ch*/) -> int { return 0; });
+
+		const riscv::Arena* src_arena = &source.machine().arena();
+		machine().arena().on_unknown_realloc(
+			[src_arena, this](auto ptr, auto newsize) -> riscv::Arena::ReallocResult {
+				const size_t old_len = src_arena->size(ptr);
+				const auto   new_ptr = machine().arena().malloc(newsize);
+				return {new_ptr, old_len};
+			});
 	}
 	/* Load the compiled regexes of the source */
 	m_regex.loan_from(source.m_regex);
@@ -148,6 +171,11 @@ void Script::machine_initialize()
 		handle_exception(machine().cpu.pc());
 		throw;
 	}
+	// Cache the high-water mark of the master arena once, after initialization.
+	// Fork constructors use this to create a fresh arena starting here — O(1)
+	// instead of copying the full chunk list.
+	if (machine().has_arena())
+		m_arena_watermark = machine().arena().high_watermark();
 	return;
 	// For each entry point, try to optimize the return path
 	for (auto& entry : m_inst.callback_entries) {
@@ -308,8 +336,8 @@ void Script::machine_setup(machine_t& machine, bool init)
 		machine.setup_linux_syscalls(false, false);
 		machine.setup_posix_threads();
 		// Custom system call API >= 500
-		// NOTE: We do not need to setup_native_heap in the forked
-		// VMs because it the heap transfer will re-create the arena.
+		// Forked VMs call setup_native_heap themselves (in the fork ctor)
+		// starting at the master's high-water mark, so we only set it up here.
 		const uint64_t arena_base = machine.memory.mmap_allocate(vrm()->config.max_heap());
 		machine.setup_native_heap(NATIVE_SYSCALLS_BASE,
 			arena_base, vrm()->config.max_heap());

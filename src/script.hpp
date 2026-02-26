@@ -119,6 +119,7 @@ private:
 	const struct SandboxTenant* m_tenant = nullptr;
 	MachineInstance& m_inst;
 	gaddr_t     m_post_data = 0;
+	gaddr_t     m_arena_watermark = 0; // cached after machine_initialize(); used by fork ctor
 
 	std::string m_want_result;
 	std::array<gaddr_t, RESULTS_MAX> m_want_values = {};
