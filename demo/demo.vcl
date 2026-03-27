@@ -1,5 +1,4 @@
 vcl 4.1;
-import digest;
 import riscv;
 import std;
 
