@@ -1,5 +1,7 @@
 $Module riscv 3 "RISC-V Sandbox For VCL"
 
+$Addon
+
 DESCRIPTION
 ===========
 
