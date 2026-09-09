@@ -89,6 +89,7 @@ jobs:
           # to where varnish-plus / varnish-plus-dev(el) actually ships.
           - { label: ubuntu-jammy,    family: deb, codename: jammy,    image: "ubuntu:22.04" }
           - { label: ubuntu-noble,    family: deb, codename: noble,    image: "ubuntu:24.04" }
+          - { label: ubuntu-resolute, family: deb, codename: resolute, image: "ubuntu:26.04" }
           - { label: debian-bookworm, family: deb, codename: bookworm, image: "debian:bookworm" }
           - { label: debian-trixie,   family: deb, codename: trixie,   image: "debian:trixie" }
           - { label: almalinux-8,     family: rpm, dist: el8,          image: "almalinux:8" }
