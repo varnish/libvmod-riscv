@@ -1,6 +1,7 @@
 #include "sandbox_tenant.hpp"
 #include "varnish.hpp"
 #include <nlohmann/json.hpp>
+#include <string_view>
 #include <libriscv/util/crc32.hpp>
 using json = nlohmann::json;
 
@@ -15,15 +16,29 @@ inline MapType& tenants(VRT_CTX)
 	return t;
 }
 
+/* The map is keyed by a CRC of the name, which anyone can collide, so a
+   lookup is only a hit when the name itself matches too. */
+inline SandboxTenant* find_tenant(VRT_CTX, std::string_view name)
+{
+	auto& map = tenants(ctx);
+	auto it = map.find(riscv::crc32c(name.data(), name.size()));
+	if (it != map.end() && it->second->config.name == name)
+		return it->second;
+	return nullptr;
+}
+
 inline void load_tenant(VRT_CTX, TenantConfig&& config)
 {
 	try {
 		const auto hash = riscv::crc32c(config.name.c_str(), config.name.size());
-		auto res = tenants(ctx).try_emplace(
-			hash,
-			new SandboxTenant(ctx, config));
-		if (res.second == false)
-			throw std::runtime_error("Tenant " + config.name + " already existed!");
+		auto existing = tenants(ctx).find(hash);
+		if (existing != tenants(ctx).end()) {
+			if (existing->second->config.name == config.name)
+				throw std::runtime_error("Tenant " + config.name + " already existed!");
+			throw std::runtime_error("Tenant " + config.name + " has the same hash as tenant "
+				+ existing->second->config.name + "; rename one of them");
+		}
+		tenants(ctx).emplace(hash, new SandboxTenant(ctx, config));
 	} catch (const std::exception& e) {
 		VRT_fail(ctx, "Exception when creating machine '%s': %s",
 			config.name.c_str(), e.what());
@@ -88,11 +103,7 @@ static void init_tenants(VRT_CTX,
 				});
 			} else {
 				// Existing tenant, reconfigure
-				auto tit = tenants(ctx).find(
-					riscv::crc32c(it.key().c_str(), it.key().size())
-				);
-				if (tit != tenants(ctx).end()) {
-					auto& tenant = tit->second;
+				if (auto* tenant = find_tenant(ctx, it.key())) {
 					auto& group  = tenant->config.group;
 					configure_tenant(group, obj);
 					continue;
@@ -125,13 +136,7 @@ rvs::SandboxTenant* tenant_find(VRT_CTX, const char* name, size_t namelen)
 {
 	if (UNLIKELY(name == nullptr))
 		return nullptr;
-	auto& map = rvs::tenants(ctx);
-	const auto hash = riscv::crc32c(name, namelen);
-	// regular tenants
-	auto it = map.find(hash);
-	if (it != map.end())
-		return it->second;
-	return nullptr;
+	return rvs::find_tenant(ctx, {name, namelen});
 }
 
 extern "C"

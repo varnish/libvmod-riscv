@@ -1,0 +1,120 @@
+varnishtest "VCL tenant: static statistics become Varnish counters"
+
+server s1 -repeat 4 {
+	rxreq
+	txresp -body "ok"
+} -start
+
+varnish v1 -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"one.com": { "filename": "${testdir}/vcl/stats.vcl" },
+			"two.com": { "filename": "${testdir}/vcl/stats.vcl" }
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/update") {
+			if (riscv.live_update_file(req.http.Host, "${testdir}/vcl/" + req.http.X-File)) {
+				return (synth(200, "reloaded"));
+			}
+			return (synth(500, "reload failed"));
+		}
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(500, "no tenant"));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (hash);
+	}
+
+	sub vcl_backend_fetch {
+		if (riscv.fork(bereq.http.Host)) {
+			riscv.run();
+		}
+	}
+
+	sub vcl_backend_response {
+		if (riscv.active()) {
+			riscv.run();
+		}
+	}
+
+	sub vcl_deliver {
+		if (riscv.active()) {
+			riscv.run();
+		}
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.run();
+			return (deliver);
+		}
+	}
+} -start
+
+# Nothing has run yet: a min starts at its identity.
+varnish v1 -expect RISCV.one.com.requests == 0
+varnish v1 -expect RISCV.one.com.smallest == 9223372036854775807
+
+client c1 {
+	txreq -url "/a" -hdr "Host: one.com" -hdr "X-Size: 40"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Seen == "1"
+	expect resp.http.X-Offset == "102"
+
+	txreq -url "/b" -hdr "Host: one.com" -hdr "X-Size: 7"
+	rxresp
+	expect resp.http.X-Seen == "1"
+
+	# A hit: no fetch, but recv and deliver still count.
+	txreq -url "/a" -hdr "Host: one.com" -hdr "X-Size: 12"
+	rxresp
+	expect resp.http.X-Seen == "1"
+
+	txreq -url "/c" -hdr "Host: two.com" -hdr "X-Size: 3"
+	rxresp
+	expect resp.http.X-Seen == "1"
+} -run
+
+varnish v1 -expect RISCV.one.com.requests == 3
+varnish v1 -expect RISCV.one.com.fetches == 2
+varnish v1 -expect RISCV.one.com.inflight == 0
+varnish v1 -expect RISCV.one.com.largest == 40
+varnish v1 -expect RISCV.one.com.smallest == 7
+varnish v1 -expect RISCV.one.com.offset == 6
+# The tenant is part of the name: two.com counts on its own.
+varnish v1 -expect RISCV.two.com.requests == 1
+varnish v1 -expect RISCV.two.com.fetches == 1
+varnish v1 -expect RISCV.two.com.smallest == 3
+
+client c2 {
+	# A program that changes what a name counts is refused, and the
+	# running one stays.
+	txreq -url "/update" -hdr "Host: one.com" -hdr "X-File: stats_kind.vcl"
+	rxresp
+	expect resp.status == 500
+
+	# A live update keeps the counter.
+	txreq -url "/update" -hdr "Host: one.com" -hdr "X-File: stats_updated.vcl"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/d" -hdr "Host: one.com"
+	rxresp
+	expect resp.status == 204
+} -run
+
+varnish v1 -expect RISCV.one.com.requests == 13
+# The refused program published none of its statistics.
+shell -match "^0$" {varnishstat -n ${v1_name} -1 | grep -c "RISCV.one.com.leaked" || true}
+varnish v1 -expect RISCV.one.com.peak == 100
+varnish v1 -expect RISCV.two.com.requests == 1

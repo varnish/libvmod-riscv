@@ -15,10 +15,11 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/ext/json/single_include \
 	-DVMOD=1 \
 	-D_GNU_SOURCE \
-	-DRISCV_SYSCALLS_MAX=600 \
+	-DRISCV_SYSCALLS_MAX=601 \
 	$(CRYPTO_CFLAGS)
 
-AM_CFLAGS   = $(VARNISHAPI_CFLAGS) -Wall
+## -Wa,-I lets vcl/vclc_blob.c .incbin the sandboxed VCL compiler.
+AM_CFLAGS   = $(VARNISHAPI_CFLAGS) -Wall -Wa,-I$(top_srcdir)/vcl
 AM_CXXFLAGS = $(VARNISHAPI_CFLAGS) -Wall
 AM_LDFLAGS  = $(VARNISHAPI_LIBS) $(VMOD_LDFLAGS)
 
@@ -55,7 +56,13 @@ libvmod_riscv_la_SOURCES = \
 	vmod_riscv_backend.c \
 	vmod_riscv.c \
 	vmod_riscv_post.c \
-	vmod_riscv_update.c
+	vmod_riscv_update.c \
+	vcl/compiler.cpp \
+	vcl/vcl_program.cpp \
+	vcl/vcl_stats.cpp \
+	vcl/vcl_syscalls.cpp \
+	vcl/vcl_varnish.c \
+	vcl/vclc_blob.c
 
 nodist_libvmod_riscv_la_SOURCES = \
 	vcc_if.c \
@@ -82,9 +89,17 @@ noinst_HEADERS = \
 	varnish_interface.h \
 	vmod_riscv.h \
 	vmod_riscv_sandbox.h \
-	vmod_util.h
+	vmod_util.h \
+	vcl/abi.hpp \
+	vcl/compiler.hpp \
+	vcl/vcl_program.hpp \
+	vcl/vcl_stats.hpp \
+	vcl/vcl_varnish.h
 
 dist_man_MANS = vmod_riscv.3
+
+## The embedded compiler is an .incbin, which dependency tracking cannot see.
+vcl/vclc_blob.lo: $(top_srcdir)/vcl/vclc.elf
 
 ## --- VCC interface + man page generation ---------------------------------
 ## The sources #include "vcc_if.h" (CMake's base name), so we generate

@@ -1,0 +1,36 @@
+varnishtest "Fractional VCL TTL and Cache-Control are separate values"
+
+# Run explicitly with: varnishtest carapace-vcl/tests/varnish/fractional_ttl.vtc
+# This is the Varnish compatibility reference, not a Carapace test.
+server s1 {
+    rxreq
+    txresp -hdr "Cache-Control: max-age=60" -body "fractional"
+    rxreq
+    txresp -hdr "Cache-Control: max-age=60" -body "fractional"
+} -start
+
+varnish v1 -vcl+backend {
+    sub vcl_backend_response {
+        set beresp.ttl = 1.5s;
+        set beresp.http.X-VCL-TTL = beresp.ttl;
+        if (bereq.url == "/explicit") {
+            set beresp.http.Cache-Control = "max-age=" + beresp.ttl;
+        }
+    }
+} -start
+
+client c1 {
+    txreq -url "/ttl-only"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.X-VCL-TTL == "1.500"
+    expect resp.http.Cache-Control == "max-age=60"
+
+    txreq -url "/explicit"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.X-VCL-TTL == "1.500"
+    expect resp.http.Cache-Control == "max-age=1.500"
+} -run
+
+server s1 -wait

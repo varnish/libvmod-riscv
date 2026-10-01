@@ -17,6 +17,7 @@ EXTRA_DIST = \
 	CMakeLists.txt \
 	ext \
 	src/libriscv \
+	vcl/vclc.elf \
 	demo
 
 # Ship the demo/example VCL alongside the module.

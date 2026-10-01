@@ -136,7 +136,13 @@ int riscv_update_file(VRT_CTX, rvs::SandboxTenant* vrm,
 {
 	using namespace rvs;
 	try {
-		auto binary = file_loader(apply_dollar_vars(std::string(filename)));
+		const std::string path = apply_dollar_vars(std::string(filename));
+		if (rvs::vcl::is_vcl_source(path)) {
+			/* A compiled policy has no serialized state to hand over. */
+			rvs::atomic_store(&vrm->program, rvs::vcl::load(path, ctx, vrm));
+			return 1;
+		}
+		auto binary = file_loader(path);
 
 		/* If an extra argument is given, atomically swap in a new argv vector
 		   that includes it. Readers in machine_setup snapshot the shared_ptr

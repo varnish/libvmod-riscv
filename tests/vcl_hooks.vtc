@@ -1,0 +1,116 @@
+varnishtest "VCL tenant: every client and backend hook, as Varnish runs them"
+
+server s1 {
+	# The rewritten URL, with the headers vcl_recv and vcl_miss set.
+	rxreq
+	expect req.url == "/new/thing?x=1"
+	expect req.http.X-Method == "GET"
+	expect req.http.X-Miss == "yes"
+	expect req.http.X-Fetch-Url == "/new/thing?x=1"
+	txresp -body "thing"
+
+	# Another tenant's identical key is its own object.
+	rxreq
+	expect req.url == "/new/thing"
+	expect req.http.Host == "b.com"
+	txresp -body "b-thing"
+
+	rxreq
+	expect req.url == "/private"
+	expect req.http.X-Pass == "yes"
+	expect req.http.X-Miss == <undef>
+	txresp -body "private"
+
+	rxreq
+	expect req.url == "/teapot"
+	txresp -body "tea"
+
+	rxreq
+	expect req.url == "/rewrite-status"
+	txresp -body "rewritten"
+
+	rxreq
+	expect req.url == "/broken"
+	txresp -status 500 -body "boom"
+} -start
+
+varnish v1 -arg "-p workspace_client=128k" -arg "-p workspace_backend=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"a.com": { "filename": "${testdir}/vcl/hooks.vcl" },
+			"b.com": { "filename": "${testdir}/vcl/hooks.vcl" }
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	include "${testdir}/vcl_router.vcl";
+} -start
+
+client c1 {
+	# vcl_recv rewrites req.url; vcl_miss runs before the fetch.
+	txreq -url "/old/thing?x=1" -hdr "Host: a.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "thing"
+	expect resp.http.X-Miss == "yes"
+	expect resp.http.X-Hits == ""
+	expect resp.http.X-Has-Xid == "yes"
+
+	# vcl_hash drops the query string, so this is a hit, and vcl_hit sees
+	# the object's hit count. The tenant's return (hash) means a Cookie
+	# does not pass, as it would in the built-in vcl_recv.
+	txreq -url "/new/thing?y=2" -hdr "Host: a.com" -hdr "Cookie: a=b"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "thing"
+	expect resp.http.X-Hits == "1"
+	expect resp.http.X-Miss == ""
+
+	# The same key from another tenant misses: the VMOD hashes the tenant.
+	txreq -url "/new/thing" -hdr "Host: b.com"
+	rxresp
+	expect resp.body == "b-thing"
+	expect resp.http.X-Miss == "yes"
+
+	txreq -url "/private" -hdr "Host: a.com"
+	rxresp
+	expect resp.body == "private"
+	expect resp.http.X-Pass == "yes"
+
+	# The custom-status redirect: vcl_synth turns 750 into a 301.
+	txreq -url "/moved" -hdr "Host: a.com"
+	rxresp
+	expect resp.status == 301
+	expect resp.reason == "Moved Permanently"
+	expect resp.http.Location == "/new/place"
+
+	# resp.status and resp.reason are writable in vcl_deliver.
+	txreq -url "/teapot" -hdr "Host: a.com"
+	rxresp
+	expect resp.status == 418
+	expect resp.reason == "Teapot"
+	expect resp.body == "tea"
+
+	# beresp.status and beresp.reason are writable in vcl_backend_response.
+	txreq -url "/rewrite-status" -hdr "Host: a.com"
+	rxresp
+	expect resp.status == 203
+	expect resp.reason == "Rewritten"
+	expect resp.http.X-Origin-Proto == "HTTP/1.1"
+
+	# return (error(...)) hands the fetch to vcl_backend_error.
+	txreq -url "/broken" -hdr "Host: a.com"
+	rxresp
+	expect resp.status == 502
+	expect resp.http.X-Error == "origin failed"
+	expect resp.http.Content-Type == "text/plain"
+	expect resp.body == "backend error 502"
+
+	# return (fail) fails the subroutine, as VRT_fail does.
+	txreq -url "/fail" -hdr "Host: a.com"
+	rxresp
+	expect resp.status == 503
+} -run

@@ -2,6 +2,7 @@
 #include "varnish.hpp"
 extern "C" {
 #include "update_result.h"
+#include "vcl/vcl_varnish.h"
 }
 struct CallResults {
 	long results[3];
@@ -64,6 +65,26 @@ long riscv_call_idx(rvs::Script* script, VRT_CTX, vcall_info info, const char* a
 	using namespace rvs;
 
 	const auto& callbacks = script->program().callback_entries;
+	if (script->program().is_vcl && info.idx < callbacks.size())
+	{
+		// VRT ctx can easily change even on the same request due to waitlist
+		script->set_ctx(ctx);
+		// The tenant's name goes into every cache key it builds, so no
+		// hash_data() can collide with another tenant's objects.
+		if (info.idx == 2) // ON_HASH
+			vclv_hash_data(ctx, script->name().c_str());
+		// Each hook states its own outcome; one it does not define (a
+		// policy without vcl_deliver) is a no-op, not an error.
+		script->set_result("", 0, false);
+		const auto addr = callbacks[info.idx];
+		if (addr == 0x0)
+			return 0;
+		const long ret = script->call(addr);
+		// What the hook did to its statistics, even if it trapped: the
+		// writes before the trap happened.
+		rvs::vcl::fold_stats(*script);
+		return ret;
+	}
 	if (info.idx < callbacks.size())
 	{
 		auto addr = callbacks[info.idx];

@@ -106,6 +106,22 @@ long riscv_current_result_value(VRT_CTX, size_t idx)
 	return 503;
 }
 extern "C"
+const char* riscv_current_reason(VRT_CTX)
+{
+	auto* script = rvs::get_machine(ctx);
+	/* Null, not empty: VRT_synth only uses the status's standard reason
+	   when given none, and an empty one would replace it. */
+	if (script == nullptr)
+		return nullptr;
+	const auto& reason = script->vcl_task().reason;
+	if (reason.empty())
+		return nullptr;
+	/* The task's Script outlives the subroutine, but copy anyway: VCL
+	   expects a string on the workspace, not in a C++ object. */
+	char* copy = (char*)WS_Copy(ctx->ws, reason.c_str(), int(reason.size() + 1));
+	return copy;
+}
+extern "C"
 const char* riscv_current_result_string(VRT_CTX, size_t idx)
 {
 	auto* script = rvs::get_machine(ctx);

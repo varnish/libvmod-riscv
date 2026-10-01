@@ -1,0 +1,6 @@
+# Pinned so that ../runtime.elf is reproducible: the blob is committed, and a
+# floating toolchain would make every rustc release a different image.
+[toolchain]
+channel = "1.91.0"
+profile = "minimal"
+targets = ["riscv64gc-unknown-none-elf"]

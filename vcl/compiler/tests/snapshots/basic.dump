@@ -1,0 +1,54 @@
+== typed ==
+TypedProgram {
+    subs: [
+        TypedSub {
+            phase: Recv,
+            statements: [
+                Return {
+                    action: Hash,
+                    span: Span {
+                        start: 24,
+                        end: 38,
+                    },
+                },
+            ],
+            locals: [],
+        },
+    ],
+    user_subs: {},
+    statics: [],
+    globals: [],
+    acls: [],
+    patterns: [],
+    warnings: [],
+}
+== desugared ==
+TypedProgram {
+    subs: [
+        TypedSub {
+            phase: Recv,
+            statements: [
+                Return {
+                    action: Hash,
+                    span: Span {
+                        start: 24,
+                        end: 38,
+                    },
+                },
+            ],
+            locals: [],
+        },
+    ],
+    user_subs: {},
+    statics: [],
+    globals: [],
+    acls: [],
+    patterns: [],
+    warnings: [],
+}
+== lowered (O0) ==
+functions: 1
+
+fn on_recv  phase=Recv values=0 ops=1
+  0000  ReturnAction Hash abi=5 ()       ; bytes 24..38
+

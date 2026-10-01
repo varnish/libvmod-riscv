@@ -1,0 +1,24 @@
+[package]
+name = "vcl-compiler"
+version = "0.3.0"
+edition = "2021"
+description = "VCL frontend and RISC-V compiler for libvmod-riscv tenants"
+publish = false
+
+# Its own workspace root: the VMOD is a C/C++ project, and the Rust crates
+# under vcl/ are built separately (the compiler natively for tests, and as
+# the RISC-V guest in ../vclc).
+[workspace]
+members = []
+
+# Zero runtime dependencies but the RISC-V runtime blob, deliberately: this
+# crate is linked into a guest program and compiled for RISC-V (../vclc),
+# so every dependency added here has to cross-compile *and* is attack surface
+# reachable from untrusted VCL source. Include resolution is a callback the
+# host supplies; nothing here opens a file.
+[dependencies]
+vcl-rt = { path = "../runtime" }
+
+[dev-dependencies]
+regex = "1"
+tempfile = "3"

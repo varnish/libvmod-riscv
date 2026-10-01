@@ -138,7 +138,8 @@ $Function INT     vcall(ENUM {
 		ON_HIT,
 		ON_MISS,
 		ON_LIVE_UPDATE,
-		ON_RESUME_UPDATE} index)
+		ON_RESUME_UPDATE,
+		ON_PASS} index)
 
 - Calls the given function at index in order added by add_known_function
   (starting at zero), in the currently active machine.
@@ -184,6 +185,13 @@ $Function INT     want_status()
 
 - Returns the status code that the guest wants to use, if relevant.
 - Returns zero (0) if no status has been set.
+
+$Function STRING  want_reason()
+
+- Returns the reason a VCL tenant gave with return (synth(status, "reason"))
+  or return (error(status, "reason")), for the Varnish VCL to pass on.
+- Returns no string (NULL) otherwise, so synth() and error() use the
+  status's standard reason.
 
 $Function INT     result_value(INT index)
 

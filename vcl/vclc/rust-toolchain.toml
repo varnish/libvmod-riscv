@@ -1,0 +1,6 @@
+# Pinned so that ../vclc.elf is reproducible: the blob is committed, and a
+# different rustc is a different compiler running inside the sandbox.
+[toolchain]
+channel = "1.91.0"
+profile = "minimal"
+targets = ["riscv64gc-unknown-linux-gnu"]

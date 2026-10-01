@@ -1,9 +1,13 @@
 #include <libriscv/rv32i_instr.hpp>
 #include <openssl/evp.h>
+#include <algorithm>
+#include <climits>
+#include <cstring>
 #include "script_functions.hpp"
 #include "machine/include_api.hpp"
 #include "machine_instance.hpp"
 #include "varnish.hpp"
+#include "vcl/vcl_varnish.h"
 extern "C" {
 # include "varnish_interface.h"
 enum {
@@ -683,14 +687,15 @@ APICALL(http_unset_re)
 	for (int i = hp->field_count-1; i >= HDR_FIRST; i--)
 	{
 		auto& field = hp->field_array[i];
+		machine.penalize(VCLV_REGEX_MATCH_LIMIT);
 #ifdef VARNISH_PLUS
 		if ( VRE_exec(vre, field.b, field.e - field.b,
-			0, 0, nullptr, 0, nullptr) >= 0 ) {
+			0, 0, nullptr, 0, vclv_regex_limits()) >= 0 ) {
 			http_unsetat(hp, i);
 			mcount ++;
 		}
 #else
-		if ( VRE_match(vre, field.b, field.e - field.b, 0, nullptr) >= 0 ) {
+		if ( VRE_match(vre, field.b, field.e - field.b, 0, vclv_regex_limits()) >= 0 ) {
 			http_unsetat(hp, i);
 			mcount ++;
 		}
@@ -916,6 +921,8 @@ APICALL(regex_match)
 {
 	auto [index, buffer] = machine.sysargs<uint32_t, riscv::Buffer> ();
 	auto* vre = get_script(machine).regex().get(index);
+	/* A match may cost the host up to the match limit in backtracking. */
+	machine.penalize(VCLV_REGEX_MATCH_LIMIT);
 	/* VRE_exec(const vre_t *code, const char *subject, int length,
 		int startoffset, int options, int *ovector, int ovecsize,
 		const volatile struct vre_limits *lim) */
@@ -923,10 +930,10 @@ APICALL(regex_match)
 #ifdef VARNISH_PLUS
 		machine.set_result(
 			VRE_exec(vre, buffer.c_str(), buffer.size(), 0,
-				0, nullptr, 0, nullptr) >= 0);
+				0, nullptr, 0, vclv_regex_limits()) >= 0);
 #else
 		machine.set_result(
-			VRE_match(vre, buffer.c_str(), buffer.size(), 0, nullptr) >= 0);
+			VRE_match(vre, buffer.c_str(), buffer.size(), 0, vclv_regex_limits()) >= 0);
 #endif
 		return;
 	}
@@ -934,11 +941,28 @@ APICALL(regex_match)
 #ifdef VARNISH_PLUS
 	machine.set_result(
 		VRE_exec(vre, subject.c_str(), subject.size(), 0,
-		0, nullptr, 0, nullptr) >= 0);
+		0, nullptr, 0, vclv_regex_limits()) >= 0);
 #else
 	machine.set_result(
-		VRE_match(vre, subject.c_str(), subject.size(), 0, nullptr) >= 0);
+		VRE_match(vre, subject.c_str(), subject.size(), 0, vclv_regex_limits()) >= 0);
 #endif
+}
+/* regsub() or regsuball() under the regex limits, charging each match the
+   way a single regex_match is charged, and bounded by the budget left.
+   VRT_regsub runs one uncounted match per replacement, up to one per byte. */
+static struct vsb* charged_regsub(machine_t& machine, bool all,
+	const std::string& subject, const void* re, const std::string& subst)
+{
+	if (subst.find('\0') != std::string::npos)
+		return nullptr;
+	const uint64_t left = machine.max_instructions() > machine.instruction_counter()
+		? machine.max_instructions() - machine.instruction_counter() : 0;
+	unsigned execs = unsigned(std::clamp<uint64_t>(left / VCLV_REGEX_MATCH_LIMIT, 1, UINT_MAX));
+	struct vsb* result = nullptr;
+	const int rc = vclv_regsub(all, subject.c_str(), strnlen(subject.c_str(), subject.size()),
+		re, subst.c_str(), 16u << 20, &execs, &result);
+	machine.penalize(uint64_t(execs) * VCLV_REGEX_MATCH_LIMIT + subject.size());
+	return rc == 0 ? result : nullptr;
 }
 APICALL(regex_subst)
 {
@@ -949,16 +973,8 @@ APICALL(regex_subst)
 
 	/* Run the regsub using existing 're' */
 	const bool all = (maxlen & 0x80000000);
-	const char* result;
-	if (tbuffer.is_sequential() && sbuffer.is_sequential()) {
-		result =
-			VRT_regsub(script.ctx(), all, tbuffer.c_str(), re, sbuffer.c_str());
-	} else {
-		auto subject = tbuffer.to_string();
-		auto subst   = sbuffer.to_string();
-		result =
-			VRT_regsub(script.ctx(), all, subject.c_str(), re, subst.c_str());
-	}
+	auto* result = charged_regsub(machine, all, tbuffer.to_string(), re,
+		sbuffer.to_string());
 	if (result == nullptr) {
 		machine.set_result(-1);
 		return;
@@ -966,8 +982,9 @@ APICALL(regex_subst)
 
 	/* This call only supports dest buffer being in the RW area */
 	const size_t len =
-		std::min((size_t) maxlen & 0x7FFFFFFF, __builtin_strlen(result)+1);
-	machine.copy_to_guest(dst, result, len);
+		std::min((size_t) maxlen & 0x7FFFFFFF, size_t(VSB_len(result))+1);
+	machine.copy_to_guest(dst, VSB_data(result), len);
+	VSB_destroy(&result);
 	/* The last byte is the zero, not reporting that */
 	machine.set_result(len-1);
 }
@@ -983,21 +1000,23 @@ APICALL(regex_subst_hdr)
 	}
 	auto [hp, field] = get_field(ctx, (gethdr_e) where, index);
 
-	const char* result = nullptr;
-
 	/* Run the regsub using existing 're' */
-	if (subst.is_sequential()) {
-		result = VRT_regsub(ctx, all, field.b, re, subst.c_str());
-	} else {
-		result = VRT_regsub(ctx, all, field.b, re, subst.to_string().c_str());
+	auto* sub = charged_regsub(machine, all, std::string(field.b, field.e - field.b), re,
+		subst.to_string());
+	if (sub == nullptr) {
+		machine.set_result(-1);
+		return;
 	}
+	const size_t sublen = VSB_len(sub);
+	auto* result = static_cast<const char*>(WS_Copy(ctx->ws, VSB_data(sub), sublen + 1));
+	VSB_destroy(&sub);
 	if (result == nullptr) {
 		machine.set_result(-1);
 		return;
 	}
 
 	http_SetH(hp, index, result);
-	machine.set_result(__builtin_strlen(result));
+	machine.set_result(sublen);
 }
 APICALL(regex_delete)
 {

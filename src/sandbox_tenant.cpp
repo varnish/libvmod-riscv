@@ -63,6 +63,11 @@ void SandboxTenant::load(VRT_CTX)
 				std::make_shared<MachineInstance> (std::move(bin), ctx, this);
 			return;
 		}
+		// A .vcl file is compiled to a tenant program, inside the sandbox
+		if (vcl::is_vcl_source(filename)) {
+			this->program = vcl::load(filename, ctx, this);
+			return;
+		}
 		// If the filename begins with "rust:", build it as a Rust project
 		if (config.filename.size() > 5 &&
 		    config.filename.substr(0, 5) == "rust:") {

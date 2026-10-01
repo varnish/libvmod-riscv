@@ -1,0 +1,30 @@
+[package]
+name = "vclc"
+version = "0.1.0"
+edition = "2021"
+description = "The VCL compiler, built as a libvmod-riscv guest"
+publish = false
+
+# Its own workspace root, like ../compiler and ../runtime/guest. It builds
+# for riscv64gc-unknown-linux-gnu with link flags that only make sense for a
+# libriscv guest.
+[workspace]
+members = []
+
+[dependencies]
+# The compiler itself, unchanged: the same code compiles natively under
+# `cargo test` in ../compiler and here inside the sandbox.
+vcl-compiler = { path = "../compiler" }
+
+[profile.release]
+# The compile runs interpreted unless the VMOD is built with binary
+# translation, so every emitted instruction is paid for at vcl_init time.
+opt-level = 2
+# A panic is a machine fault the host reports as a failed compile. That is
+# the containment this guest exists for, so it must not unwind.
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+# The host resolves `vclc_compile` and `fast_exit` by name in `.symtab`, so
+# symbols stay. Debug info is megabytes nothing reads.
+strip = "debuginfo"

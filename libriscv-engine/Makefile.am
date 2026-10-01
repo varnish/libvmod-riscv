@@ -22,11 +22,14 @@ RISCV_CMAKE_FLAGS = \
 	-DRISCV_BINARY_TRANSLATION=OFF \
 	-DRISCV_LIBTCC=OFF \
 	-DRISCV_FLAT_RW_ARENA=OFF \
-	-DCMAKE_CXX_FLAGS="-DRISCV_SYSCALLS_MAX=600"
+	-DCMAKE_CXX_FLAGS="-DRISCV_SYSCALLS_MAX=601"
 
 all-local: $(ENGINE_LIB)
 
-$(ENGINE_LIB):
+## Rebuilt when this Makefile changes, so a changed RISCV_CMAKE_FLAGS (such
+## as RISCV_SYSCALLS_MAX) never leaves a stale archive that disagrees with
+## the VMOD about the system call table's size. cmake --build is incremental.
+$(ENGINE_LIB): Makefile
 	@test -f $(ENGINE_SRC)/CMakeLists.txt || { \
 		echo "error: src/libriscv is empty -- run 'git submodule update --init --recursive'"; \
 		exit 1; }

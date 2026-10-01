@@ -1,0 +1,123 @@
+varnishtest "VCL tenant: regex limits, tenant lookup, log tagging and the statistics cap"
+
+# A Host whose CRC32C equals good.com's. Tenants are looked up by that
+# hash, and must still be matched by name.
+varnish v1 -arg "-p workspace_client=128k" -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"good.com":  { "filename": "${testdir}/vcl/limits.vcl" },
+			"stats.com": { "filename": "${testdir}/vcl/stats_cap.vcl" }
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/update") {
+			if (riscv.live_update_file(req.http.Host, "${testdir}/vcl/" + req.http.X-File)) {
+				return (synth(200, "reloaded"));
+			}
+			return (synth(500, "reload failed"));
+		}
+	}
+
+	# Varnish's own answers, for the tenant's to match.
+	sub vcl_synth {
+		if (resp.reason == "/semantics") {
+			set resp.http.N-1 = regsuball("aaa", "^a", "b");
+			set resp.http.N-2 = regsub("foo-bar", "(\w+)-(\w+)", "\2-\1");
+			set resp.http.N-3 = regsuball("abc", "x*", "-");
+			set resp.http.N-4 = regsub("abc", "(b)", "[\0\1\9]");
+			set resp.http.N-5 = regsuball("a.b.c", "\.", "/");
+			set resp.http.N-6 = regsuball("abab", "b", "\\");
+		}
+	}
+
+	include "${testdir}/vcl_router.vcl";
+} -start
+
+logexpect l1 -v v1 -g raw {
+	expect * * VCL_Log {^\[good\.com\] \[other\.com\] spoofed$}
+} -start
+
+client c1 {
+	# Without the backtracking limits, this pattern costs PCRE millions of
+	# steps on this subject. The match is undecided, so the subroutine
+	# fails rather than reading it as "no match".
+	txreq -url "/slow-match" -hdr "Host: good.com" -hdr "X-Subject: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"
+	rxresp
+	expect resp.status == 503
+} -run
+
+# A failed subroutine closes the connection, so each failure gets its own.
+client c2 {
+	# A pattern within the limits still decides.
+	txreq -url "/slow-match" -hdr "Host: good.com" -hdr "X-Subject: aaaa"
+	rxresp
+	expect resp.status == 200
+	txreq -url "/slow-match" -hdr "Host: good.com" -hdr "X-Subject: aaab"
+	rxresp
+	expect resp.status == 404
+
+	# regsuball runs a match per replacement; each is limited the same way.
+	txreq -url "/slow-regsub" -hdr "Host: good.com" -hdr "X-Subject: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!"
+	rxresp
+	expect resp.status == 503
+} -run
+
+client c3 {
+	# regsub and regsuball mean what they mean in Varnish's own VCL.
+	txreq -url "/semantics" -hdr "Host: good.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.T-1 == resp.http.N-1
+	expect resp.http.T-2 == resp.http.N-2
+	expect resp.http.T-3 == resp.http.N-3
+	expect resp.http.T-4 == resp.http.N-4
+	expect resp.http.T-5 == resp.http.N-5
+	expect resp.http.T-6 == resp.http.N-6
+	expect resp.http.T-2 == "bar-foo"
+
+	# A tenant's log lines carry its name, so it cannot write lines that
+	# read as another tenant's.
+	txreq -url "/log" -hdr "Host: good.com"
+	rxresp
+	expect resp.status == 200
+
+	# Same hash as good.com, different name: no tenant.
+	txreq -url "/" -hdr "Host: x7pxj9xa"
+	rxresp
+	expect resp.status == 404
+	expect resp.reason == "No such tenant"
+} -run
+
+logexpect l1 -wait
+
+client c4 {
+	txreq -url "/" -hdr "Host: stats.com"
+	rxresp
+	expect resp.status == 200
+
+	# stats.com already has the most statistics a tenant may have, and a
+	# counter lives until varnishd restarts: a new name is refused, and
+	# the running program stays.
+	txreq -url "/update" -hdr "Host: stats.com" -hdr "X-File: stats_cap_more.vcl"
+	rxresp
+	expect resp.status == 500
+
+	# Reloading the same names is not new statistics.
+	txreq -url "/update" -hdr "Host: stats.com" -hdr "X-File: stats_cap.vcl"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/" -hdr "Host: stats.com"
+	rxresp
+	expect resp.status == 200
+} -run
+
+varnish v1 -expect RISCV.stats.com.s0 == 2
+shell -match "^0$" {varnishstat -n ${v1_name} -1 | grep -c "RISCV.stats.com.one_more" || true}

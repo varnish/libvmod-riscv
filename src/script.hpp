@@ -3,6 +3,7 @@
 #include <functional>
 #include <libriscv/machine.hpp>
 #include "script_cache.hpp"
+#include "vcl/vcl_program.hpp"
 
 struct vrt_ctx;
 struct VSHA256Context;
@@ -41,6 +42,7 @@ public:
 	inline long resume(uint64_t cycles);
 
 	auto& regex() { return m_regex; }
+	auto& vcl_task() { return m_vcl_task; }
 	auto& directors() { return m_directors; }
 
 	auto& machine() { return m_machine; }
@@ -131,6 +133,7 @@ private:
 	struct VSHA256Context* m_sha_ctx = nullptr;
 
 	Cache<struct vre> m_regex;
+	vcl::TaskState m_vcl_task;
 	Cache<const struct director> m_directors;
 
 	/* GDB RSP client */

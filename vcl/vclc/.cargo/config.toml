@@ -1,0 +1,12 @@
+# The target and the linker only. Every other build flag is in the Makefile,
+# which is the only supported way to regenerate ../vclc.elf: one of them
+# depends on the checkout path, and RUSTFLAGS replaces this file's rustflags
+# wholesale.
+[build]
+target = "riscv64gc-unknown-linux-gnu"
+
+[target.riscv64gc-unknown-linux-gnu]
+# Override with CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER if your
+# cross-toolchain is named differently. Debian/Ubuntu:
+#   apt install gcc-14-riscv64-linux-gnu
+linker = "riscv64-linux-gnu-gcc-14"

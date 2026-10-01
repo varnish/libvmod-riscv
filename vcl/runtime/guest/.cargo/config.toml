@@ -1,0 +1,5 @@
+# The target only. The rest of the build flags are in the Makefile, which is
+# the only supported way to regenerate ../runtime.elf: one of them depends on
+# the checkout path, and RUSTFLAGS replaces this file's rustflags wholesale.
+[build]
+target = "riscv64gc-unknown-none-elf"

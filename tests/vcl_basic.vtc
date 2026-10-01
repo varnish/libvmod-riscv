@@ -1,0 +1,100 @@
+varnishtest "VCL tenant: compiled in the sandbox, run per phase"
+
+server s1 {
+	rxreq
+	expect req.url == "/new/thing"
+	expect req.http.X-Fetch == "vcl"
+	expect req.http.X-Policy == "edge"
+	expect req.http.X-Has-Cookie == "yes"
+	txresp -hdr "Server: origin" -body "hello"
+
+	rxreq
+	expect req.url == "/pass"
+	txresp -body "passed"
+
+	rxreq
+	expect req.url == "/teapot"
+	txresp -body "brewing"
+
+	rxreq
+	expect req.url == "/api/users"
+	txresp -body "users"
+} -start
+
+varnish v1 -arg "-p workspace_client=128k" -arg "-p workspace_backend=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/vcl/basic.vcl"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	include "${testdir}/vcl_router.vcl";
+} -start
+
+client c1 {
+	# A miss: every phase runs, the fetch sees the request edits.
+	txreq -url "/old/thing" -hdr "Host: test.com" -hdr "Cookie: a=b"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "hello"
+	expect resp.http.X-Cache-Policy == "vcl"
+	expect resp.http.X-Origin == "origin"
+	expect resp.http.Server == <undef>
+	expect resp.http.X-Delivered-By == "vcl"
+	expect resp.http.X-Hit == "0"
+	expect resp.http.X-Kind == ""
+
+	# A hit on the same object, with beresp.ttl = 30s.
+	txreq -url "/old/thing" -hdr "Host: test.com" -hdr "Cookie: a=b"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Hit == "1"
+
+	# synth from vcl_recv, with the folded vcl_synth's headers and body.
+	txreq -url "/deny" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 403
+	expect resp.reason == "denied"
+	expect resp.http.Content-Type == "text/plain"
+	expect resp.http.X-Synth == "policy"
+	expect resp.body == "nope"
+
+	# synth without a reason gets the status's standard one.
+	txreq -url "/gone" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 404
+	expect resp.reason == "Not Found"
+
+	txreq -url "/pass" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "passed"
+	expect resp.http.X-Hit == "0"
+
+	# synth from vcl_deliver replaces the response.
+	txreq -url "/teapot" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 418
+	expect resp.reason == "teapot"
+	expect resp.http.X-Synth == "policy"
+	expect resp.http.X-Delivered-By == <undef>
+	expect resp.body == "nope"
+
+	# A request global set in vcl_recv is read in vcl_deliver, and the next
+	# request starts from its initialiser again.
+	txreq -url "/api/users" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Kind == "api"
+
+	txreq -url "/old/thing" -hdr "Host: test.com"
+	rxresp
+	expect resp.http.X-Hit == "1"
+	expect resp.http.X-Kind == ""
+} -run

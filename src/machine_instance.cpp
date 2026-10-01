@@ -6,8 +6,9 @@ namespace rvs {
 MachineInstance::MachineInstance(
 	std::vector<uint8_t> elf,
 	const vrt_ctx* ctx, SandboxTenant* ten,
-	bool debug)
+	bool debug, bool vcl)
 	: binary{std::move(elf)},
+	  is_vcl{vcl},
 	  script{binary, ctx, ten, *this, false, debug},
 	  storage{binary, ctx, ten, *this, true, debug},
 	  rspclient{nullptr},
@@ -18,6 +19,8 @@ MachineInstance::MachineInstance(
 	// for both the storage and main VM.
 	storage.machine_initialize();
 	script.machine_initialize();
+	if (is_vcl)
+		this->vcl_program = vcl::Program::install(script, *this);
 }
 MachineInstance::~MachineInstance()
 {

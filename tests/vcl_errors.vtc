@@ -1,0 +1,124 @@
+varnishtest "VCL tenant: refused policies do not load, and do not take others down"
+
+# A policy directory with an include that is a symlink out of it.
+shell {
+	mkdir -p ${tmpdir}/policy
+	printf 'sub leaked { return (hash); }\n' > ${tmpdir}/outside.vcl
+	ln -s ${tmpdir}/outside.vcl ${tmpdir}/policy/outside.vcl
+	printf 'vcl 4.1;\ninclude "outside.vcl";\nsub vcl_recv { return (hash); }\n' \
+		> ${tmpdir}/policy/symlink.vcl
+}
+
+varnish v1 -arg "-p workspace_client=128k" -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"broken.com":  { "filename": "${testdir}/vcl/broken.vcl" },
+			"static.com":  { "filename": "${testdir}/vcl/static.vcl" },
+			"escape.com":  { "filename": "${testdir}/vcl/escape.vcl" },
+			"symlink.com": { "filename": "${tmpdir}/policy/symlink.vcl" },
+			"good.com":    { "filename": "${testdir}/vcl/basic.vcl" }
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/update") {
+			if (riscv.live_update_file(req.http.Host, "${testdir}/vcl/" + req.http.X-File)) {
+				return (synth(200, "reloaded"));
+			}
+			return (synth(500, "reload failed"));
+		}
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403, "no program"));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status(), riscv.want_reason()));
+		}
+		return (synth(200, "ran"));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.run();
+			if (riscv.want_result() == "deliver") {
+				return (deliver);
+			}
+		}
+	}
+}
+
+
+varnish v1 -start
+
+# -d 1 reads the log from its start, where vcl_init left the load errors.
+# Tenants load in no particular order, so one reader per expectation.
+logexpect l1 -v v1 -g raw -d 1 {
+	expect * 0 Error {broken\.com.*expected an expression}
+} -start
+logexpect l2 -v v1 -g raw -d 1 {
+	expect * 0 Error {static\.com.*static variables are not supported}
+} -start
+logexpect l3 -v v1 -g raw -d 1 {
+	expect * 0 Error {escape\.com.*outside the policy directory}
+} -start
+# Refused by the host, not the compiler: the name is relative and clean,
+# only the filesystem says where it leads.
+logexpect l4 -v v1 -g raw -d 1 {
+	expect * 0 Error {symlink\.com.*include 'outside\.vcl' resolves outside the policy directory}
+} -start
+logexpect l1 -wait
+logexpect l2 -wait
+logexpect l3 -wait
+logexpect l4 -wait
+
+client c1 {
+	txreq -url "/" -hdr "Host: broken.com"
+	rxresp
+	expect resp.status == 403
+
+	txreq -url "/" -hdr "Host: static.com"
+	rxresp
+	expect resp.status == 403
+
+	txreq -url "/" -hdr "Host: escape.com"
+	rxresp
+	expect resp.status == 403
+
+	txreq -url "/" -hdr "Host: symlink.com"
+	rxresp
+	expect resp.status == 403
+
+	# The tenant beside them compiled and runs.
+	txreq -url "/deny" -hdr "Host: good.com"
+	rxresp
+	expect resp.status == 403
+	expect resp.reason == "denied"
+	expect resp.body == "nope"
+
+	# A live update to another .vcl compiles it and swaps it in.
+	txreq -url "/update" -hdr "Host: good.com" -hdr "X-File: updated.vcl"
+	rxresp
+	expect resp.status == 200
+	expect resp.reason == "reloaded"
+
+	txreq -url "/deny" -hdr "Host: good.com"
+	rxresp
+	expect resp.status == 204
+	expect resp.reason == "updated"
+
+	# A broken update is refused, and the running program stays.
+	txreq -url "/update" -hdr "Host: good.com" -hdr "X-File: broken.vcl"
+	rxresp
+	expect resp.status == 500
+	expect resp.reason == "reload failed"
+
+	txreq -url "/deny" -hdr "Host: good.com"
+	rxresp
+	expect resp.status == 204
+} -run

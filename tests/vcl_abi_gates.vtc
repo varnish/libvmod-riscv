@@ -1,0 +1,123 @@
+varnishtest "The VCL policy ABI's host-side gates hold against a hand-written guest"
+
+# The syscall table is shared by every machine in the process, and a tenant
+# may be any ELF, so the policy ABI (540..=560) is reachable without the
+# compiler's checks. The host has to refuse on its own:
+#  - the compiler's include read (560, sub-command 28), answered only while
+#    a compile runs on the calling thread;
+#  - a header value that would end its line, and a name that is not a token;
+#  - the client's Host, which picked the tenant;
+#  - a variable outside the subroutines Varnish gives it, where its VRT
+#    accessor would assert, and hash_data() or a synthetic body outside
+#    vcl_hash, vcl_synth and vcl_backend_error.
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static long include_read(const char* name, size_t len, char* out, size_t cap)
+{
+	register long a0 asm("a0") = 28;
+	register long a1 asm("a1") = (long) name;
+	register long a2 asm("a2") = len;
+	register long a3 asm("a3") = (long) out;
+	register long a4 asm("a4") = cap;
+	register long a7 asm("a7") = 560;
+	asm volatile ("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7) : "memory");
+	return a0;
+}
+
+static long set_req_header(const char* name, size_t nlen, const char* value, size_t vlen)
+{
+	register long a0 asm("a0") = (long) name;
+	register long a1 asm("a1") = nlen;
+	register long a2 asm("a2") = (long) value;
+	register long a3 asm("a3") = vlen;
+	register long a7 asm("a7") = 543;
+	asm volatile ("ecall" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a3), "r"(a7) : "memory");
+	return a0;
+}
+static long typed(long cmd, long a1, long a2 = 0, long a3 = 0)
+{
+	register long a0 asm("a0") = cmd;
+	register long r1 asm("a1") = a1;
+	register long r2 asm("a2") = a2;
+	register long r3 asm("a3") = a3;
+	register long a7 asm("a7") = 560;
+	asm volatile ("ecall" : "+r"(a0) : "r"(r1), "r"(r2), "r"(r3), "r"(a7) : "memory");
+	return a0;
+}
+enum { VAR_GET_STRING = 32, VAR_GET_SCALAR = 33, VAR_SET_SCALAR = 34,
+	VAR_SET_STRING = 35, HASH_DATA = 36, SYNTH_BODY = 37 };
+enum { V_METHOD = 1, V_XID = 2, V_OBJ_HITS = 20, V_OBJ_TTL = 21, V_RESP_STATUS = 26,
+	V_BERESP_STATUS = 11 };
+#define S(x) x, sizeof(x)-1
+
+static void on_recv(int req)
+{
+	static char out[4096];
+	int failures = 0;
+	/* A refusal is negative; anything else is a leak. */
+	if (include_read(S("basic.vcl"), out, sizeof(out)) >= 0) failures |= 1;
+	if (set_req_header(S("X-Evil"), S("a\r\nInjected: yes")) != -1) failures |= 2;
+	if (set_req_header(S("Bad Name"), S("v")) != -1) failures |= 4;
+	if (set_req_header(S("X-Nul"), "a\0b", 3) != -1) failures |= 8;
+	if (set_req_header(S("X-Good"), S("ok")) != 0) failures |= 16;
+	if (set_req_header(S("hOsT"), S("other.com")) != -1) failures |= 32;
+	if (typed(VAR_GET_SCALAR, V_OBJ_HITS) != -1) failures |= 64;
+	if (typed(VAR_GET_SCALAR, V_OBJ_TTL) != -1) failures |= 128;
+	if (typed(VAR_SET_SCALAR, V_RESP_STATUS, 200) != -1) failures |= 256;
+	if (typed(VAR_SET_SCALAR, V_BERESP_STATUS, 200) != -1) failures |= 512;
+	if (typed(VAR_GET_SCALAR, 9999) != -1) failures |= 1024;
+	if (typed(VAR_GET_SCALAR, V_XID) != -1) failures |= 2048;   /* a string */
+	if (typed(HASH_DATA, (long)"x", 1) != -1) failures |= 4096;
+	if (typed(SYNTH_BODY, 0, (long)"x", 1) != -1) failures |= 8192;
+	if (typed(VAR_SET_STRING, V_METHOD, (long)"G T", 3) != -1) failures |= 16384;
+	if (typed(VAR_SET_STRING, V_METHOD, (long)"PURGE", 5) != 0) failures |= 32768;
+	if (typed(VAR_GET_STRING, V_XID, 0, 0) <= 0) failures |= 65536;
+	decision("synth", 5, failures == 0 ? 403 : 500);
+	if (failures) {
+		static char hdr[64];
+		int n = 0;
+		for (const char* p = "X-Failures: "; *p; p++) hdr[n++] = *p;
+		for (int bit = 16; bit >= 0; bit--) hdr[n++] = (failures >> bit) & 1 ? '1' : '0';
+		set_req_header(S("X-Failures"), hdr + 12, n - 12);
+	}
+}
+
+void start(int argc, char** argv) {
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"probe.com": { "filename": "${tmpdir}/${testname}" },
+			"vcl.com":   { "filename": "${testdir}/vcl/basic.vcl" }
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(404));
+		}
+		riscv.vcall(ON_REQUEST);
+		return (synth(riscv.want_status(), req.http.X-Failures + " " + req.method));
+	}
+} -start
+
+client c1 {
+	txreq -url "/" -hdr "Host: probe.com"
+	rxresp
+	expect resp.status == 403
+	# The one method write that is allowed went through.
+	expect resp.reason == "PURGE"
+} -run

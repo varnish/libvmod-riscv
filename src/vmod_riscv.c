@@ -25,6 +25,7 @@ extern const char* riscv_current_group(VRT_CTX);
 extern const char* riscv_current_result(VRT_CTX);
 extern long riscv_current_result_value(VRT_CTX, size_t);
 extern const char* riscv_current_result_string(VRT_CTX, size_t);
+extern const char* riscv_current_reason(VRT_CTX);
 extern int  riscv_current_is_paused(VRT_CTX);
 extern int  riscv_current_apply_hash(VRT_CTX);
 
@@ -46,6 +47,7 @@ static inline vcall_info enum_to_idx(VCL_ENUM e)
 
 	if (e == VENUM(ON_LIVE_UPDATE)) return (vcall_info){10, HDR_INVALID, HDR_INVALID};
 	if (e == VENUM(ON_RESUME_UPDATE)) return (vcall_info){11, HDR_INVALID, HDR_INVALID};
+	if (e == VENUM(ON_PASS))   return (vcall_info){12, HDR_REQ, HDR_INVALID};
 	return (vcall_info){-1, HDR_INVALID, HDR_INVALID};
 }
 
@@ -123,6 +125,8 @@ VCL_INT vmod_run(VRT_CTX, VCL_STRING arg)
 		e = VENUM(ON_HIT); break;
 	case VCL_MET_MISS:
 		e = VENUM(ON_MISS); break;
+	case VCL_MET_PASS:
+		e = VENUM(ON_PASS); break;
 	case VCL_MET_DELIVER:
 		e = VENUM(ON_DELIVER); break;
 	default:
@@ -171,6 +175,12 @@ VCL_INT vmod_want_status(VRT_CTX)
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
 	return riscv_current_result_value(ctx, 0);
+}
+VCL_STRING vmod_want_reason(VRT_CTX)
+{
+	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+
+	return riscv_current_reason(ctx);
 }
 VCL_INT vmod_result_value(VRT_CTX, VCL_INT idx)
 {
