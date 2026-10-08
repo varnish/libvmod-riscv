@@ -138,8 +138,11 @@ Script* SandboxTenant::vmfork(VRT_CTX, bool debug)
 		else
 			prog = rvs::atomic_load(&this->debug_program);
 		/* First-time tenants could have no program loaded */
-		if (UNLIKELY(prog == nullptr))
+		if (UNLIKELY(prog == nullptr)) {
+			VSLb(ctx->vsl, SLT_VCL_Error,
+			    "No program loaded: %s", this->config.name.c_str());
 			return nullptr;
+		}
 		/* Allocate Script on workspace, and construct it in-place */
 		uintptr_t saddr = (uintptr_t)WS_Alloc(ctx->ws, sizeof(Script) + 0x20);
 		if (UNLIKELY(saddr == 0x0)) {
