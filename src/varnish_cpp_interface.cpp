@@ -33,8 +33,12 @@ rvs::Script* riscv_fork(VRT_CTX, const char* tenant, size_t tenantlen, int debug
 
 	extern SandboxTenant* tenant_find(VRT_CTX, const char* name, size_t namelen);
 	auto* tenptr = tenant_find(ctx, tenant, tenantlen);
-	if (UNLIKELY(tenptr == nullptr))
+	if (UNLIKELY(tenptr == nullptr)) {
+		VSLb(ctx->vsl, SLT_VCL_Error,
+		    "riskv.fork: Could not find tenant '%.*s'",
+		    (int)tenantlen, tenant);
 		return nullptr;
+	}
 
 	return tenptr->vmfork(ctx, debug);
 }

@@ -1,5 +1,7 @@
 varnishtest "QuickJS - varnish.log, varnish.print, varnish.hashData don't crash"
 
+feature cmd "test -x ${testdir}/js"
+
 varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
 	vcl 4.1;
 	import riscv;
