@@ -1,5 +1,7 @@
 varnishtest "QuickJS - req.get() is case-insensitive"
 
+feature cmd "test -x ${testdir}/js"
+
 varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
 	vcl 4.1;
 	import riscv;

@@ -1,5 +1,7 @@
 varnishtest "QuickJS - on_deliver sets response headers"
 
+feature cmd "test -x ${testdir}/js"
+
 server s1 {
 	rxreq
 	txresp -hdr "X-From-Backend: yes" -body "Hello from backend"

@@ -1,5 +1,7 @@
 varnishtest "QuickJS - resp.setStatus() and resp.status snapshot in on_deliver"
 
+feature cmd "test -x ${testdir}/js"
+
 server s1 {
 	rxreq
 	txresp -status 200 -body "teapot route"
