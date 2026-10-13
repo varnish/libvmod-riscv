@@ -219,8 +219,54 @@ void Script::machine_setup(machine_t& machine, bool init)
 
 	if (init == false)
 	{
+		/* Loan a page of the master to this fork: read-only, and
+		   copy-on-write when the master can write to it */
+		static constexpr auto loan_page =
+		[] (riscv::Memory<MARCH>& mem, gaddr_t pageno, const riscv::Page& foreign_page) -> riscv::Page& {
+			riscv::PageAttributes attr = foreign_page.attr;
+			attr.non_owning = true;
+			attr.is_cow = foreign_page.attr.write;
+			attr.write = false;
+			riscv::PageData* data = const_cast<riscv::PageData*>(foreign_page.m_page.get());
+			return mem.allocate_page(pageno, attr, data);
+		};
+		/* Give this fork its own copy of a loaned page */
+		auto copy_page = [this] (auto& mem, gaddr_t pageno, riscv::Page& page) -> void {
+			assert(page.attr.is_cow);
+			/* Pages are allocated from workspace */
+			auto* data =
+				(riscv::PageData*) WS_Copy(m_ctx->ws, page.data(), page.size());
+			if (LIKELY(data != nullptr)) {
+				/* Replace old data with new non-owned data */
+				page.new_data(data, false);
+				page.attr.write = true;
+				page.attr.is_cow = false;
+				return;
+			}
+			// With heap as fallback, to allow bigger VMs
+			const auto mem_usage = mem.owned_pages_active() * riscv::Page::size();
+			if (mem_usage < this->tenant().config.max_memory()) {
+				page.make_writable();
+				return;
+			}
+			throw riscv::MachineException(
+				riscv::OUT_OF_MEMORY, "Out of memory (max_memory limit reached)",
+					pageno * riscv::Page::size());
+		};
 		machine.memory.set_page_fault_handler(
-		[this] (auto& mem, size_t pageno, bool init) -> riscv::Page& {
+		[this, copy_page] (auto& mem, size_t pageno, bool init) -> riscv::Page& {
+			/* A write to a page this fork has not read yet. If the master
+			   has the page, a fresh page would replace the master's data
+			   with zeroes (or workspace garbage), so the fork copies it
+			   like any other copy-on-write page. A read-only page stays
+			   read-only, and the write that got us here faults. */
+			const auto& master_pages = m_parent->memory.pages();
+			if (auto it = master_pages.find(pageno); it != master_pages.end()) {
+				auto& page = loan_page(mem, pageno, it->second);
+				if (page.attr.is_cow)
+					copy_page(mem, pageno, page);
+				return page;
+			}
 			/* Pages are allocated from workspace */
 			auto* data =
 				(riscv::PageData*) WS_Alloc(m_ctx->ws, riscv::Page::size());
@@ -245,41 +291,14 @@ void Script::machine_setup(machine_t& machine, bool init)
 					pageno * riscv::Page::size());
 		});
 		// Copy-on-write handling
-		machine.memory.set_page_write_handler(
-		[this] (auto& mem, gaddr_t pageno, riscv::Page& page) -> void {
-			assert(page.attr.is_cow);
-			/* Pages are allocated from workspace */
-			auto* data =
-				(riscv::PageData*) WS_Copy(m_ctx->ws, page.data(), page.size());
-			if (LIKELY(data != nullptr)) {
-				/* Replace old data with new non-owned data */
-				page.new_data(data, false);
-				page.attr.write = true;
-				page.attr.is_cow = false;
-				return;
-			}
-			// With heap as fallback, to allow bigger VMs
-			const auto mem_usage = mem.owned_pages_active() * riscv::Page::size();
-			if (mem_usage < this->tenant().config.max_memory()) {
-				page.make_writable();
-				return;
-			}
-			throw riscv::MachineException(
-				riscv::OUT_OF_MEMORY, "Out of memory (max_memory limit reached)",
-					pageno * riscv::Page::size());
-		});
+		machine.memory.set_page_write_handler(copy_page);
 		machine.memory.set_page_readf_handler(
 		[] (const riscv::Memory<MARCH>& mem, gaddr_t pageno) -> const riscv::Page& {
 			//printf("Reading page %zu @ 0x%lX\n", pageno, long(pageno * 4096u));
 			Script& script = *mem.machine().template get_userdata<Script>();
 			const riscv::Page& foreign_page = script.m_parent->memory.get_pageno(pageno);
 			// Install the page as a non-owning, COW page
-			riscv::PageAttributes attr = foreign_page.attr;
-			attr.non_owning = true;
-			attr.is_cow = foreign_page.attr.write;
-			attr.write = false;
-			riscv::PageData* data = const_cast<riscv::PageData*>(foreign_page.m_page.get());
-			return const_cast<riscv::Memory<MARCH>&>(mem).allocate_page(pageno, attr, data);
+			return loan_page(const_cast<riscv::Memory<MARCH>&>(mem), pageno, foreign_page);
 		});
 	}
 	else {

@@ -1,0 +1,82 @@
+varnishtest "RISC-V fork: the first touch of a master page is a write"
+
+# A fork that writes to a page before reading it must get a copy of the
+# master's page, not a fresh one. Each array has a page of its own, so
+# the write is the first access to that page in the fork.
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+alignas(4096) static long data[512] = {11, 22, 33, 44};
+alignas(4096) static const long rodata[512] = {7};
+
+static void on_recv(int req)
+{
+	char url[128];
+	get_url(req, url, sizeof(url)-1);
+
+	if (strcmp(url, "/store") == 0) {
+		*(volatile long *)&data[3] = 99;
+		decision("synth", 5, 200 + data[0] + data[1]);
+	} else if (strcmp(url, "/read") == 0) {
+		decision("synth", 5, 200 + data[3]);
+	} else if (strcmp(url, "/rodata") == 0) {
+		*(volatile long *)&rodata[1] = 1;
+		decision("synth", 5, 200 + rodata[0]);
+	} else {
+		decision("synth", 5, 404);
+	}
+}
+
+void start(int argc, char** argv) {
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+varnish v1 -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(400));
+	}
+} -start
+
+client c1 {
+	# The fork sees the master's data next to the word it wrote
+	txreq -url "/store" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 233
+
+	# ... and the write stayed in the fork
+	txreq -url "/read" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 244
+
+	# Read-only memory stays read-only: the write faults
+	txreq -url "/rodata" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 503
+} -run

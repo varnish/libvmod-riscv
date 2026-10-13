@@ -54,6 +54,7 @@ enable_testing()
 add_vmod_tests(vmod_riscv vmod_riscv
 	tests/empty.vtc
 	tests/faulty_loop.vtc
+	tests/fork_cow_write.vtc
 	tests/hello_backend_world.vtc
 	tests/hello_synth_world.vtc
 	tests/js_synth_basic.vtc
