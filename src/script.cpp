@@ -187,22 +187,6 @@ void Script::machine_initialize()
 	// instead of copying the full chunk list.
 	if (machine().has_arena())
 		m_arena_watermark = machine().arena().high_watermark();
-	return;
-	// For each entry point, try to optimize the return path
-	for (auto& entry : m_inst.callback_entries) {
-		if (entry != 0) {
-			const bool optimized = machine().cpu.create_fast_path_function(entry);
-			if (this->config().group.verbose) {
-				if (optimized) {
-					printf("[VM '%s'] Optimized callback entry at 0x%08lX\n",
-						name().c_str(), (long)entry);
-				} else {
-					printf("[VM '%s'] Could not optimize callback entry at 0x%08lX\n",
-						name().c_str(), (long)entry);
-				}
-			}
-		}
-	}
 }
 void Script::machine_setup(machine_t& machine, bool init)
 {
