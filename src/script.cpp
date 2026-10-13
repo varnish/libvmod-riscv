@@ -41,8 +41,9 @@ void Script::init()
 		MARCH == riscv::RISCV64 ? "64-bit" : "32-bit",
 		riscv::vector_extension ? "enabled" : "disabled",
 		riscv::compressed_enabled ? "enabled" : "disabled");
-	printf("[RISC-V features] Binary translation: %s  Memory traps: %s Flat Arena: %s\n",
+	printf("[RISC-V features] Binary translation: %s  asmjit: %s  Memory traps: %s Flat Arena: %s\n",
 		riscv::binary_translation_enabled ? (riscv::libtcc_enabled ? "jit" : "full") : "disabled",
+		riscv::asmjit_enabled ? "enabled" : "disabled",
 		riscv::memory_traps_enabled ? "enabled" : "disabled",
 		riscv::flat_readwrite_arena ? "enabled" : "disabled");
 }

@@ -6,6 +6,7 @@
 ## CMake developer build keeps working; automake and cmake ignore each other.
 
 RISCV_ENGINE_LIB = $(top_builddir)/libriscv-engine/build/libriscv.a
+RISCV_ASMJIT_LIB = $(top_builddir)/libriscv-engine/build/libasmjit.a
 
 AM_CPPFLAGS = \
 	-I$(srcdir) \
@@ -70,6 +71,7 @@ nodist_libvmod_riscv_la_SOURCES = \
 
 libvmod_riscv_la_LIBADD = \
 	$(RISCV_ENGINE_LIB) \
+	$(RISCV_ASMJIT_LIB) \
 	$(CRYPTO_LIBS) \
 	$(PTHREAD_LIBS)
 

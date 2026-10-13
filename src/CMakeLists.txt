@@ -33,6 +33,8 @@ set_source_files_properties(vcl/vclc_blob.c PROPERTIES
 
 # RISC-V sandbox library
 option(RISCV_FLAT_RW_ARENA "" OFF)
+option(RISCV_ASMJIT "" ON)
+set(RISCV_ASMJIT_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ext/asmjit" CACHE PATH "")
 add_subdirectory(libriscv)
 target_compile_definitions(riscv PUBLIC RISCV_SYSCALLS_MAX=601)
 target_compile_options(riscv PUBLIC -fPIC)

@@ -11,6 +11,8 @@
 ENGINE_SRC   = $(abs_top_srcdir)/src/libriscv
 ENGINE_BUILD = $(abs_builddir)/build
 ENGINE_LIB   = $(ENGINE_BUILD)/libriscv.a
+## asmjit is vendored in ext/asmjit (fwsGonzo/asmjit), so the build never fetches it.
+ASMJIT_SRC   = $(abs_top_srcdir)/ext/asmjit
 
 RISCV_CMAKE_FLAGS = \
 	-DCMAKE_BUILD_TYPE=Release \
@@ -21,6 +23,8 @@ RISCV_CMAKE_FLAGS = \
 	-DRISCV_EXT_C=ON \
 	-DRISCV_BINARY_TRANSLATION=OFF \
 	-DRISCV_LIBTCC=OFF \
+	-DRISCV_ASMJIT=ON \
+	-DRISCV_ASMJIT_SOURCE_DIR=$(ASMJIT_SRC) \
 	-DRISCV_FLAT_RW_ARENA=OFF \
 	-DCMAKE_CXX_FLAGS="-DRISCV_SYSCALLS_MAX=601"
 

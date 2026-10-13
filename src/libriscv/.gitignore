@@ -11,8 +11,7 @@ emulator/*.dll
 **/libtcc1.a
 nodiverge
 tests/autotest/emulator/emulator
-binaries/*
-!binaries/barebones/
+binaries/
 packages/
 fuzz/crash-*
 webapi/tests/binary
