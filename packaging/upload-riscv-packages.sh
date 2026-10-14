@@ -18,7 +18,7 @@ function upload {
     set +x
 }
 
-for i in jammy noble; do
+for i in jammy noble resolute; do
     echo "***** Ubuntu - $i *****"
     upload ubuntu $i 60-enterprise packages/ubuntu-$i/*.deb
 done

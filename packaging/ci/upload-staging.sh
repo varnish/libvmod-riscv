@@ -48,6 +48,7 @@ pc_target() {
 	case "$1" in
 		*ubuntu-jammy*)     echo ubuntu/jammy ;;
 		*ubuntu-noble*)     echo ubuntu/noble ;;
+		*ubuntu-resolute*)  echo ubuntu/resolute ;;
 		*debian-bookworm*)  echo debian/bookworm ;;
 		*debian-trixie*)    echo debian/trixie ;;
 		*almalinux-8*)      echo el/8 ;;
