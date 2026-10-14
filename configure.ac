@@ -1,5 +1,5 @@
 AC_PREREQ([2.68])
-AC_INIT([libvmod-riscv],[1.0],[],[libvmod-riscv])
+AC_INIT([libvmod-riscv],[1.1],[],[libvmod-riscv])
 AC_COPYRIGHT([Public Domain])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_AUX_DIR([build-aux])

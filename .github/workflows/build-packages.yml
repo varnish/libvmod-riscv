@@ -3,8 +3,8 @@ name: Packages (Varnish Enterprise)
 # Builds native libvmod-riscv packages for every distro/architecture where
 # Varnish Enterprise (varnish-plus) is published, in the same naming format as
 # the enterprise sledge packages, e.g.
-#   libvmod-riscv_1.0~6.0.18r2-1~noble_amd64.deb
-#   libvmod-riscv-1.0~6.0.18r2-1.el9.x86_64.rpm
+#   libvmod-riscv_1.1~6.0.18r2-1~noble_amd64.deb
+#   libvmod-riscv-1.1~6.0.18r2-1.el9.x86_64.rpm
 #
 # Manual-only: this builds against Varnish Enterprise (varnish-plus) and is not
 # meant to run on every push/PR. Trigger it from the Actions tab ("Run
