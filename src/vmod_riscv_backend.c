@@ -1,6 +1,7 @@
 #include "vmod_riscv.h"
 #include "riscv_backend.h"
 
+#include <errno.h>
 #include <malloc.h>
 #include <stdlib.h>
 #include <vtim.h>
@@ -9,6 +10,8 @@
 
 extern struct vmod_riscv_machine* riscv_current_machine(VRT_CTX);
 extern const char* riscv_current_name(VRT_CTX);
+extern const char* riscv_current_result(VRT_CTX);
+extern long riscv_current_result_value(VRT_CTX, size_t);
 extern const char* riscv_name_from_tenant(const void* tenant);
 extern void riscv_backend_call(VRT_CTX, const void*, struct vmod_riscv_arguments *, struct backend_result *);
 extern int riscv_get_body(struct vmod_riscv_post *post, struct busyobj *bo);
@@ -274,6 +277,20 @@ static void setup_backend_director(const struct vrt_ctx *ctx,
 	}
 }
 
+/* A guest address or argument, as VCL's INT-to-STRING conversion of
+   riscv.result_value() gives it. Empty (or NULL) is zero. */
+static int parse_guest_value(const char *str, uint64_t *value)
+{
+	char *end;
+
+	*value = 0;
+	if (str == NULL || *str == '\0')
+		return (1);
+	errno = 0;
+	*value = (uint64_t) strtoll(str, &end, 10);
+	return (errno == 0 && *end == '\0');
+}
+
 VCL_BACKEND vmod_vm_backend(VRT_CTX, VCL_STRING func, VCL_STRING farg)
 {
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
@@ -293,13 +310,25 @@ VCL_BACKEND vmod_vm_backend(VRT_CTX, VCL_STRING func, VCL_STRING farg)
 		return NULL;
 	}
 
-	if (func) {
-		rvr->arguments.funcaddr = atoi(func);
-		rvr->arguments.funcarg  = farg ? atoi(farg) : 0;
-		/* TODO: If it's null, should we abandon? */
-		if (rvr->arguments.funcaddr == 0x0) {
-			return (NULL);
+	if (func == NULL || *func == '\0') {
+		/* The tenant's own backend decision: (caching, func, arg) */
+		const char *res = riscv_current_result(ctx);
+		if (res == NULL || strcmp(res, "backend") != 0) {
+			VRT_fail(ctx, "VM backend: No function given, "
+				"and the tenant made no backend decision");
+			return NULL;
 		}
+		rvr->arguments.funcaddr = riscv_current_result_value(ctx, 1);
+		rvr->arguments.funcarg  = riscv_current_result_value(ctx, 2);
+	} else if (!parse_guest_value(func, &rvr->arguments.funcaddr) ||
+		!parse_guest_value(farg, &rvr->arguments.funcarg)) {
+		VRT_fail(ctx, "VM backend: Invalid function '%s' or argument '%s'",
+			func, farg ? farg : "");
+		return NULL;
+	}
+	if (rvr->arguments.funcaddr == 0x0) {
+		VRT_fail(ctx, "VM backend: No function to call");
+		return NULL;
 	}
 	rvr->arguments.max_response_size = 0;
 

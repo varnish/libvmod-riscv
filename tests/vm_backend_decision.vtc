@@ -1,0 +1,150 @@
+varnishtest "RISC-V: vm_backend() without arguments, add_backend(), ON_HIT"
+
+server s1 {
+	rxreq
+	txresp -hdr "X-Server: s1"
+} -start
+
+server s2 {
+	rxreq
+	txresp -hdr "X-Server: s2"
+} -start
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static void on_recv(int req)
+{
+	char url[128];
+	const long len = get_url(req, url, sizeof(url)-1);
+	url[len < 0 ? 0 : len] = 0;
+
+	if (strcmp(url, "/s2") == 0) {
+		decision("pass", 4, syscall1(ECALL_SET_BACKEND, 1));
+	} else if (strcmp(url, "/empty-slot") == 0) {
+		/* Not given by VCL: refused, and the hint is kept */
+		decision("pass", 4, syscall1(ECALL_SET_BACKEND, 5));
+	} else if (strcmp(url, "/hit") == 0) {
+		decision("lookup", 6, 0);
+	} else {
+		decision("none", 4, 0);
+	}
+}
+
+static void on_backend_fetch(int, int)
+{
+	forge(NOT_CACHED, [] {
+		static const char mime[] = "text/plain";
+		static const char text[] = "Hello World";
+		sys_response(200, mime, sizeof(mime)-1, text, sizeof(text)-1);
+	});
+}
+
+static void on_hit(int req, int obj)
+{
+	/* There is no object HTTP to pass */
+	decision("hit", 3, obj == -1 ? 200 : 500);
+}
+
+void start(int, char**) {
+	register_callback(4, (void(*)())on_backend_fetch);
+	register_callback(8, (void(*)())on_hit);
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+varnish v1 -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		set req.backend_hint = s1;
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		if (riscv.add_backend(s1) != 0 || riscv.add_backend(s2) != 1) {
+			return (synth(500));
+		}
+		riscv.vcall(ON_REQUEST);
+		if (riscv.want_result() == "pass") {
+			set req.http.X-Set-Backend = riscv.want_status();
+			return (pass);
+		}
+		if (riscv.want_result() == "lookup") {
+			return (hash);
+		}
+		return (pass);
+	}
+
+	sub vcl_hit {
+		riscv.vcall(ON_HIT);
+		return (synth(riscv.want_status()));
+	}
+
+	sub vcl_backend_fetch {
+		if (bereq.url == "/forge" || bereq.url == "/hit") {
+			if (riscv.fork(bereq.http.Host)) {
+				riscv.vcall(ON_BACKEND_FETCH);
+				set bereq.backend = riscv.vm_backend();
+			}
+		} elsif (bereq.url == "/nodecision") {
+			if (riscv.fork(bereq.http.Host)) {
+				set bereq.backend = riscv.vm_backend();
+			}
+		}
+	}
+
+	sub vcl_deliver {
+		set resp.http.X-Set-Backend = req.http.X-Set-Backend;
+	}
+} -start
+
+client c1 {
+	# The guest selects the second backend VCL gave it
+	txreq -url "/s2" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Server == "s2"
+	expect resp.http.X-Set-Backend == "0"
+
+	# An index VCL did not fill fails, and keeps the backend
+	txreq -url "/empty-slot" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Server == "s1"
+	expect resp.http.X-Set-Backend == "-1"
+
+	# vm_backend() uses the tenant's own backend decision
+	txreq -url "/forge" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "Hello World"
+
+	# ... and with no decision, fails instead of using a null backend
+	txreq -url "/nodecision" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 503
+
+	# ON_HIT passes no object HTTP
+	txreq -url "/hit" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "Hello World"
+	txreq -url "/hit" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Server == <undef>
+} -run

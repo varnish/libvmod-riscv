@@ -72,6 +72,8 @@ get_http(VRT_CTX, int where)
 	case HDR_RESP:
 		hp = ctx->http_resp;
 		break;
+	case HDR_OBJ:
+		throw std::runtime_error("Object headers (HDR_OBJ) are not supported");
 	}
 	if (UNLIKELY(hp == nullptr))
 		throw std::runtime_error("Selected HTTP not available at this time: " + std::to_string(where));
@@ -126,6 +128,39 @@ http_unsetat(struct http *hp, unsigned idx)
 inline uint32_t field_length(const txt& field)
 {
 	return field.e - field.b;
+}
+
+/* An RFC 9110 token: what a header name (or a method) may be. */
+static bool valid_token(std::string_view name)
+{
+	if (name.empty())
+		return false;
+	for (unsigned char c : name) {
+		if (isalnum(c))
+			continue;
+		if (c == '\0' || !strchr("!#$%&'*+-.^_`|~", c))
+			return false;
+	}
+	return true;
+}
+/* A CR, LF or NUL would end the line, and let a tenant add header fields,
+   or a whole request, of its own. */
+static bool valid_value(std::string_view value)
+{
+	return value.find_first_of(std::string_view("\r\n\0", 3)) == std::string_view::npos;
+}
+/* A field the guest writes at an index. A header is "Name: value", with
+   a token for the name, and the request or status line fields are values. */
+static bool valid_field(unsigned index, std::string_view field)
+{
+	if (!valid_value(field))
+		return false;
+	if (index == HTTP_HDR_METHOD)
+		return valid_token(field);
+	if (index < HDR_FIRST)
+		return true;
+	const size_t colon = field.find(':');
+	return colon != std::string_view::npos && valid_token(field.substr(0, colon));
 }
 
 /* An empty slot (never compiled, or deleted) is NULL, and VRE asserts on it */
@@ -414,10 +449,15 @@ APICALL(set_decision)
 }
 APICALL(set_backend)
 {
-	auto [be] = machine.sysargs<int> ();
+	auto [be] = machine.sysargs<unsigned> ();
 	auto& script = get_script(machine);
-	auto* dir = script.directors().get(be);
-	machine.set_result(riscv_SetBackend(script.ctx(), dir));
+	/* Only a backend that VCL gave this machine with riscv.add_backend().
+	   An empty slot would clear the backend hint. */
+	if (be >= script.directors().size() || script.directors().get(be) == nullptr) {
+		machine.set_result(-1);
+		return;
+	}
+	machine.set_result(riscv_SetBackend(script.ctx(), script.directors().get(be)));
 }
 APICALL(backend_decision)
 {
@@ -468,6 +508,9 @@ APICALL(synth)
 		/* http_SetStatus() asserts on the last three digits */
 		if (UNLIKELY(status % 1000 < 100))
 			throw std::runtime_error("Invalid synth status code: " + std::to_string(status));
+		/* The Content-Type goes into a header line as is */
+		if (UNLIKELY(!valid_value(type.to_string())))
+			throw std::runtime_error("Invalid synth Content-Type");
 
 #ifdef VARNISH_PLUS
 		http_SetStatus(hp, status);
@@ -802,6 +845,8 @@ APICALL(header_field_append)
 		throw std::runtime_error("Unable to make room for HTTP header field");
 	machine.memory.memcpy_out(val, (gaddr_t) field, len);
 	val[len] = 0;
+	if (UNLIKELY(!valid_field(HDR_FIRST, std::string_view(val, len))))
+		throw std::runtime_error("Invalid HTTP header field");
 
 	if (UNLIKELY(hp->field_count >= hp->fields_max)) {
 		VSLb(hp->vsl, SLT_LostHeader, "%.*s", (int) len, val);
@@ -834,6 +879,8 @@ APICALL(header_field_set)
 
 		buffer.copy_to(val, buffer.size());
 		val[buffer.size()] = 0;
+		if (UNLIKELY(!valid_field(index, std::string_view(val, buffer.size()))))
+			throw std::runtime_error("Invalid HTTP header field");
 
 		/* Apply it at the given index */
 		http_SetH(hp, index, val);
@@ -1041,6 +1088,11 @@ APICALL(regex_subst_hdr)
 		return;
 	}
 	const size_t sublen = VSB_len(sub);
+	/* The substitution replaces the whole field, name included */
+	if (UNLIKELY(!valid_field(index, std::string_view(VSB_data(sub), sublen)))) {
+		VSB_destroy(&sub);
+		throw std::runtime_error("Invalid HTTP header field");
+	}
 	auto* result = static_cast<const char*>(WS_Copy(ctx->ws, VSB_data(sub), sublen + 1));
 	VSB_destroy(&sub);
 	if (result == nullptr) {

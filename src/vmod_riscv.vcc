@@ -24,8 +24,8 @@ Example:
 			{
 				"default": {
 					"max_instructions": 2000000,
-					"max_memory": 42000000,
-					"max_heap":  4194304
+					"max_memory": 42,
+					"max_heap":  4
 				},
 				"xpizza.com": {
 					"filename": "/tmp/my_program",
@@ -33,11 +33,14 @@ Example:
 				}
 			}
 		""");
+		/* Load the programs: required after the last
+		   embed_tenants(), load_tenants() or add_main_argument() */
+		riscv.finalize_tenants();
 	}
 
 	sub vcl_recv {
 		/* Select a tenant to handle this request */
-		riscv.fork("mytenant.com");
+		riscv.fork("xpizza.com");
 		/* Add CDNs custom header fields */
 		set req.http.X-Tenant = riscv.current_name();
 		/* We can call VCL-like functions */
@@ -85,13 +88,17 @@ $Function VOID load_tenants(STRING json_filepath)
 
 	"group_name": {
 		"max_instructions": 2000000,
-		"max_memory": 4194304,
-		"max_heap":  4194304
+		"max_memory": 4,
+		"max_heap":  4
 	},
 	"tenant_name": {
 		"filename": "/path/to/program",
-		"group": "groupname"
+		"group": "group_name"
 	}
+
+- max_memory and max_heap are in megabytes.
+- A tenant without a "group" uses the built-in "test" group.
+  Naming a group that the JSON does not define fails vcl_init.
 
 - The program does not have to exist, it only needs to be
   accessible to Varnish. When a tenant sends a new program
@@ -127,6 +134,24 @@ $Function BOOL    active()
 
 - Returns true if there is a currently active tenant.
 
+$Function INT     add_backend(BACKEND backend)
+
+- Lets the current machine select this backend with the guest's
+  set_backend(n), where n is the number this returns: zero for the first
+  backend added to the machine, one for the next, and so on.
+- Returns -1 if there is no active machine, or it has too many backends
+  (the group's max_backends, at most 16).
+- Backends are added per request, after riscv.fork().
+
+Example:
+	sub vcl_recv {
+		if (riscv.fork(req.http.Host)) {
+			riscv.add_backend(b0); # set_backend(0)
+			riscv.add_backend(b1); # set_backend(1)
+			riscv.run();
+		}
+	}
+
 $Function INT     vcall(ENUM {
 		ON_REQUEST,
 		ON_HASH,
@@ -144,6 +169,8 @@ $Function INT     vcall(ENUM {
 - Calls the given function at index in order added by add_known_function
   (starting at zero), in the currently active machine.
   Req/resp HTTP index arguments are added to the call.
+- ON_HIT passes no second HTTP (HDR_INVALID): object headers
+  (HDR_OBJ) are not available to the guest.
 
 $Function INT     run(STRING arg = 0)
 
@@ -207,11 +234,15 @@ $Function BOOL    want_resume()
 
 - Returns true if the machine was paused, and may be resumed.
 
-$Function BACKEND vm_backend(STRING func, STRING arg = "")
+$Function BACKEND vm_backend(STRING func = "", STRING arg = "")
 
 - Returns a backend that will call into the current machine to produce a response.
 - Produces 500 server error if there is no active machine, or an error happens.
 - Call with no function specified if tenant has made a "backend" decision.
+  The function and argument are then the decision's, which
+  riscv.result_value(1) and riscv.result_value(2) also return.
+- Fails the VCL if no function is given and there is no backend decision,
+  or if the function or argument is not a number.
 
 	if (riscv.want_result() == "backend") {
 		set bereq.backend = riscv.vm_backend();

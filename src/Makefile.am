@@ -17,6 +17,7 @@ AM_CPPFLAGS = \
 	-DVMOD=1 \
 	-D_GNU_SOURCE \
 	-DRISCV_SYSCALLS_MAX=601 \
+	-DRISCV_PROGRAM_PATH=\"$(abs_top_srcdir)\" \
 	$(CRYPTO_CFLAGS)
 
 ## -Wa,-I lets vcl/vclc_blob.c .incbin the sandboxed VCL compiler.

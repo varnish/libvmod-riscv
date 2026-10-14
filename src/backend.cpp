@@ -16,8 +16,11 @@ inline Script* get_machine(VRT_CTX, const void* key)
 	return nullptr;
 }
 
-inline const char* optional_copy(VRT_CTX, const riscv::Buffer& buffer)
+/* The guest's Content-Type, which goes into a header line as is */
+inline const char* content_type_copy(VRT_CTX, const riscv::Buffer& buffer)
 {
+	if (buffer.to_string().find_first_of(std::string_view("\r\n\0", 3)) != std::string::npos)
+		throw std::runtime_error("Invalid Content-Type");
 	if (buffer.is_sequential())
 		return buffer.data();
 
@@ -66,7 +69,7 @@ void riscv_backend_call(VRT_CTX, const void* key, struct vmod_riscv_arguments *a
 				throw std::runtime_error("Invalid backend response status: " + std::to_string(status));
 			/* Return content-type, status, and iovecs containing data */
 			using vBuffer = riscv::vBuffer;
-			result->type = optional_copy(ctx, type);
+			result->type = content_type_copy(ctx, type);
 			result->tsize = type.size();
 			result->status = status;
 			result->content_length = datalen;
@@ -184,7 +187,7 @@ int riscv_deliver_call(VRT_CTX, const char* func, const char* arg,
 		/* http_PutResponse() asserts on a status that is not three digits */
 		if (UNLIKELY(status < 100 || status > 999))
 			throw std::runtime_error("Invalid deliver response status: " + std::to_string(status));
-		result->type = optional_copy(ctx, type);
+		result->type = content_type_copy(ctx, type);
 		result->tsize = type.size();
 		result->status = status;
 		result->data = data;

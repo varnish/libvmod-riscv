@@ -74,50 +74,58 @@ static void init_tenants(VRT_CTX,
 			{"test", TenantGroup{}}
 		};
 
+		/* Groups first: JSON objects are ordered by key, and a tenant
+		   may name a group that sorts after it. */
 		for (const auto& it : j.items())
 		{
 			const auto& obj = it.value();
 			if (obj.contains("filename"))
-			{
-				std::string grname;
-				if (obj.contains("group"))
-					grname = obj["group"];
-				else
-					grname = "test";
-
-				/* Validate the group name */
-				auto grit = groups.find(grname);
-				if (grit == groups.end()) {
-					VSL(SLT_Error, 0,
-						"Group '%s' missing for tenant: %s",
-						grname.c_str(), it.key().c_str());
-					continue;
-				}
-				// Make a copy of the group
-				TenantGroup group = grit->second;
-				// Apply any overrides
+				continue;
+			// Existing tenant, reconfigure
+			if (auto* tenant = find_tenant(ctx, it.key())) {
+				auto& group  = tenant->config.group;
 				configure_tenant(group, obj);
-				/* Use the group data except filename */
-				load_tenant(ctx, TenantConfig{
-					it.key(), obj["filename"], group,
-				});
-			} else {
-				// Existing tenant, reconfigure
-				if (auto* tenant = find_tenant(ctx, it.key())) {
-					auto& group  = tenant->config.group;
-					configure_tenant(group, obj);
-					continue;
-				}
-				/* Find or create group */
-				auto git = groups.find(it.key());
-				if (git == groups.end()) {
-					/* New group */
-					groups.emplace(it.key(), TenantGroup{});
-					git = groups.find(it.key());
-				}
-				auto& group = git->second;
-				configure_tenant(group, obj);
+				continue;
 			}
+			/* Find or create group */
+			auto git = groups.find(it.key());
+			if (git == groups.end()) {
+				/* New group */
+				groups.emplace(it.key(), TenantGroup{});
+				git = groups.find(it.key());
+			}
+			auto& group = git->second;
+			configure_tenant(group, obj);
+		}
+		for (const auto& it : j.items())
+		{
+			const auto& obj = it.value();
+			if (!obj.contains("filename"))
+				continue;
+			std::string grname;
+			if (obj.contains("group"))
+				grname = obj["group"];
+			else
+				grname = "test";
+
+			/* Validate the group name */
+			auto grit = groups.find(grname);
+			if (grit == groups.end()) {
+				VSL(SLT_Error, 0,
+					"Group '%s' missing for tenant: %s",
+					grname.c_str(), it.key().c_str());
+				VRT_fail(ctx, "Group '%s' missing for tenant: %s",
+					grname.c_str(), it.key().c_str());
+				continue;
+			}
+			// Make a copy of the group
+			TenantGroup group = grit->second;
+			// Apply any overrides
+			configure_tenant(group, obj);
+			/* Use the group data except filename */
+			load_tenant(ctx, TenantConfig{
+				it.key(), obj["filename"], group,
+			});
 		}
 	} catch (const std::exception& e) {
 		VSL(SLT_Error, 0,

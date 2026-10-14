@@ -3,13 +3,19 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <filesystem>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <libriscv/common.hpp>
-#include <libriscv/util/crc32.hpp>
 #include "builder.sh.h"
 static constexpr bool VERBOSE_COMPILER = false;
-static const std::string PROGRAM_PATH = "/home/gonzo/github/libvmod-riscv";
+/* Where program/ (the guest API and toolchain files) is: the source tree
+   this VMOD was built from, unless RISCV_PROGRAM_PATH says otherwise. */
+#ifndef RISCV_PROGRAM_PATH
+#define RISCV_PROGRAM_PATH "."
+#endif
+static const std::string PROGRAM_PATH = RISCV_PROGRAM_PATH;
 
 std::string env_with_default(const char* var, const std::string& defval) {
 	std::string value = defval;
@@ -17,37 +23,31 @@ std::string env_with_default(const char* var, const std::string& defval) {
 	return value;
 }
 
-struct TemporaryFile
+TemporaryDirectory::TemporaryDirectory()
 {
-	TemporaryFile(std::string contents)
-	{
-		// Create temporary filenames for code and binary
-		this->filename = "/tmp/builder-XXXXXX";
-		// Open temporary code file with owner privs
-		this->fd = mkstemp(&filename[0]);
-		if (this->fd < 0)
-		{
-			throw std::runtime_error(
-				"Unable to create temporary file: " + this->filename);
-		}
-
-		// Write code to temp code file
-		const ssize_t len = write(this->fd, contents.data(), contents.size());
-		close(this->fd);
-		if (len < (ssize_t)contents.size())
-		{
-			throw std::runtime_error("Unable to write to temporary file");
-		}
-	}
-	~TemporaryFile()
-	{
-		//if (fd > 0)
-		//	unlink(this->filename.c_str());
-	}
-
-	int fd;
-	std::string filename;
-};
+	char templ[] = "/tmp/builder-XXXXXX";
+	if (mkdtemp(templ) == nullptr)
+		throw std::runtime_error("Unable to create temporary directory");
+	this->path = templ;
+}
+TemporaryDirectory::~TemporaryDirectory()
+{
+	std::error_code ec;
+	std::filesystem::remove_all(this->path, ec);
+}
+std::string TemporaryDirectory::write(const std::string& name,
+	const std::string& contents, mode_t mode)
+{
+	const std::string filename = this->path + "/" + name;
+	const int fd = open(filename.c_str(), O_WRONLY | O_CREAT | O_EXCL, mode);
+	if (fd < 0)
+		throw std::runtime_error("Unable to create temporary file: " + filename);
+	const ssize_t len = ::write(fd, contents.data(), contents.size());
+	close(fd);
+	if (len < (ssize_t)contents.size())
+		throw std::runtime_error("Unable to write to temporary file: " + filename);
+	return filename;
+}
 
 std::vector<uint8_t> load_file(const std::string& filename)
 {
@@ -72,18 +72,14 @@ std::vector<uint8_t> load_file(const std::string& filename)
 std::vector<uint8_t>
 	build_and_load(const std::string& code, const std::string& args)
 {
-	// Create temporary file for builder script
-	TemporaryFile builder_script_tmpfile { std::string((const char*)builder_sh, builder_sh_len) };
-	chmod(builder_script_tmpfile.filename.c_str(), 0755);
-
-	// Create temporary filenames for code and binary
-	TemporaryFile code_tmpfile { code };
-	// Compile code to binary file
-	char bin_filename[256];
-	const uint32_t code_checksum = riscv::crc32((const uint8_t *)code.c_str(), code.size());
-	const uint32_t final_checksum = riscv::crc32(code_checksum, (const uint8_t *)args.c_str(), args.size());
-	(void)snprintf(bin_filename, sizeof(bin_filename),
-		"/tmp/binary-%08X", final_checksum);
+	/* micro.cmake picks the compiler flags */
+	(void) args;
+	// The builder script, the code and the binary, all removed afterwards
+	TemporaryDirectory tmpdir;
+	const std::string builder_script =
+		tmpdir.write("builder.sh", std::string((const char*)builder_sh, builder_sh_len), 0700);
+	const std::string code_file = tmpdir.write("program.cpp", code, 0600);
+	const std::string bin_filename = tmpdir.path + "/program";
 	const std::string gcc_triple = env_with_default("RISCV_GCC_TRIPLE",
 #if defined(RISCV_64I) && defined(RISCV_EXT_C)
 		"riscv64-linux-gnu"
@@ -97,12 +93,12 @@ std::vector<uint8_t>
 
 	char command[8192];
 	snprintf(command, sizeof(command),
-		"exec %s \"%s\" %s %s %s",
-		builder_script_tmpfile.filename.c_str(),
+		"exec \"%s\" \"%s\" \"%s\" \"%s\" \"%s\"",
+		builder_script.c_str(),
 		gcc_triple.c_str(),
 		program_path.c_str(),
-		code_tmpfile.filename.c_str(),
-		bin_filename);
+		code_file.c_str(),
+		bin_filename.c_str());
 
 	if constexpr (VERBOSE_COMPILER) {
 		printf("Command: %s\n", command);
@@ -123,9 +119,7 @@ std::vector<uint8_t>
 	pclose(f);
 
 	try {
-		std::vector<uint8_t> vec = load_file(bin_filename);
-		unlink(bin_filename);
-		return vec;
+		return load_file(bin_filename);
 	} catch (const std::exception& e) {
 		if (len > 0) {
 			printf("Compilation:\n%.*s\n", (int)len, command);

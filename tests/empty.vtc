@@ -11,7 +11,7 @@ vcl 4.1;
 			{
 				"xpizza.com": {
 					"filename": "/tmp/nothing",
-					"group": "default"
+					"group": "test"
 				}
 			}
 		""");

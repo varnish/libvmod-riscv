@@ -43,6 +43,19 @@ const rvs::SandboxTenant* riscv_current_machine(VRT_CTX)
 }
 
 extern "C"
+long riscv_current_add_backend(VRT_CTX, VCL_BACKEND dir)
+{
+	auto* script = rvs::get_machine(ctx);
+	if (script == nullptr || dir == nullptr)
+		return -1;
+	if (script->directors().full()) {
+		VSLb(ctx->vsl, SLT_Error, "riscv.add_backend(): Too many backends (max %zu)",
+			script->directors().max_size());
+		return -1;
+	}
+	return script->directors().manage(dir, 0);
+}
+extern "C"
 long riscv_current_call_idx(VRT_CTX, vcall_info info, const char* argument)
 {
 	using namespace rvs;

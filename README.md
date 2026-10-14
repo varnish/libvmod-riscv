@@ -56,6 +56,8 @@ sub vcl_init {
             "filename": "/path/to/tenant_program"
         }
     }""");
+    # Loads the programs. Required, or no tenant is loaded.
+    riscv.finalize_tenants();
 }
 
 sub vcl_recv {

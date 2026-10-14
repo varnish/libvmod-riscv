@@ -35,6 +35,8 @@ pub fn print(msg: &str) {
     }
 }
 
+/// Returns the whole field ("Name: value"), or an empty string when
+/// there is no field at index (eg. u32::MAX from header_find()).
 pub fn get_header_field(where_from: u32, index: u32) -> String {
 	let mut len: i32;
 	unsafe {
@@ -47,6 +49,9 @@ pub fn get_header_field(where_from: u32, index: u32) -> String {
 			lateout("a0") len
 		);
 	}
+	if len < 0 {
+		return String::new();
+	}
 	let mut buf: Vec<u8> = Vec::with_capacity(len as usize);
 	unsafe {
 		asm!("ecall",
@@ -57,6 +62,9 @@ pub fn get_header_field(where_from: u32, index: u32) -> String {
 			in("a3") buf.capacity(),
 			lateout("a0") len
 		);
+		if len < 0 || len as usize > buf.capacity() {
+			return String::new();
+		}
 		buf.set_len(len as usize);
 		String::from_utf8_unchecked(buf)
 	}

@@ -1,0 +1,198 @@
+varnishtest "RISC-V: guest header writes are validated, empty synth bodies work"
+
+# A guest-written header field is "Name: value" with a token for a name,
+# and no field may contain CR, LF or NUL, which would let a tenant add
+# header fields (or a whole request) of its own.
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static long append(const char* field, size_t len) {
+	return syscall3(ECALL_FIELD_APPEND, HDR_REQ, (long)field, len);
+}
+static long set_field(int idx, const char* field, size_t len) {
+	return syscall4(ECALL_FIELD_SET, HDR_REQ, idx, (long)field, len);
+}
+#define S(x) x, sizeof(x)-1
+
+static void on_recv(int req)
+{
+	char url[128];
+	const long len = get_url(req, url, sizeof(url)-1);
+	url[len < 0 ? 0 : len] = 0;
+
+	if (strcmp(url, "/good") == 0) {
+		append(S("X-Good: yes"));
+	} else if (strcmp(url, "/append-crlf") == 0) {
+		append(S("X-A: b\r\nX-Evil: 1"));
+	} else if (strcmp(url, "/append-lf") == 0) {
+		append(S("X-A: b\nX-Evil: 1"));
+	} else if (strcmp(url, "/append-nul") == 0) {
+		append(S("X-A: b\0X-Evil: 1"));
+	} else if (strcmp(url, "/append-noname") == 0) {
+		append(S("no colon here"));
+	} else if (strcmp(url, "/append-badname") == 0) {
+		append(S("X A: b"));
+	} else if (strcmp(url, "/set-url") == 0) {
+		set_field(1, S("/a HTTP/1.1\r\nX-Evil: 1\r\n\r\nGET /b"));
+	} else if (strcmp(url, "/set-method") == 0) {
+		set_field(0, S("GET /"));
+	} else if (strcmp(url, "/set-good") == 0) {
+		set_field(1, S("/rewritten"));
+	} else if (strcmp(url, "/empty-synth") == 0) {
+		decision("synth", 5, 200);
+		return;
+	} else if (strcmp(url, "/bad-type") == 0) {
+		decision("synth", 5, 201);
+		return;
+	}
+	decision("synth", 5, 299);
+}
+
+static void on_synth(int req, int resp)
+{
+	if (resp == HDR_RESP) {
+		char url[128];
+		const long len = get_url(req, url, sizeof(url)-1);
+		url[len < 0 ? 0 : len] = 0;
+		if (strcmp(url, "/bad-type") == 0)
+			synth(200, S("text/plain\r\nX-Evil: 1"), S("body"));
+		/* A zero-length body, and a null pointer for it */
+		synth(200, S("text/plain"), nullptr, 0);
+	}
+}
+
+void start(int, char**) {
+	register_callback(3, (void(*)())on_synth);
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+varnish v1 -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		# The group sorts after the tenant that uses it
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "zgroup"
+			},
+			"zgroup": {
+				"max_instructions": 1000000
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		if (riscv.want_result() == "synth" && riscv.want_status() == 299) {
+			return (synth(299));
+		}
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(400));
+	}
+
+	sub vcl_synth {
+		if (resp.status == 299) {
+			set resp.status = 200;
+			set resp.http.X-Good = req.http.X-Good;
+			set resp.http.X-Evil = req.http.X-Evil;
+			set resp.http.X-Url = req.url;
+			return (deliver);
+		}
+		if (resp.status == 200 || resp.status == 201) {
+			riscv.vcall(ON_SYNTH);
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	txreq -url "/good" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Good == "yes"
+
+	txreq -url "/set-good" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Url == "/rewritten"
+} -run
+
+# Each of these is refused, and fails the request (which closes the connection)
+client cr0 {
+	txreq -url "/append-crlf" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 503
+	expect resp.http.X-Evil == <undef>
+} -run
+
+client cr1 {
+	txreq -url "/append-lf" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 503
+	expect resp.http.X-Evil == <undef>
+} -run
+
+client cr2 {
+	txreq -url "/append-nul" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 503
+	expect resp.http.X-Evil == <undef>
+} -run
+
+client cr3 {
+	txreq -url "/append-noname" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 503
+} -run
+
+client cr4 {
+	txreq -url "/append-badname" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 503
+} -run
+
+client cr5 {
+	txreq -url "/set-url" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 503
+	expect resp.http.X-Evil == <undef>
+} -run
+
+client cr6 {
+	txreq -url "/set-method" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 503
+} -run
+
+client c4 {
+	# An empty synth body is valid
+	txreq -url "/empty-synth" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.Content-Type == "text/plain"
+	expect resp.bodylen == 0
+
+} -run
+
+client c5 {
+	# A Content-Type with CR/LF is refused
+	txreq -url "/bad-type" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 500
+	expect resp.http.X-Evil == <undef>
+} -run
