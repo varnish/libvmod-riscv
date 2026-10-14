@@ -102,7 +102,9 @@ int riscv_backend_streaming_post(struct vmod_riscv_post *post,
 	const void *data_ptr, ssize_t data_len)
 {
 	using namespace rvs;
-	auto* script = get_machine(post->ctx, post->ctx->bo);
+	/* A backend VM is keyed on the busyobj, a deliver VM on the req */
+	const void* key = post->ctx->req ? (const void *)post->ctx->req : post->ctx->bo;
+	auto* script = get_machine(post->ctx, key);
 	if (script) {
 		auto* old_ctx = script->ctx();
 		try {
@@ -141,6 +143,76 @@ int riscv_backend_streaming_post(struct vmod_riscv_post *post,
 	} else {
 		fprintf(stderr, "Streaming post error: no VM instance\n");
 		VSLb(post->ctx->vsl, SLT_Error, "Streaming post error: no VM instance");
+	}
+	return -1;
+}
+extern "C"
+int riscv_deliver_call(VRT_CTX, const char* func, const char* arg,
+	const struct vmod_riscv_post *post, struct deliver_result *result)
+{
+	using namespace rvs;
+	auto* script = get_machine(ctx, ctx->req);
+	if (script == nullptr) {
+		VSLb(ctx->vsl, SLT_Error, "deliver_transform: no active tenant");
+		return -1;
+	}
+	auto* old_ctx = script->ctx();
+	try {
+		Script::gaddr_t addr = 0;
+		const auto it = script->program().function_map.find(func);
+		if (it != script->program().function_map.end())
+			addr = it->second;
+		else
+			addr = script->resolve_address(func);
+		if (addr == 0)
+			throw std::runtime_error("function '" + std::string(func) + "' not found");
+
+		/* The guest may read and change resp while it runs */
+		script->set_ctx(ctx);
+		auto& machine = script->machine();
+		machine.cpu.reset_stack_pointer();
+		machine.setup_call(std::string(arg), (Script::gaddr_t)post->address, (Script::gaddr_t)post->length);
+		machine.simulate_with<true>(script->max_instructions(), 0u, addr);
+		script->set_ctx(old_ctx);
+
+		/* A function that returns instead of responding has no answer */
+		if (machine.cpu.pc() == machine.memory.exit_address())
+			throw std::runtime_error("function '" + std::string(func) + "' returned without a response");
+
+		const auto [status, type, data, datalen] =
+			machine.sysargs<int, riscv::Buffer, Script::gaddr_t, Script::gaddr_t> ();
+		/* http_PutResponse() asserts on a status that is not three digits */
+		if (UNLIKELY(status < 100 || status > 999))
+			throw std::runtime_error("Invalid deliver response status: " + std::to_string(status));
+		result->type = optional_copy(ctx, type);
+		result->tsize = type.size();
+		result->status = status;
+		result->data = data;
+		result->length = datalen;
+		return 0;
+	} catch (const riscv::MachineException& e) {
+		VSLb(ctx->vsl, SLT_Error,
+			"deliver_transform VM exception: %s (data: 0x%lX)",
+			e.what(), e.data());
+	} catch (const std::exception& e) {
+		VSLb(ctx->vsl, SLT_Error, "deliver_transform VM exception: %s", e.what());
+	}
+	script->set_ctx(old_ctx);
+	return -1;
+}
+
+extern "C"
+int riscv_deliver_copy_out(VRT_CTX, void *dst, uint64_t src, size_t len)
+{
+	using namespace rvs;
+	auto* script = get_machine(ctx, ctx->req);
+	if (script == nullptr)
+		return -1;
+	try {
+		script->machine().memory.memcpy_out(dst, src, len);
+		return 0;
+	} catch (const std::exception& e) {
+		VSLb(ctx->vsl, SLT_Error, "deliver_transform: bad response body: %s", e.what());
 	}
 	return -1;
 }

@@ -33,3 +33,13 @@ struct backend_result {
 
 #define VMBE_NUM_BUFFERS  1024
 #define VMBE_RESULT_SIZE  (sizeof(struct backend_result) + VMBE_NUM_BUFFERS * sizeof(struct VMBuffer))
+
+/* The response a guest produced in vcl_deliver, before it replaces
+   the object being delivered. data is a guest address. */
+struct deliver_result {
+	const char *type;
+	size_t   tsize;
+	int      status;
+	uint64_t data;
+	size_t   length;
+};

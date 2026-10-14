@@ -63,3 +63,15 @@ long riscv_SetBackend(VRT_CTX, VCL_BACKEND dir)
 	}
 	return -1;
 }
+
+/* Fork pages come from the workspace while it has room for them and
+   still leaves 'keep' bytes for Varnish (response headers and the like).
+   A failed WS_Alloc() marks the workspace overflowed, which fails the
+   whole task, so check first and let the caller fall back to the heap. */
+void *riscv_ws_alloc_spare(struct ws *ws, unsigned bytes, unsigned keep)
+{
+	CHECK_OBJ_NOTNULL(ws, WS_MAGIC);
+	if (ws->r != NULL || pdiff(ws->f, ws->e) < (size_t)bytes + keep)
+		return (NULL);
+	return (WS_Alloc(ws, bytes));
+}

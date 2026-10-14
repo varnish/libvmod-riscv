@@ -270,6 +270,15 @@ namespace riscv
 			if (addr >= begin && addr < end)
 				blocked.insert(addr);
 		}
+		// The libc fast-path patches decoder entries after this translation, so
+		// calls into those functions must leave the JIT to see the patch.
+		if constexpr (W <= 8) {
+			if (options.libc_fastpath) {
+				for (const address_t addr : cpu.machine().libc_fastpath_addresses())
+					if (addr >= begin && addr < end)
+						blocked.insert(addr);
+			}
+		}
 
 		// --- 1. Instruction boundaries and entry points ---------------------------
 		AjSegmentMap<W> map { seg, begin, end, blocked };

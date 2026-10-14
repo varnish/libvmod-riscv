@@ -16,6 +16,8 @@ namespace vcl { void install_syscalls(); }
 	inline timespec time_now();
 	inline long nanodiff(timespec start_time, timespec end_time);
 	static constexpr uint64_t SIGHANDLER_INSN = 60'000;
+	/* Workspace that fork pages leave for Varnish itself */
+	static constexpr unsigned WS_PAGE_SPARE = 16384;
 	static constexpr unsigned NATIVE_SYSCALLS_BASE = 580;
 	/* The native heap takes base+0..4 and the native memory helpers
 	   base+5..base+19 (their n+14 is "print backtrace"). EBREAK is system
@@ -115,6 +117,10 @@ Script::Script(
 		.stack_size = STACK_SIZE,
 		.enforce_exec_only = ten->config.elf_execute_only(),
 		.default_exit_function = "fast_exit",
+		/* Run the guest's own memcpy, memchr, strlen, etc. natively.
+		   Like the native memory system calls, these are not charged
+		   per byte, only bounded in length. */
+		.libc_fastpath = true,
 #ifdef RISCV_BINARY_TRANSLATION
 		.translate_enabled = true,
 		.translation_use_arena = false,
@@ -252,9 +258,9 @@ void Script::machine_setup(machine_t& machine, bool init)
 					copy_page(mem, pageno, page);
 				return page;
 			}
-			/* Pages are allocated from workspace */
-			auto* data =
-				(riscv::PageData*) WS_Alloc(m_ctx->ws, riscv::Page::size());
+			/* Pages are allocated from workspace, while it has room */
+			auto* data = (riscv::PageData*) riscv_ws_alloc_spare(
+				m_ctx->ws, riscv::Page::size(), WS_PAGE_SPARE);
 			if (LIKELY(data != nullptr)) {
 				if (init) {
 					new (data) riscv::PageData();

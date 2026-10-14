@@ -217,3 +217,27 @@ $Function BACKEND vm_backend(STRING func, STRING arg = "")
 		set bereq.backend = riscv.vm_backend();
 		return (hash);
 	}
+
+$Function BOOL deliver_transform(STRING function, STRING arg = "", BYTES max_size = 16777216)
+
+- Replaces the response body in vcl_deliver, before anything is sent.
+- Reads the whole body into the current machine (waiting for a streaming
+  fetch to finish), then calls function(arg, body_address, body_length).
+  The function answers like a VM backend does, with
+  sys_response(status, content_type, data). That becomes the status and
+  body, and the Content-Type when one is given. ETag and
+  Last-Modified are removed, and conditional requests get the full
+  response: a per-client response must not be kept with a 304.
+- Returns false on any failure, in which case nothing has been sent and
+  VCL can still return (synth(503)).
+- The body must not be content-encoded, or ESI/edgestash processed.
+  Use beresp.do_gunzip for content that is to be transformed.
+- max_size limits both the body read into the machine and the response.
+- Not supported in ESI includes.
+
+Example:
+	sub vcl_deliver {
+		if (!riscv.deliver_transform("on_body")) {
+			return (synth(503));
+		}
+	}

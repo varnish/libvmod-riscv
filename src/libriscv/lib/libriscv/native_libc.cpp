@@ -739,15 +739,14 @@ void Machine<W>::previous_ebreak_handler(Machine<W>& m)
 		Machine<W>::m_previous_ebreak_handler(m);
 }
 
+/// @brief The guest's libc functions that the fast-path replaces, with their ids.
+/// @details Resolves every known name in a single pass over the symbol table.
+/// Machine::address_of() would re-scan all symbols once per name, which is
+/// measurable on a large binary (node has ~130k symbols).
 template <int W>
-size_t Machine<W>::install_libc_fastpath(DecodedExecuteSegment<W>& exec, bool verbose)
+static std::vector<std::pair<address_type<W>, uint8_t>> find_libc_symbols(const Memory<W>& memory)
 {
-	this->install_libc_fastpath_handler();
-
-	// Resolve every known name in a single pass over the symbol table.
-	// Machine::address_of() would re-scan all symbols once per name, which is
-	// measurable on a large binary (node has ~130k symbols).
-	std::vector<std::pair<address_t, uint8_t>> found;
+	std::vector<std::pair<address_type<W>, uint8_t>> found;
 	memory.for_each_symbol(
 		[&] (const typename riscv::Elf<W>::Sym& sym, const char* name)
 	{
@@ -757,11 +756,29 @@ size_t Machine<W>::install_libc_fastpath(DecodedExecuteSegment<W>& exec, bool ve
 			return;
 		for (const auto& entry : libc_symbols) {
 			if (std::strcmp(name, entry.name) == 0) {
-				found.push_back({address_t(sym.st_value), entry.id});
+				found.push_back({address_type<W>(sym.st_value), entry.id});
 				return;
 			}
 		}
 	});
+	return found;
+}
+
+template <int W>
+std::vector<address_type<W>> Machine<W>::libc_fastpath_addresses() const
+{
+	std::vector<address_t> addresses;
+	for (const auto& [addr, id] : find_libc_symbols<W>(memory))
+		addresses.push_back(addr);
+	return addresses;
+}
+
+template <int W>
+size_t Machine<W>::install_libc_fastpath(DecodedExecuteSegment<W>& exec, bool verbose)
+{
+	this->install_libc_fastpath_handler();
+
+	const auto found = find_libc_symbols<W>(memory);
 
 	size_t patched = 0;
 	for (const auto& [addr, id] : found)

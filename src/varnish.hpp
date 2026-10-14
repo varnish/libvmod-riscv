@@ -13,6 +13,7 @@ extern "C" {
 # include <vapi/vsl_int.h>
 # include <vsha256.h>
 	void *WS_Alloc(struct ws *ws, unsigned bytes);
+	void *riscv_ws_alloc_spare(struct ws *ws, unsigned bytes, unsigned keep);
 	void *WS_Copy(struct ws *ws, const void *str, int len);
 	char *WS_Printf(struct ws *ws, const char *fmt, ...);
 	void VSL(enum VSL_tag_e tag, uint32_t vxid, const char *fmt, ...);

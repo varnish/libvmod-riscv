@@ -95,9 +95,10 @@ typedef void (*on_recv_f) (int req);
 inline void wait_for_requests(on_recv_f on_recv)
 {
 	register on_recv_f a0    asm("a0") = on_recv;
+	register long a1         asm("a1") = 0; /* No custom exit function */
 	register long syscall_id asm("a7") = ECALL_SET_DECISION;
 
-	asm volatile ("ecall" : : "r"(a0), "m"(*a0), "r"(syscall_id) : "memory");
+	asm volatile ("ecall" : : "r"(a0), "r"(a1), "m"(*a0), "r"(syscall_id) : "memory");
 }
 
 // 1. wrangle with argc and argc

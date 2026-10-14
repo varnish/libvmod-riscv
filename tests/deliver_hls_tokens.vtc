@@ -1,0 +1,190 @@
+varnishtest "RISC-V deliver_transform: per-client HLS manifests from one cached copy"
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static char out[256 * 1024];
+static size_t olen;
+static const char* tok;
+static size_t toklen;
+
+static bool put(const char* s, size_t n) {
+	if (olen + n > sizeof(out))
+		return false;
+	for (size_t i = 0; i < n; i++)
+		out[olen++] = s[i];
+	return true;
+}
+static bool has_query(const char* s, size_t n) {
+	for (size_t i = 0; i < n; i++)
+		if (s[i] == '?') return true;
+	return false;
+}
+/* Append the client's token to the URI s[0..n) */
+static bool put_uri(const char* s, size_t n) {
+	return put(s, n) && put(has_query(s, n) ? "&" : "?", 1)
+		&& put("token=", 6) && put(tok, toklen);
+}
+static long find(const char* s, size_t n, const char* what, size_t wn) {
+	for (size_t i = 0; i + wn <= n; i++) {
+		size_t j = 0;
+		while (j < wn && s[i+j] == what[j]) j++;
+		if (j == wn) return i;
+	}
+	return -1;
+}
+static bool token_ok(const char* t) {
+	size_t n = 0;
+	for (; t[n]; n++) {
+		const char c = t[n];
+		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.'))
+			return false;
+	}
+	return n > 0 && n <= 128;
+}
+
+extern "C" __attribute__((used))
+void on_manifest(const char* arg, const char* data, size_t len)
+{
+	static const char m3u8[] = "application/vnd.apple.mpegurl";
+	static const char text[] = "text/plain";
+	static const char denied[] = "Invalid token";
+	if (!token_ok(arg))
+		sys_response(403, text, sizeof(text)-1, denied, sizeof(denied)-1);
+	tok = arg;
+	toklen = 0;
+	while (tok[toklen]) toklen++;
+	olen = 0;
+
+	bool ok = true;
+	size_t p = 0;
+	while (ok && p < len) {
+		size_t e = p;
+		while (e < len && data[e] != '\n') e++;
+		size_t n = e - p;
+		if (n > 0 && data[p + n - 1] == '\r') n--;
+		const char* line = &data[p];
+
+		if (n == 0) {
+		} else if (line[0] != '#') {
+			ok = put_uri(line, n);
+		} else {
+			const long u = find(line, n, "URI=\"", 5);
+			const long q = (u < 0) ? -1 : find(line + u + 5, n - u - 5, "\"", 1);
+			if (q >= 0) {
+				const size_t start = u + 5;
+				ok = put(line, start) && put_uri(line + start, q)
+					&& put(line + start + q, n - start - q);
+			} else {
+				ok = put(line, n);
+			}
+		}
+		/* Keep the original line ending */
+		if (ok && e > p + n) ok = put(line + n, e - p - n);
+		if (ok && e < len) ok = put("\n", 1);
+		p = e + 1;
+	}
+	if (!ok) return; /* Too large: no response, which fails the request */
+	sys_response(200, m3u8, sizeof(m3u8)-1, out, olen);
+}
+
+static void on_recv(int) {}
+
+void start(int, char**) {
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+server s1 {
+	rxreq
+	expect req.url == "/live/master.m3u8"
+	txresp -hdr "Last-Modified: Tue, 13 Oct 2026 10:00:00 GMT" -body "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nlow/index.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=3000000\r\nhigh/index.m3u8?v=2\r\n"
+
+	rxreq
+	expect req.url == "/live/low/index.m3u8"
+	txresp -body "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:100\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x1\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:6.0,\nseg100.ts\n#EXTINF:6.0,\nseg101.ts?v=1\n"
+} -start
+
+varnish v1 -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork("xpizza.com")) {
+			return (synth(403));
+		}
+		/* The token is per client, the cached manifest is not */
+		if (req.url ~ "\.m3u8(\?|$)") {
+			unset req.http.X-Token;
+			if (req.url ~ "[?&]token=") {
+				set req.http.X-Token = regsub(req.url, "^.*[?&]token=([^&]*).*$", "\1");
+			}
+			set req.url = regsub(req.url, "\?.*$", "");
+		}
+		return (hash);
+	}
+
+	sub vcl_deliver {
+		if (req.url ~ "\.m3u8$") {
+			if (!riscv.deliver_transform("on_manifest", req.http.X-Token)) {
+				return (synth(503));
+			}
+			set resp.http.Cache-Control = "private, no-store";
+		}
+	}
+} -start
+
+client c1 {
+	txreq -url "/live/master.m3u8?token=alice"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.Content-Type == "application/vnd.apple.mpegurl"
+	expect resp.http.Cache-Control == "private, no-store"
+	expect resp.http.Last-Modified == <undef>
+	expect resp.body == "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nlow/index.m3u8?token=alice\n#EXT-X-STREAM-INF:BANDWIDTH=3000000\r\nhigh/index.m3u8?v=2&token=alice\r\n"
+
+	txreq -url "/live/low/index.m3u8?token=alice"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:100\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin?token=alice\",IV=0x1\n#EXT-X-MAP:URI=\"init.mp4?token=alice\"\n#EXTINF:6.0,\nseg100.ts?token=alice\n#EXTINF:6.0,\nseg101.ts?v=1&token=alice\n"
+} -run
+
+# A second viewer gets their own manifest from the same cached copy
+client c2 {
+	txreq -url "/live/low/index.m3u8?token=bob-2"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:100\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin?token=bob-2\",IV=0x1\n#EXT-X-MAP:URI=\"init.mp4?token=bob-2\"\n#EXTINF:6.0,\nseg100.ts?token=bob-2\n#EXTINF:6.0,\nseg101.ts?v=1&token=bob-2\n"
+
+	txreq -url "/live/master.m3u8?token=bob-2" -hdr "If-Modified-Since: Tue, 13 Oct 2026 10:00:00 GMT"
+	rxresp
+	expect resp.status == 200
+	expect resp.body ~ "low/index.m3u8\\?token=bob-2\n"
+
+	# The guest decides the status after looking at the request
+	txreq -url "/live/master.m3u8?token=x%3Cy"
+	rxresp
+	expect resp.status == 403
+	expect resp.body == "Invalid token"
+
+	txreq -url "/live/master.m3u8"
+	rxresp
+	expect resp.status == 403
+} -run
+
+varnish v1 -expect cache_hit == 4
+varnish v1 -expect backend_req == 2

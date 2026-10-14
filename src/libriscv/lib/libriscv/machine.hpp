@@ -405,6 +405,9 @@ namespace riscv
 		/// original machine code, so debuggers, backtraces and the single-stepping
 		/// simulator still see (and execute) the real function.
 		size_t install_libc_fastpath(DecodedExecuteSegment<W>& exec, bool verbose = false);
+		/// @brief The entry addresses of the functions install_libc_fastpath()
+		/// patches. A JIT must leave them to the dispatcher, which sees the patch.
+		std::vector<address_t> libc_fastpath_addresses() const;
 		/// @brief Install the EBREAK handler that hot-patched libc functions use,
 		/// chaining onto any EBREAK handler that is already installed.
 		static void install_libc_fastpath_handler();

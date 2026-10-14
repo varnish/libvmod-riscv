@@ -14,6 +14,7 @@ add_vmod(vmod_riscv vmod_riscv.vcc "Low-Latency Configuration VMOD"
 	varnish_interface.c
 	vmod_cpp_interface.cpp
 	vmod_riscv_backend.c
+	vmod_riscv_deliver.c
 	vmod_riscv.c
 	vmod_riscv_post.c
 	vmod_riscv_update.c

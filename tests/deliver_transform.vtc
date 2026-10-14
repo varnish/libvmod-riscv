@@ -1,0 +1,202 @@
+varnishtest "RISC-V deliver_transform replaces the body before headers are sent"
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static const char upper_mime[] = "text/x-upper";
+
+extern "C" __attribute__((used))
+void on_body(const char* arg, char* data, size_t len)
+{
+	if (strcmp(arg, "return") == 0)
+		return;
+	if (strcmp(arg, "loop") == 0)
+		for (;;) asm volatile("");
+	if (strcmp(arg, "badstatus") == 0)
+		sys_response(42, upper_mime, sizeof(upper_mime)-1, data, len);
+	if (strcmp(arg, "toolarge") == 0)
+		sys_response(200, upper_mime, sizeof(upper_mime)-1, data, 1L << 40);
+	if (strcmp(arg, "status") == 0) {
+		static const char mime[] = "text/html";
+		static const char text[] = "<p>replaced</p>";
+		sys_response(201, mime, sizeof(mime)-1, text, sizeof(text)-1);
+	}
+	/* The body is writable guest memory: change it in place */
+	for (size_t i = 0; i < len; i++)
+		if (data[i] >= 'a' && data[i] <= 'z')
+			data[i] -= 32;
+	sys_response(200, upper_mime, sizeof(upper_mime)-1, data, len);
+}
+
+static void on_recv(int) {}
+
+void start(int argc, char** argv) {
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+server s1 {
+	rxreq
+	expect req.url == "/upper"
+	txresp -hdr {ETag: "abc"} -hdr "Content-Type: text/plain" -body "hello world"
+
+	rxreq
+	expect req.url == "/stream"
+	txresp -nolen -hdr "Transfer-Encoding: chunked"
+	chunked "hello "
+	delay 0.5
+	chunked "world"
+	chunkedlen 0
+
+	rxreq
+	expect req.url == "/gzip"
+	txresp -gzipbody "gzip body"
+
+	rxreq
+	expect req.url == "/gunzip"
+	txresp -gzipbody "gzip body"
+
+	rxreq
+	expect req.url == "/pass"
+	txresp -body "pass body"
+
+	rxreq
+	expect req.url == "/big"
+	txresp -bodylen 300000
+
+	rxreq
+	expect req.url == "/empty"
+	txresp -body ""
+} -start
+
+varnish v1 -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork("xpizza.com")) {
+			return (synth(403));
+		}
+		if (req.url == "/pass") {
+			return (pass);
+		}
+		return (hash);
+	}
+
+	sub vcl_backend_response {
+		if (bereq.url == "/gunzip") {
+			set beresp.do_gunzip = true;
+		}
+	}
+
+	sub vcl_deliver {
+		if (req.http.X-Raw) {
+			return (deliver);
+		}
+		if (!riscv.deliver_transform("on_body", req.http.X-Mode)) {
+			return (synth(503));
+		}
+	}
+} -start
+
+client c1 {
+	txreq -url "/upper"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "HELLO WORLD"
+	expect resp.http.Content-Type == "text/x-upper"
+	expect resp.http.Content-Length == 11
+	expect resp.http.ETag == <undef>
+
+	# The cached object is untouched
+	txreq -url "/upper" -hdr "X-Raw: 1"
+	rxresp
+	expect resp.body == "hello world"
+	expect resp.http.ETag == {"abc"}
+
+	txreq -url "/upper" -hdr "Range: bytes=0-4"
+	rxresp
+	expect resp.status == 206
+	expect resp.body == "HELLO"
+	expect resp.http.Content-Range == "bytes 0-4/11"
+
+	txreq -req HEAD -url "/upper"
+	rxresp -no_obj
+	expect resp.status == 200
+	expect resp.http.Content-Length == 11
+
+	txreq -url "/upper" -hdr "X-Mode: status"
+	rxresp
+	expect resp.status == 201
+	expect resp.http.Content-Type == "text/html"
+	expect resp.body == "<p>replaced</p>"
+
+	# Failures are still free to choose the status
+	txreq -url "/upper" -hdr "X-Mode: return"
+	rxresp
+	expect resp.status == 503
+
+	txreq -url "/upper" -hdr "X-Mode: loop"
+	rxresp
+	expect resp.status == 503
+
+	txreq -url "/upper" -hdr "X-Mode: badstatus"
+	rxresp
+	expect resp.status == 503
+
+	txreq -url "/upper" -hdr "X-Mode: toolarge"
+	rxresp
+	expect resp.status == 503
+
+	# A streaming fetch is waited for, and gets a Content-Length
+	txreq -url "/stream"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "HELLO WORLD"
+	expect resp.http.Content-Length == 11
+	expect resp.http.Transfer-Encoding == <undef>
+
+	# Encoded bodies are refused, even to a client without gzip
+	txreq -url "/gzip"
+	rxresp
+	expect resp.status == 503
+
+	txreq -url "/gunzip"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "GZIP BODY"
+	expect resp.http.Content-Encoding == <undef>
+
+	txreq -url "/pass"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "PASS BODY"
+
+	txreq -url "/big"
+	rxresp
+	expect resp.status == 200
+	expect resp.bodylen == 300000
+
+	txreq -url "/empty"
+	rxresp
+	expect resp.status == 200
+	expect resp.bodylen == 0
+	expect resp.http.Content-Type == "text/x-upper"
+} -run
+
+# The connection survived every failure
+varnish v1 -expect client_req == 15
+varnish v1 -expect sess_conn == 1

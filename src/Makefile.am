@@ -55,6 +55,7 @@ libvmod_riscv_la_SOURCES = \
 	vmod_cpp_interface.cpp \
 	varnish_interface.c \
 	vmod_riscv_backend.c \
+	vmod_riscv_deliver.c \
 	vmod_riscv.c \
 	vmod_riscv_post.c \
 	vmod_riscv_update.c \
