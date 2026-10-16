@@ -206,17 +206,99 @@ int riscv_deliver_call(VRT_CTX, const char* func, const char* arg,
 }
 
 extern "C"
-int riscv_deliver_copy_out(VRT_CTX, void *dst, uint64_t src, size_t len)
+int riscv_deliver_map_body(struct vmod_riscv_post *post,
+	const void *data_ptr, ssize_t data_len)
 {
 	using namespace rvs;
-	auto* script = get_machine(ctx, ctx->req);
-	if (script == nullptr)
+	auto* script = get_machine(post->ctx, post->ctx->req);
+	if (script == nullptr) {
+		VSLb(post->ctx->vsl, SLT_Error, "deliver_transform: no active tenant");
 		return -1;
+	}
+	auto* old_ctx = script->ctx();
 	try {
-		script->machine().memory.memcpy_out(dst, src, len);
+		script->set_ctx(post->ctx);
+		if (post->length == 0)
+		{
+			assert(post->address == 0);
+			post->address = script->allocate_post_data(post->capacity);
+		}
+		if (UNLIKELY(data_len < 0 || size_t(data_len) > post->capacity - post->length))
+			throw std::runtime_error("Body is larger than " + std::to_string(post->capacity) + " bytes");
+
+		auto& machine = script->machine();
+		constexpr size_t PSIZE = riscv::Page::size();
+		auto* src = (const uint8_t *)data_ptr;
+		size_t len = data_len;
+		Script::gaddr_t dst = post->address + post->length;
+
+		const size_t head = std::min(len, (PSIZE - (dst & (PSIZE - 1))) & (PSIZE - 1));
+		if (head > 0) {
+			machine.copy_to_guest(dst, src, head);
+			dst += head; src += head; len -= head;
+		}
+		const size_t whole = len & ~(PSIZE - 1);
+		if (whole > 0) {
+			machine.memory.free_pages(dst, whole);
+			machine.memory.insert_non_owned_memory(dst, (void *)src, whole,
+				riscv::PageAttributes{
+					.read = true,
+					.write = false,
+					.exec = false,
+					.is_cow = true });
+			dst += whole; src += whole; len -= whole;
+		}
+		if (len > 0)
+			machine.copy_to_guest(dst, src, len);
+
+		post->length += data_len;
+		script->set_ctx(old_ctx);
 		return 0;
 	} catch (const std::exception& e) {
-		VSLb(ctx->vsl, SLT_Error, "deliver_transform: bad response body: %s", e.what());
+		VSLb(post->ctx->vsl, SLT_Error, "deliver_transform: could not map the body: %s", e.what());
+	}
+	script->set_ctx(old_ctx);
+	return -1;
+}
+
+extern "C"
+void* riscv_deliver_machine(VRT_CTX)
+{
+	return rvs::get_machine(ctx, ctx->req);
+}
+
+extern "C"
+int riscv_deliver_iterate(void *vscript, uint64_t addr, size_t len, void *priv,
+	int (*func)(void *, int, int, const void *, ssize_t))
+{
+	auto* script = (rvs::Script*) vscript;
+	const auto& memory = script->machine().memory;
+	constexpr size_t MAX_BUFFERS = 64;
+	riscv::vBuffer buffers[MAX_BUFFERS];
+	try {
+		while (len > 0)
+		{
+			const size_t chunk = std::min(len, (MAX_BUFFERS - 1) * riscv::Page::size());
+			const size_t cnt = memory.gather_buffers_from_range(MAX_BUFFERS, buffers, addr, chunk);
+			addr += chunk;
+			len -= chunk;
+			for (size_t i = 0; i < cnt; i++) {
+				const int last = (len == 0 && i == cnt - 1);
+				const int ret = func(priv, 1, last, buffers[i].ptr, buffers[i].len);
+				if (ret != 0)
+					return ret;
+			}
+		}
+		return 0;
+	} catch (const std::exception& e) {
+		fprintf(stderr, "deliver_transform: could not read the response: %s\n", e.what());
 	}
 	return -1;
+}
+
+extern "C"
+void riscv_deliver_unmap(void *vscript, uint64_t addr, size_t len)
+{
+	auto* script = (rvs::Script*) vscript;
+	script->machine().memory.free_pages(addr, len);
 }

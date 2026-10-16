@@ -9,20 +9,28 @@
  *
  * A delivery processor (VDP) cannot fail a response: by the time it sees
  * the body, the status and headers have been sent. vcl_deliver runs before
- * anything is sent, so here we read the whole object into the tenant's VM,
+ * anything is sent, so here we map the whole object into the tenant's VM,
  * let the guest produce a new response, and swap the request's object for a
- * private transient one holding it, the way cnt_synth() builds its body.
+ * private transient one that delivers it, the way cnt_synth() builds its body.
  * Delivery then sees a plain, complete object: Content-Length, Range and
  * HEAD all work, and no gunzip or ESI processor gets pushed.
  * On any failure nothing has been sent, and VCL can still return (synth).
  */
 
 extern int riscv_backend_streaming_post(struct vmod_riscv_post *, const void*, ssize_t);
+extern int riscv_deliver_map_body(struct vmod_riscv_post *, const void*, ssize_t);
 extern int riscv_deliver_call(VRT_CTX, const char *func, const char *arg,
 	const struct vmod_riscv_post *, struct deliver_result *);
-extern int riscv_deliver_copy_out(VRT_CTX, void *dst, uint64_t src, size_t len);
+extern void *riscv_deliver_machine(VRT_CTX);
+extern int riscv_deliver_iterate(void *script, uint64_t addr, size_t len,
+	void *priv, objiterate_f *func);
+extern void riscv_deliver_unmap(void *script, uint64_t addr, size_t len);
 
 #ifdef VARNISH_PLUS
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+
 /* Not in the installed headers (cache_objhead.h, storage.h) */
 struct objcore *HSH_Private(const struct worker *wrk);
 void HSH_Abandon(struct objcore *oc);
@@ -35,8 +43,170 @@ enum stv_alloc_result {
 	STV_AR_FAIL,
 };
 
+struct deliver_obj_methods {
+	void		*objgetlastlru;
+	void		*objtryrefattr;
+	void		*objrefattr;
+	void		*objderefattr;
+	void		(*objfree)(struct worker *, struct objcore *);
+	int		(*objiterator)(struct worker *, struct objcore *, void *,
+			    objiterate_f *, int, size_t, ssize_t);
+	void		*objgetspace;
+	void		*objextend;
+	void		*objtrimstore;
+	void		*objfinish;
+	void		*objbocdone;
+	void		*objslim;
+	void		*objgetattr;
+	void		*objsetattr;
+	void		*objhasattr;
+	void		*objsetauxattr;
+	void		*objgetauxattr;
+	void		*objrelauxattr;
+	void		*objtouch;
+	void		*objsetstate;
+	void		*objsetlen;
+	uint64_t	(*objgetlen)(struct worker *, struct objcore *);
+	void		*objcheckvary;
+	void		*objgetvary;
+	void		*objsetvary;
+	void		*objsetslicerdata;
+	void		*objgetslicerdata;
+	void		*objevent;
+};
+
+struct deliver_stevedore {
+	unsigned	magic;
+#define DELIVER_STEVEDORE_MAGIC		0x4baf43db
+	const char	*name;
+	void		*callbacks[24];
+	const struct deliver_obj_methods *methods;
+	void		*lru;
+#define VRTSTVVAR(nm, vtype, ctype, dval) void *var_##nm;
+#include "tbl/vrt_stv_var.h"
+	void		*priv;
+	void		*list[2];
+	const char	*ident;
+	const char	*vclname;
+	void		*vgs;
+};
+
+struct deliver_view {
+	struct deliver_stevedore	stv;
+	unsigned			magic;
+#define DELIVER_VIEW_MAGIC		0x5d1e7a11
+	const struct deliver_stevedore	*real;
+	void				*script;
+	uint64_t			data;
+	size_t				length;
+	struct objcore			*orig;
+	oaref_t				orig_oaref;
+	uint64_t			mapped;
+	size_t				mapped_len;
+};
+
+static const struct deliver_obj_methods *deliver_real_methods;
+static struct deliver_obj_methods deliver_methods;
+static pthread_once_t deliver_once = PTHREAD_ONCE_INIT;
+
+static struct deliver_view *
+deliver_view_of(const struct objcore *oc)
+{
+	struct deliver_view *dv;
+
+	CHECK_OBJ_NOTNULL(oc, OBJCORE_MAGIC);
+	if (oc->stobj->stevedore == NULL)
+		return (NULL);
+	dv = (struct deliver_view *)(uintptr_t)oc->stobj->stevedore;
+	if (dv->stv.methods != &deliver_methods)
+		return (NULL);
+	CHECK_OBJ(dv, DELIVER_VIEW_MAGIC);
+	return (dv);
+}
+
 static int
-deliver_body_to_vm(void *priv, int flush, int last, const void *ptr, ssize_t len)
+deliver_iterator(struct worker *wrk, struct objcore *oc, void *priv,
+    objiterate_f *func, int final, size_t start, ssize_t end)
+{
+	struct deliver_view *dv = deliver_view_of(oc);
+	size_t stop;
+
+	(void)wrk;
+	(void)final;
+	AN(dv);
+	stop = dv->length;
+	if (end >= 0 && (size_t)end < stop)
+		stop = end;
+	if (start >= stop)
+		return (func(priv, 0, 1, NULL, 0));
+	return (riscv_deliver_iterate(dv->script, dv->data + start,
+	    stop - start, priv, func));
+}
+
+static uint64_t
+deliver_getlen(struct worker *wrk, struct objcore *oc)
+{
+	struct deliver_view *dv = deliver_view_of(oc);
+
+	(void)wrk;
+	AN(dv);
+	return (dv->length);
+}
+
+static void
+deliver_release(struct worker *wrk, struct deliver_view *dv)
+{
+	if (dv->mapped_len > 0)
+		riscv_deliver_unmap(dv->script, dv->mapped, dv->mapped_len);
+	if (dv->orig != NULL) {
+		if (dv->orig_oaref)
+			ObjDerefAttr(dv->orig, &dv->orig_oaref);
+		(void)HSH_DerefObjCore(wrk, &dv->orig);
+	}
+	dv->magic = 0;
+	free(dv);
+}
+
+static void
+deliver_objfree(struct worker *wrk, struct objcore *oc)
+{
+	struct deliver_view *dv = deliver_view_of(oc);
+
+	AN(dv);
+	oc->stobj->stevedore = (const struct stevedore *)(uintptr_t)dv->real;
+	deliver_real_methods->objfree(wrk, oc);
+	deliver_release(wrk, dv);
+}
+
+static void
+deliver_init(void)
+{
+	const struct deliver_stevedore *stv = (const void *)stv_transient;
+
+	if (stv == NULL || stv->magic != DELIVER_STEVEDORE_MAGIC ||
+	    stv->ident == NULL || strcmp(stv->ident, "Transient") ||
+	    stv->methods == NULL || stv->methods->objfree == NULL ||
+	    stv->methods->objiterator == NULL)
+		return;
+	deliver_methods = *stv->methods;
+	deliver_methods.objfree = deliver_objfree;
+	deliver_methods.objiterator = deliver_iterator;
+	deliver_methods.objgetlen = deliver_getlen;
+	deliver_real_methods = stv->methods;
+}
+
+static int
+deliver_map_to_vm(void *priv, int flush, int last, const void *ptr, ssize_t len)
+{
+	(void)flush;
+	(void)last;
+	if (len != 0)
+		return (riscv_deliver_map_body(priv, ptr, len));
+	return (0);
+}
+
+static int
+deliver_copy_to_vm(void *priv, int flush, int last, const void *ptr, ssize_t len)
 {
 	(void)flush;
 	(void)last;
@@ -45,25 +215,20 @@ deliver_body_to_vm(void *priv, int flush, int last, const void *ptr, ssize_t len
 	return (0);
 }
 
-/* Build a private transient object from the guest's response body.
+/* Build a private transient object for the guest's response body.
    Returns NULL with nothing left behind on failure. */
 static struct objcore *
-deliver_new_object(VRT_CTX, const struct deliver_result *result, oaref_t *oaref)
+deliver_new_object(VRT_CTX, oaref_t *oaref)
 {
 	struct req *req = ctx->req;
 	struct worker *wrk = req->wrk;
 	struct stv_hints hints[1];
 	STV_STAT_STACKALLOC(stvstat, 64);
-	uint64_t src = result->data;
-	ssize_t sz = result->length;
-	ssize_t l2;
-	uint8_t *dest;
 	int ok = 1;
 
 	struct objcore *oc = HSH_Private(wrk);
 	CHECK_OBJ_NOTNULL(oc, OBJCORE_MAGIC);
 	memset(hints, 0, sizeof *hints);
-	hints->size_body = sz;
 	hints->vrt_privs = req->privs;
 	hints->vrt_privs_id = (uintptr_t)req;
 	hints->vcl = req->vcl;
@@ -75,26 +240,9 @@ deliver_new_object(VRT_CTX, const struct deliver_result *result, oaref_t *oaref)
 		AN(*oaref);
 	} else
 		ok = 0;
-
-	while (ok && sz > 0) {
-		l2 = sz;
-		if (!ObjGetSpace(wrk, oc, &l2, &dest, stvstat)) {
-			ok = 0;
-			break;
-		}
-		AN(dest);
-		if (l2 > sz)
-			l2 = sz;
-		if (riscv_deliver_copy_out(ctx, dest, src, l2) < 0) {
-			ok = 0;
-			break;
-		}
-		ObjExtend(wrk, oc, l2, stvstat);
-		src += l2;
-		sz -= l2;
-	}
-	if (ok)
-		ObjSetLen(wrk, oc, *oaref, result->length);
+	if (ok && ((const struct deliver_stevedore *)
+	    (const void *)oc->stobj->stevedore)->methods != deliver_real_methods)
+		ok = 0;
 
 	HSH_DerefBoc(wrk, oc);
 	if (stvstat != NULL)
@@ -135,6 +283,12 @@ vmod_deliver_transform(VRT_CTX, VCL_STRING func, VCL_STRING arg, VCL_BYTES max_s
 		VSLb(ctx->vsl, SLT_Error, "deliver_transform: not supported in ESI includes");
 		return (0);
 	}
+	AZ(pthread_once(&deliver_once, deliver_init));
+	if (deliver_real_methods == NULL) {
+		VSLb(ctx->vsl, SLT_Error,
+			"deliver_transform: unsupported Transient storage");
+		return (0);
+	}
 	/* The guest gets the stored bytes, so they must be the body itself */
 	if (http_GetHdr(req->resp, H_Content_Encoding, NULL) ||
 	    ObjCheckFlag(wrk, req->objcore, req->oc_oaref, OF_GZIPED) ||
@@ -146,6 +300,12 @@ vmod_deliver_transform(VRT_CTX, VCL_STRING func, VCL_STRING arg, VCL_BYTES max_s
 			"deliver_transform: encoded or processed bodies are not supported");
 		return (0);
 	}
+	void *script = riscv_deliver_machine(ctx);
+	if (script == NULL) {
+		VSLb(ctx->vsl, SLT_Error, "deliver_transform: no active tenant");
+		return (0);
+	}
+	struct deliver_view *prev = deliver_view_of(req->objcore);
 
 	/* Read the whole body into the VM. This waits for a streaming
 	   fetch to finish, and fails if the fetch fails. */
@@ -155,34 +315,63 @@ vmod_deliver_transform(VRT_CTX, VCL_STRING func, VCL_STRING arg, VCL_BYTES max_s
 		.capacity = max_size,
 		.ctx = ctx,
 	};
-	if (ObjIterate(wrk, req->objcore, &post, deliver_body_to_vm, 0, 0, -1) < 0) {
-		VSLb(ctx->vsl, SLT_Error, "deliver_transform: could not read the body");
-		return (0);
-	}
-
 	struct deliver_result result;
 	memset(&result, 0, sizeof result);
+	oaref_t oaref;
+	struct objcore *oc = NULL;
+	struct deliver_view *dv = NULL;
+
+	if (ObjIterate(wrk, req->objcore, &post,
+	    prev ? deliver_copy_to_vm : deliver_map_to_vm, 0, 0, -1) < 0) {
+		VSLb(ctx->vsl, SLT_Error, "deliver_transform: could not read the body");
+		goto fail;
+	}
 	if (riscv_deliver_call(ctx, func, arg ? arg : "", &post, &result) < 0)
-		return (0);
+		goto fail;
 	if (result.length > (size_t)max_size) {
 		VSLb(ctx->vsl, SLT_Error,
 			"deliver_transform: response of %zu bytes is over the %jd byte limit",
 			result.length, (intmax_t)max_size);
-		return (0);
+		goto fail;
 	}
-
-	oaref_t oaref;
-	struct objcore *oc = deliver_new_object(ctx, &result, &oaref);
+	dv = calloc(1, sizeof *dv);
+	if (dv == NULL) {
+		VSLb(ctx->vsl, SLT_Error, "deliver_transform: out of memory");
+		goto fail;
+	}
+	oc = deliver_new_object(ctx, &oaref);
 	if (oc == NULL)
-		return (0);
+		goto fail;
 
-	/* Let go of the original, the way cnt_deliver() does when VCL
-	   does not deliver it */
-	ObjDerefAttr(req->objcore, &req->oc_oaref);
+	dv->magic = DELIVER_VIEW_MAGIC;
+	dv->real = (const void *)oc->stobj->stevedore;
+	dv->stv = *dv->real;
+	dv->stv.methods = &deliver_methods;
+	dv->script = script;
+	dv->data = result.data;
+	dv->length = result.length;
+	if (prev != NULL) {
+		dv->orig = prev->orig;
+		dv->orig_oaref = prev->orig_oaref;
+		dv->mapped = prev->mapped;
+		dv->mapped_len = prev->mapped_len;
+		prev->orig = NULL;
+		prev->orig_oaref = 0;
+		prev->mapped_len = 0;
+		ObjDerefAttr(req->objcore, &req->oc_oaref);
+		(void)HSH_DerefObjCore(wrk, &req->objcore);
+	} else {
+		dv->orig = req->objcore;
+		dv->orig_oaref = req->oc_oaref;
+		dv->mapped = post.address;
+		dv->mapped_len = post.length;
+		if (dv->orig->flags & OC_F_TRANSIENT)
+			HSH_Abandon(dv->orig);
+		req->objcore = NULL;
+		req->oc_oaref = 0;
+	}
+	oc->stobj->stevedore = (const void *)&dv->stv;
 	AZ(req->oc_oaref);
-	if (req->objcore->flags & OC_F_TRANSIENT)
-		HSH_Abandon(req->objcore);
-	(void)HSH_DerefObjCore(wrk, &req->objcore);
 	AZ(req->objcore);
 	req->objcore = oc;
 	req->oc_oaref = oaref;
@@ -204,6 +393,12 @@ vmod_deliver_transform(VRT_CTX, VCL_STRING func, VCL_STRING arg, VCL_BYTES max_s
 			(int)result.tsize, result.type);
 	}
 	return (1);
+
+fail:
+	free(dv);
+	if (prev == NULL && post.length > 0)
+		riscv_deliver_unmap(script, post.address, post.length);
+	return (0);
 }
 #else
 VCL_BOOL

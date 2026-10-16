@@ -1,0 +1,195 @@
+varnishtest "RISC-V deliver_transform maps the body copy-on-write and delivers from guest memory"
+
+feature cmd "varnishd -V 2>&1 | grep -q varnish-plus"
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+static const char mime[] = "text/plain";
+
+extern "C" __attribute__((used))
+void on_body(const char* arg, char* data, size_t len)
+{
+	if (strcmp(arg, "same") == 0)
+		sys_response(200, mime, sizeof(mime)-1, data, len);
+	if (strcmp(arg, "patch") == 0) {
+		data[5000] = 'X';
+		sys_response(200, mime, sizeof(mime)-1, data, len);
+	}
+	if (strcmp(arg, "slice") == 0)
+		sys_response(200, mime, sizeof(mime)-1, data + 4090, 20);
+	for (size_t i = 0; i < len; i++)
+		if (data[i] >= 'a' && data[i] <= 'z')
+			data[i] -= 32;
+	sys_response(200, mime, sizeof(mime)-1, data, len);
+}
+
+extern "C" __attribute__((used))
+void on_synth(const char* arg, char* data, size_t len)
+{
+	sys_response(200, mime, sizeof(mime)-1, data, len);
+}
+
+static void on_recv(int) {}
+
+void start(int argc, char** argv) {
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+for i in $(seq 3000); do printf abcdefghij; done > ${tmpdir}/body
+}
+
+server s1 {
+	rxreq
+	expect req.url == "/body"
+	txresp -bodyfrom ${tmpdir}/body
+
+	rxreq
+	expect req.url == "/pass"
+	txresp -bodyfrom ${tmpdir}/body
+
+	rxreq
+	expect req.url == "/pass"
+	txresp -bodyfrom ${tmpdir}/body
+
+	rxreq
+	expect req.url == "/chunked"
+	txresp -nolen -hdr "Transfer-Encoding: chunked"
+	loop 3000 {
+		chunked "abcdefghij"
+	}
+	chunkedlen 0
+} -start
+
+varnish v1 -arg "-p fetch_chunksize=5000" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork("xpizza.com")) {
+			return (synth(403));
+		}
+		if (req.url == "/pass") {
+			return (pass);
+		}
+		return (hash);
+	}
+
+	sub vcl_deliver {
+		if (req.http.X-Raw) {
+			return (deliver);
+		}
+		if (!riscv.deliver_transform("on_body", req.http.X-Mode)) {
+			return (synth(503));
+		}
+		if (req.http.X-Then) {
+			if (!riscv.deliver_transform("on_body", req.http.X-Then)) {
+				return (synth(503));
+			}
+		}
+		if (req.http.X-Synth) {
+			return (synth(299));
+		}
+	}
+} -start
+
+client c1 {
+	txreq -url "/body"
+	rxresp
+	expect resp.status == 200
+	expect resp.bodylen == 30000
+	expect resp.body ~ "^(?:ABCDEFGHIJ)++$"
+
+	# Copy-on-write: the cached object is untouched
+	txreq -url "/body" -hdr "X-Raw: 1"
+	rxresp
+	expect resp.body ~ "^(?:abcdefghij)++$"
+
+	txreq -url "/body" -hdr "X-Mode: same"
+	rxresp
+	expect resp.bodylen == 30000
+	expect resp.body ~ "^(?:abcdefghij)++$"
+
+	txreq -url "/body" -hdr "X-Mode: patch"
+	rxresp
+	expect resp.bodylen == 30000
+	expect resp.body ~ "^[a-j]{5000}X"
+	expect resp.body ~ "^(?:abcdefghij)++Xbcdefghij(?:abcdefghij)++$"
+
+	txreq -url "/body" -hdr "X-Raw: 1"
+	rxresp
+	expect resp.body ~ "^(?:abcdefghij)++$"
+
+	txreq -url "/body" -hdr "X-Mode: same" -hdr "Range: bytes=4095-4104"
+	rxresp
+	expect resp.status == 206
+	expect resp.body == "fghijabcde"
+
+	txreq -url "/body" -hdr "X-Mode: slice"
+	rxresp
+	expect resp.body == "abcdefghijabcdefghij"
+
+	txreq -url "/body" -hdr "X-Then: patch"
+	rxresp
+	expect resp.bodylen == 30000
+	expect resp.body ~ "^[A-J]{5000}X"
+	expect resp.body ~ "^(?:ABCDEFGHIJ)++XBCDEFGHIJ(?:ABCDEFGHIJ)++$"
+
+	txreq -url "/body" -hdr "X-Mode: same" -hdr "X-Then: same"
+	rxresp
+	expect resp.body ~ "^(?:abcdefghij)++$"
+
+	txreq -url "/body" -hdr "X-Synth: 1"
+	rxresp
+	expect resp.status == 299
+
+	txreq -url "/pass" -hdr "X-Mode: same"
+	rxresp
+	expect resp.bodylen == 30000
+	expect resp.body ~ "^(?:abcdefghij)++$"
+
+	txreq -url "/pass" -hdr "X-Mode: patch"
+	rxresp
+	expect resp.bodylen == 30000
+	expect resp.body ~ "^[a-j]{5000}X"
+	expect resp.body ~ "^(?:abcdefghij)++Xbcdefghij(?:abcdefghij)++$"
+
+	txreq -url "/body" -hdr "X-Raw: 1"
+	rxresp
+	expect resp.body ~ "^(?:abcdefghij)++$"
+
+	txreq -url "/chunked"
+	rxresp
+	expect resp.bodylen == 30000
+	expect resp.body ~ "^(?:ABCDEFGHIJ)++$"
+
+	txreq -url "/chunked" -hdr "X-Mode: same"
+	rxresp
+	expect resp.bodylen == 30000
+	expect resp.body ~ "^(?:abcdefghij)++$"
+
+	txreq -url "/chunked" -hdr "X-Mode: patch"
+	rxresp
+	expect resp.bodylen == 30000
+	expect resp.body ~ "^[a-j]{5000}X"
+	expect resp.body ~ "^(?:abcdefghij)++Xbcdefghij(?:abcdefghij)++$"
+
+	txreq -url "/chunked" -hdr "X-Raw: 1"
+	rxresp
+	expect resp.body ~ "^(?:abcdefghij)++$"
+} -run
+
+varnish v1 -expect client_req == 17
+varnish v1 -expect sess_conn == 1

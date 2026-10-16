@@ -506,6 +506,34 @@ APICALL(purge)
 	machine.set_result(-1);
 }
 
+#ifdef VARNISH_PLUS
+static char* synth_zero_copy(machine_t& machine, gaddr_t addr, gaddr_t len)
+{
+	constexpr gaddr_t PMASK = riscv::Page::size() - 1;
+	if (len == 0)
+		return nullptr;
+	const gaddr_t end = addr + len;
+	if (UNLIKELY(end < addr))
+		return nullptr;
+	const gaddr_t first = addr / riscv::Page::size();
+	const gaddr_t last = end / riscv::Page::size();
+	char* body = nullptr;
+	for (gaddr_t pageno = first; pageno <= last; pageno++) {
+		const auto& page = machine.memory.get_pageno(pageno);
+		if (!page.attr.write)
+			return nullptr;
+		char* host = (char *)page.data();
+		if (pageno == first)
+			body = host + (addr & PMASK);
+		else if (host != body + (pageno * riscv::Page::size() - addr))
+			return nullptr;
+	}
+	if (body[len] != 0)
+		return nullptr;
+	return body;
+}
+#endif
+
 APICALL(synth)
 {
 #ifdef ENABLE_TIMING
@@ -517,7 +545,9 @@ APICALL(synth)
 	{
 		// Synth responses are always using HDR_RESP
 		auto* hp = get_http(ctx, GUEST_HDR_RESP);
-		const auto [status, type, data] = machine.sysargs<uint16_t, riscv::Buffer, riscv::Buffer> ();
+		const auto [status, type, data_addr, data_len] = machine.sysargs<uint16_t, riscv::Buffer, gaddr_t, gaddr_t> ();
+		if (UNLIKELY(data_len > 16ul << 20))
+			throw std::runtime_error("Synth content too large");
 		/* http_SetStatus() asserts on the last three digits */
 		if (UNLIKELY(status % 1000 < 100))
 			throw std::runtime_error("Invalid synth status code: " + std::to_string(status));
@@ -531,7 +561,7 @@ APICALL(synth)
 		const char *reason = http_Status2Reason(status, NULL);
 		http_SetStatus(hp, status, reason ? reason : "Unknown reason");
 #endif
-		http_PrintfHeader(hp, "Content-Length: %u", data.size());
+		http_PrintfHeader(hp, "Content-Length: %u", (unsigned)data_len);
 		if (type.is_sequential())
 			http_PrintfHeader(hp, "Content-Type: %.*s", (int)type.size(), type.data());
 		else
@@ -539,13 +569,14 @@ APICALL(synth)
 
 #ifndef VARNISH_PLUS
 #if __has_include("cache/cache_int.h")
-		auto* body = (char *)WS_Alloc(ctx->ws, data.size() + 1);
+		auto* body = (char *)WS_Alloc(ctx->ws, data_len + 1);
 		if (UNLIKELY(body == nullptr))
 			throw std::runtime_error("Out of workspace for synth content");
-		data.copy_to(body, data.size());
-		VCL_BLOB blob = VRT_blob(ctx, "riscv.synth", body, data.size(), 0);
+		machine.memory.memcpy_out(body, data_addr, data_len);
+		VCL_BLOB blob = VRT_blob(ctx, "riscv.synth", body, data_len, 0);
 #else
-		const std::string buf = data.to_string();
+		std::string buf(data_len, '\0');
+		machine.memory.memcpy_out(buf.data(), data_addr, data_len);
 		VCL_BLOB blob = VRT_blob(ctx, "riscv.synth", buf.data(), buf.size(), 0);
 #endif
 		if (UNLIKELY(blob == nullptr))
@@ -558,29 +589,30 @@ APICALL(synth)
 		auto* vsb = (struct vsb *)ctx->specific;
 		assert(vsb != nullptr);
 
-		// The body is always copied out of the guest. Varnish writes a
-		// NUL after it, which would land past the end of a guest page,
-		// or in a page every fork shares with the master (rodata, or
-		// the zero page). We allocate one more byte for that zero.
-		{
-			// By using realloc we do not need to delete old data,
-			// although only if s_flags is *not* VSB_FIXEDLEN.
-			char* new_buffer = nullptr;
-			if (vsb->s_flags & VSB_DYNAMIC) {
-				new_buffer = (char *)realloc(vsb->s_buf, data.size()+1);
-			} else if (vsb->s_flags & VSB_FIXEDLEN) {
-				new_buffer = (char *)malloc(data.size()+1);
-			} else {
-				throw std::runtime_error("Unable to determine type of synth content buffer");
-			}
+		// Varnish writes a NUL after the body in VSB_finish(), so the
+		// body is only used in place when that byte is already a zero
+		// in a page this fork owns. Otherwise it would land past the end
+		// of a guest page, or in a page every fork shares with the master
+		// (rodata, or the zero page). The copy has room for that zero.
+		const int dynstruct = vsb->s_flags & VSB_DYNSTRUCT;
+		if (char* body = synth_zero_copy(machine, data_addr, data_len)) {
+			if (vsb->s_flags & VSB_DYNAMIC)
+				free(vsb->s_buf);
+			vsb->s_buf = body;
+			vsb->s_flags = dynstruct;
+		} else {
+			char* new_buffer = (char *)((vsb->s_flags & VSB_DYNAMIC)
+				? realloc(vsb->s_buf, data_len+1) : malloc(data_len+1));
 			if (UNLIKELY(new_buffer == nullptr))
 				throw std::runtime_error("Unable to allocate room for synth content buffer");
-			data.copy_to(new_buffer, data.size());
 			vsb->s_buf = new_buffer;
-			vsb->s_size = data.size()+1;
-			vsb->s_len  = data.size();
-			vsb->s_flags = VSB_DYNAMIC;
+			vsb->s_flags = dynstruct | VSB_DYNAMIC;
+			vsb->s_size = data_len+1;
+			vsb->s_len  = 0;
+			machine.memory.memcpy_out(new_buffer, data_addr, data_len);
 		}
+		vsb->s_size = data_len+1;
+		vsb->s_len  = data_len;
 #endif
 		machine.stop();
 #ifdef ENABLE_TIMING
