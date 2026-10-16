@@ -800,14 +800,8 @@ APICALL(http_rollback)
 	/* Varnish can only roll back req and bereq, and panics otherwise */
 	if (where != GUEST_HDR_REQ && where != GUEST_HDR_BEREQ)
 		throw std::runtime_error("Rollback is only possible for req and bereq");
-	auto* hp = get_http(ctx, where);
 
-#if __has_include("cache/cache_int.h")
-	(void)hp;
 	VRT_Rollback(ctx);
-#else
-	VRT_Rollback(ctx, hp);
-#endif
 }
 
 APICALL(header_field_get)
