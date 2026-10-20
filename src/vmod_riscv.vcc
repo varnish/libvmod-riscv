@@ -124,6 +124,23 @@ $Function BOOL    fork(PRIV_VCL, STRING tenant, STRING debug = 0)
   fully prepared machine, using copy-on-write mechanics.
 - Returns true if the fork succeeded.
 
+$Function BOOL    permanent_fork(PRIV_VCL, STRING tenant, STRING debug = 0)
+
+- Like fork(), and a drop-in replacement for it: instead of constructing
+  a new VM for this task, it takes a permanent VM of the tenant from a
+  small pool kept by each worker thread. When the task ends, the VM is
+  reset to the state of the tenant's prepared machine and goes back to
+  the pool, so the next task sees nothing of this one.
+- Lower latency than fork(), at the cost of memory that stays with the
+  worker threads: up to 4 idle VMs per thread (the least recently used
+  is evicted), each keeping the pages its tasks wrote to, up to 256 KiB.
+  They are freed when their thread exits, and are not reused once a
+  live update has replaced their program.
+- A task that leaves state behind that a reset does not undo (guest
+  threads or signal handlers) has its VM destroyed instead of pooled.
+- A debug fork (see fork()) is never pooled.
+- Returns true if the fork succeeded.
+
 $Function BACKEND live_update(PRIV_VCL, STRING tenant, BYTES max_size = 2097152)
 
 - Update this machine using binary data received in the
@@ -164,6 +181,17 @@ Example:
 			riscv.run();
 		}
 	}
+
+$Function STRING  bench_fork(PRIV_VCL, STRING tenant, INT iterations,
+	ENUM {FORK, CLEAR, RESTORE, WARM} mode = "FORK")
+
+- PROTOTYPE: run fork, vcall(ON_REQUEST) and release of a tenant VM
+  repeatedly in vcl_recv, and return the per-phase latencies.
+
+$Function INT     pooled_vms()
+
+- The number of permanent VMs (see permanent_fork()) that exist, idle
+  or in use by a task, over all worker threads and tenants.
 
 $Function INT     vcall(ENUM {
 		ON_REQUEST,

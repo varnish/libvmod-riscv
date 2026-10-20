@@ -2,7 +2,10 @@
 #include "varnish.hpp"
 #include <libriscv/util/crc32.hpp>
 #include "builder/builder.hpp"
+#include <atomic>
 #include <climits>
+#include <dlfcn.h>
+#include <pthread.h>
 #include <mutex>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -87,6 +90,11 @@ SandboxTenant::SandboxTenant(VRT_CTX, const TenantConfig& conf)
 	: config{conf}
 {
 	(void) ctx;
+}
+SandboxTenant::~SandboxTenant()
+{
+	MachineInstance::retire(this->program);
+	MachineInstance::retire(this->debug_program);
 }
 
 void SandboxTenant::load(VRT_CTX)
@@ -173,7 +181,124 @@ static const struct vmod_priv_methods riscv_priv_methods[1] = {{
 }};
 #endif
 
-Script* SandboxTenant::vmfork(VRT_CTX, bool debug)
+namespace {
+/* Permanent VMs that exist, idle or in use by a task */
+std::atomic<long> pooled_vms {0};
+
+void destroy_pooled(Script* script)
+{
+	delete script;
+	pooled_vms--;
+}
+
+struct ForkPool {
+	static constexpr size_t MAX_IDLE = 4;
+	/* Least recently used first */
+	std::vector<Script*> idle;
+	~ForkPool() { for (auto* script : idle) destroy_pooled(script); }
+
+	/* Drop the idle VMs of programs that are no longer in use */
+	void drop_retired() {
+		std::erase_if(idle, [] (Script* script) {
+			if (LIKELY(!script->program().retired.load(std::memory_order_relaxed)))
+				return false;
+			destroy_pooled(script);
+			return true;
+		});
+	}
+};
+
+/* Each worker thread has its own pool, which is freed when the thread
+   exits. A task can move to another thread (waiting list), so a pooled
+   fork is taken out of the pool while in use, and put back into the
+   pool of the thread that ends the task. */
+pthread_key_t pool_key;
+
+void pool_key_create()
+{
+	AZ(pthread_key_create(&pool_key,
+		[] (void* pool) { delete (ForkPool*) pool; }));
+	/* The key's destructor is in this VMOD, and runs whenever a worker
+	   thread exits. Keep the VMOD loaded after its last VCL is gone. */
+	Dl_info info;
+	if (dladdr((void*) &pool_key_create, &info) && info.dli_fname != nullptr)
+		(void) dlopen(info.dli_fname, RTLD_NOW | RTLD_NODELETE);
+}
+
+ForkPool& fork_pool()
+{
+	static pthread_once_t once = PTHREAD_ONCE_INIT;
+	AZ(pthread_once(&once, pool_key_create));
+	auto* pool = (ForkPool*) pthread_getspecific(pool_key);
+	if (UNLIKELY(pool == nullptr)) {
+		pool = new ForkPool;
+		AZ(pthread_setspecific(pool_key, pool));
+	}
+	return *pool;
+}
+}
+
+long SandboxTenant::pooled_count() { return pooled_vms.load(); }
+
+Script* SandboxTenant::pool_acquire(VRT_CTX, std::shared_ptr<MachineInstance> prog)
+{
+	auto& pool = fork_pool();
+	pool.drop_retired();
+	auto& idle = pool.idle;
+	/* The most recently used VM has the warmest caches */
+	for (size_t i = idle.size(); i-- > 0; ) {
+		Script* script = idle[i];
+		if (&script->program() == prog.get()) {
+			idle.erase(idle.begin() + i);
+			script->set_ctx(ctx);
+			return script;
+		}
+	}
+	auto* script = new Script{prog->script, ctx, this, *prog, true};
+	pooled_vms++;
+	script->assign_instance(prog);
+	return script;
+}
+
+void SandboxTenant::pool_release(Script* script, bool restore)
+{
+	/* A VM of a replaced program is not kept, nor one whose task left
+	   state behind that a reset does not undo */
+	bool reusable = !script->program().retired.load(std::memory_order_relaxed);
+	try {
+		reusable = reusable && script->reset_to_master(restore);
+	} catch (...) {
+		reusable = false;
+	}
+	if (!reusable) {
+		destroy_pooled(script);
+		return;
+	}
+	auto& idle = fork_pool().idle;
+	/* Evict the least recently used fork */
+	if (idle.size() >= ForkPool::MAX_IDLE) {
+		destroy_pooled(idle.front());
+		idle.erase(idle.begin());
+	}
+	idle.push_back(script);
+}
+
+static void PoolFreeFunction(void* priv) {
+	SandboxTenant::pool_release((Script*) priv);
+}
+#ifndef VARNISH_PLUS
+static void PoolPrivFreeFunction(const struct vrt_ctx*, void *priv)
+{
+	PoolFreeFunction(priv);
+}
+static const struct vmod_priv_methods riscv_pool_priv_methods[1] = {{
+	.magic = VMOD_PRIV_METHODS_MAGIC,
+	.type = "vmod_riscv_pool",
+	.fini = PoolPrivFreeFunction
+}};
+#endif
+
+Script* SandboxTenant::vmfork(VRT_CTX, bool debug, bool permanent)
 {
 	auto* priv_task = VRT_priv_task(ctx, get_priv_key(ctx));
 	if (!priv_task->priv)
@@ -191,6 +316,23 @@ Script* SandboxTenant::vmfork(VRT_CTX, bool debug)
 			VSLb(ctx->vsl, SLT_VCL_Error,
 			    "No program loaded: %s", this->config.name.c_str());
 			return nullptr;
+		}
+		if (permanent && !debug) {
+			Script* script;
+			try {
+				script = pool_acquire(ctx, std::move(prog));
+			} catch (std::exception& e) {
+				VRT_fail(ctx, "VM '%s' exception: %s", config.name.c_str(), e.what());
+				return nullptr;
+			}
+			priv_task->priv = script;
+			priv_task->len  = SCRIPT_MAGIC;
+#ifdef VARNISH_PLUS
+			priv_task->free = PoolFreeFunction;
+#else
+			priv_task->methods = riscv_pool_priv_methods;
+#endif
+			return script;
 		}
 		/* Allocate Script on workspace, and construct it in-place */
 		uintptr_t saddr = (uintptr_t)WS_Alloc(ctx->ws, sizeof(Script) + 0x20);

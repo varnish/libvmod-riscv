@@ -2,6 +2,7 @@ add_vmod(vmod_riscv vmod_riscv.vcc "Low-Latency Configuration VMOD"
 	builder/builder.cpp
 	builder/builder_rust.cpp
 	backend.cpp
+	bench_fork.cpp
 	live_update.cpp
 	machine_instance.cpp
 	sandbox_tenant.cpp

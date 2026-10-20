@@ -44,6 +44,7 @@ libvmod_riscv_la_SOURCES = \
 	builder/builder.cpp \
 	builder/builder_rust.cpp \
 	backend.cpp \
+	bench_fork.cpp \
 	live_update.cpp \
 	machine_instance.cpp \
 	sandbox_tenant.cpp \

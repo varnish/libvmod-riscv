@@ -193,6 +193,12 @@ struct Arena
 	/// Set the metadata cap. Lowering below chunks_used() prevents further growth.
 	void set_max_chunks(unsigned new_max);
 
+	/// Free everything, in place: the arena allocates as if newly constructed
+	/// over the same range. Keeps the chunk cap and the unknown-chunk
+	/// callbacks, and gives back any host memory the metadata had grown into.
+	/// Allocation-free, and the work is proportional to what was in use.
+	void reset() noexcept;
+
 	unsigned allocation_counter() const noexcept { return m_allocation_counter; }
 	unsigned deallocation_counter() const noexcept { return m_deallocation_counter; }
 	void transfer(Arena& dest) const;
@@ -803,6 +809,41 @@ inline void Arena::set_max_chunks(unsigned new_max)
 	if (new_capacity < m_used_chunk_table.size() && new_capacity >= m_live_chunks * 2u)
 		rebuild_table(new_capacity);
 	m_max_chunks = new_max;
+}
+
+inline void Arena::reset() noexcept
+{
+	// A bin is non-empty only while its bitmap bits are set
+	for (uint32_t fl_map = m_fl_bitmap; fl_map != 0; fl_map &= fl_map - 1u) {
+		const unsigned fl = first_set(fl_map);
+		for (uint32_t sl_map = m_sl_bitmap[fl]; sl_map != 0; sl_map &= sl_map - 1u)
+			m_bins[fl][first_set(sl_map)] = ArenaChunk::NO_CHUNK;
+		m_sl_bitmap[fl] = 0;
+	}
+	m_fl_bitmap = 0;
+	// Back to the constructor's (inline) metadata sizes. Erasing leaves
+	// no tombstones, so a table without live chunks is already clean.
+	const size_t table_size = std::min(table_capacity_for(m_max_chunks), INLINE_TABLE_CAPACITY);
+	if (m_used_chunk_table.size() != table_size)
+		m_used_chunk_table.assign(table_size, UsedSlot{});
+	else if (m_live_chunks != 0)
+		std::fill(m_used_chunk_table.begin(), m_used_chunk_table.end(), UsedSlot{});
+	m_live_chunks = 0;
+	if (m_chunk_slab.on_heap())
+		m_chunk_slab.assign(std::max<unsigned>(1u, std::min<unsigned>(8u, m_max_chunks)), ArenaChunk{});
+	m_chunk_slab[0] = ArenaChunk{ArenaChunk::NO_CHUNK, ArenaChunk::NO_CHUNK,
+		m_total, true, m_base};
+	m_slab_top = 1;
+	m_slab_free = ArenaChunk::NO_CHUNK;
+	m_slab_free_count = 0;
+	m_tail = 0;
+	m_bytes_free = 0;
+	m_allocation_counter = 0;
+	m_deallocation_counter = 0;
+	m_search_steps = 0;
+	m_max_probe = 0;
+	m_seq_fallbacks = 0;
+	bin_insert(0);
 }
 
 inline void Arena::transfer(Arena& dest) const

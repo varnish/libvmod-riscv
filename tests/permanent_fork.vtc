@@ -1,0 +1,401 @@
+varnishtest "riscv.permanent_fork(): pooled VMs reset between tasks, freed with their thread"
+
+server s0 {
+	loop 40 {
+		rxreq
+		txresp -body "origin"
+	}
+} -start
+
+# One backend per slow request, so that they are all in flight at once
+server s1 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s2 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s3 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s4 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s5 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s6 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s7 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s8 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s9 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s10 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s11 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s12 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s13 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s14 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s15 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s16 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s17 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s18 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s19 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+server s20 {
+	rxreq
+	delay 1
+	txresp -body "slow"
+} -start
+
+varnish v1 -arg "-p workspace_client=128k" \
+	-arg "-p thread_pools=1" -arg "-p thread_pool_min=5" \
+	-arg "-p thread_pool_timeout=10" -arg "-p thread_pool_destroy_delay=0.1" \
+	-vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/vcl/basic.vcl"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/pooled") {
+			return (synth(200));
+		}
+		set req.backend_hint = s0;
+		if (req.url == "/slow/1") {
+			set req.backend_hint = s1;
+		}
+		if (req.url == "/slow/2") {
+			set req.backend_hint = s2;
+		}
+		if (req.url == "/slow/3") {
+			set req.backend_hint = s3;
+		}
+		if (req.url == "/slow/4") {
+			set req.backend_hint = s4;
+		}
+		if (req.url == "/slow/5") {
+			set req.backend_hint = s5;
+		}
+		if (req.url == "/slow/6") {
+			set req.backend_hint = s6;
+		}
+		if (req.url == "/slow/7") {
+			set req.backend_hint = s7;
+		}
+		if (req.url == "/slow/8") {
+			set req.backend_hint = s8;
+		}
+		if (req.url == "/slow/9") {
+			set req.backend_hint = s9;
+		}
+		if (req.url == "/slow/10") {
+			set req.backend_hint = s10;
+		}
+		if (req.url == "/slow/11") {
+			set req.backend_hint = s11;
+		}
+		if (req.url == "/slow/12") {
+			set req.backend_hint = s12;
+		}
+		if (req.url == "/slow/13") {
+			set req.backend_hint = s13;
+		}
+		if (req.url == "/slow/14") {
+			set req.backend_hint = s14;
+		}
+		if (req.url == "/slow/15") {
+			set req.backend_hint = s15;
+		}
+		if (req.url == "/slow/16") {
+			set req.backend_hint = s16;
+		}
+		if (req.url == "/slow/17") {
+			set req.backend_hint = s17;
+		}
+		if (req.url == "/slow/18") {
+			set req.backend_hint = s18;
+		}
+		if (req.url == "/slow/19") {
+			set req.backend_hint = s19;
+		}
+		if (req.url == "/slow/20") {
+			set req.backend_hint = s20;
+		}
+		if (!riscv.permanent_fork(req.http.Host)) {
+			return (synth(404, "No such tenant"));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status(), riscv.want_reason()));
+		}
+		return (pass);
+	}
+
+	sub vcl_deliver {
+		riscv.run();
+	}
+
+	sub vcl_synth {
+		set resp.http.X-Pooled = riscv.pooled_vms();
+		if (riscv.active()) {
+			riscv.run();
+			if (riscv.want_result() == "deliver") {
+				return (deliver);
+			}
+		}
+	}
+} -start
+
+client c0 {
+	# A request global set by one task is gone in the next, even
+	# when the next task gets the very same VM back.
+	loop 20 {
+		txreq -url "/api/users" -hdr "Host: test.com"
+		rxresp
+		expect resp.status == 200
+		expect resp.http.X-Kind == "api"
+		expect resp.http.X-Delivered-By == "vcl"
+
+		txreq -url "/old/thing" -hdr "Host: test.com"
+		rxresp
+		expect resp.status == 200
+		expect resp.http.X-Kind == ""
+
+		txreq -url "/deny" -hdr "Host: test.com"
+		rxresp
+		expect resp.status == 403
+		expect resp.reason == "denied"
+		expect resp.http.X-Synth == "policy"
+	}
+
+	# 60 tasks did not create 60 VMs: they were reused.
+	txreq -url "/pooled"
+	rxresp
+	expect resp.http.X-Pooled <= 6
+} -run
+
+# Hold 20 VMs at once, which takes 20 worker threads.
+client c1 {
+	txreq -url "/slow/1" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c2 {
+	txreq -url "/slow/2" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c3 {
+	txreq -url "/slow/3" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c4 {
+	txreq -url "/slow/4" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c5 {
+	txreq -url "/slow/5" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c6 {
+	txreq -url "/slow/6" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c7 {
+	txreq -url "/slow/7" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c8 {
+	txreq -url "/slow/8" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c9 {
+	txreq -url "/slow/9" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c10 {
+	txreq -url "/slow/10" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c11 {
+	txreq -url "/slow/11" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c12 {
+	txreq -url "/slow/12" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c13 {
+	txreq -url "/slow/13" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c14 {
+	txreq -url "/slow/14" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c15 {
+	txreq -url "/slow/15" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c16 {
+	txreq -url "/slow/16" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c17 {
+	txreq -url "/slow/17" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c18 {
+	txreq -url "/slow/18" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c19 {
+	txreq -url "/slow/19" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c20 {
+	txreq -url "/slow/20" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+} -start
+client c1 -wait
+client c2 -wait
+client c3 -wait
+client c4 -wait
+client c5 -wait
+client c6 -wait
+client c7 -wait
+client c8 -wait
+client c9 -wait
+client c10 -wait
+client c11 -wait
+client c12 -wait
+client c13 -wait
+client c14 -wait
+client c15 -wait
+client c16 -wait
+client c17 -wait
+client c18 -wait
+client c19 -wait
+client c20 -wait
+
+client c0 {
+	txreq -url "/pooled"
+	rxresp
+	expect resp.http.X-Pooled >= 20
+} -run
+
+# The pool shrinks back to thread_pool_min once its threads have been
+# idle for thread_pool_timeout, and their VMs go with them.
+delay 25
+
+client c0 {
+	txreq -url "/pooled"
+	rxresp
+	expect resp.http.X-Pooled <= 10
+} -run

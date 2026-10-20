@@ -237,6 +237,59 @@ TEST_CASE("Native heap slab growth and transfer remain valid", "[Heap][ArenaInva
 	require_valid(source);
 }
 
+TEST_CASE("Native heap reset is as good as new", "[Heap][ArenaInvariant]")
+{
+	// The same allocations give the same addresses after a reset as in
+	// a new arena, however the arena was used before
+	const auto replay = [] (riscv::Arena& arena, uint32_t seed) {
+		std::mt19937 random(seed);
+		std::vector<uint32_t> result, live;
+		for (unsigned i = 0; i < 400; ++i) {
+			if (live.empty() || random() % 3u != 0) {
+				const uint32_t ptr = arena.malloc(random() % 2048u);
+				result.push_back(ptr);
+				if (ptr != 0) live.push_back(ptr);
+			} else {
+				const size_t idx = random() % live.size();
+				REQUIRE(arena.free(live[idx]) == 0);
+				live[idx] = live.back();
+				live.pop_back();
+			}
+		}
+		return result;
+	};
+	int unknown_frees = 0;
+	riscv::Arena arena(BASE, END);
+	arena.on_unknown_free([&] (auto, auto*) { unknown_frees++; return 0; });
+	for (uint32_t seed : {1u, 2u, 0xdeadbeefu}) {
+		// Use it lightly, heavily (metadata on the heap) or not at all
+		replay(arena, seed);
+		if (seed == 2u) {
+			for (unsigned i = 0; i < 1000; ++i) REQUIRE(arena.malloc(16 + (i % 13) * 16) != 0);
+			REQUIRE(arena.metadata_on_heap());
+		}
+		arena.reset();
+		require_valid(arena);
+		REQUIRE_FALSE(arena.metadata_on_heap());
+		REQUIRE(arena.bytes_free() == END - BASE);
+		REQUIRE(arena.live_chunks() == 0);
+		REQUIRE(arena.chunks_used() == 1);
+		REQUIRE(arena.allocation_counter() == 0);
+		REQUIRE(arena.deallocation_counter() == 0);
+		REQUIRE(arena.high_watermark() == BASE);
+
+		riscv::Arena fresh(BASE, END);
+		REQUIRE(replay(arena, seed + 100u) == replay(fresh, seed + 100u));
+		require_valid(arena);
+		arena.reset();
+		arena.reset();
+		require_valid(arena);
+	}
+	// The callbacks survive a reset
+	REQUIRE(arena.free(BASE + 0x1000) == 0);
+	REQUIRE(unknown_frees == 1);
+}
+
 TEST_CASE("Native heap metadata stays inline for small programs", "[Heap][ArenaInvariant]")
 {
 	// The default chunk cap for this range is large, but nothing up to the

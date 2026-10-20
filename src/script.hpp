@@ -29,6 +29,12 @@ public:
 	static constexpr size_t  REGEX_MAX    = 64;
 	static constexpr size_t  DIRECTOR_MAX = 32;
 	static constexpr size_t  RESULTS_MAX  = 3;
+	/* PageAttributes::user_defined of the pages a fork's own page
+	   handlers install. Anything else that changes a page leaves it
+	   without this tag, which reset_to_master() relies on. */
+	static constexpr uint8_t FORK_PAGE    = 0xF0;
+	/* Written pages a persistent fork may keep between tasks */
+	static constexpr size_t  RETAINED_PAGES_MAX = 64;
 
 	// call any script function, with any parameters
 	template <typename... Args>
@@ -102,10 +108,24 @@ public:
 
 	static void init();
 	Script(const std::vector<uint8_t>&, const vrt_ctx*, const SandboxTenant*, MachineInstance&, bool sto, bool dbg);
-	Script(const Script& source, const vrt_ctx*, const SandboxTenant*, MachineInstance&);
+	Script(const Script& source, const vrt_ctx*, const SandboxTenant*, MachineInstance&, bool persistent = false);
 	~Script();
 	void machine_initialize();
 	bool reset(); // true if the reset was successful
+
+	/* Bring a persistent fork back to the state of its master, so that it
+	   can serve another task without being constructed again (see
+	   riscv.permanent_fork()). Returns false if the task left state behind
+	   that is not undone (guest threads, signals, new execute segments):
+	   the fork must then be destroyed instead.
+	   restore == true:  memcpy the master's data into the pages this fork
+	                     owns and has written to, keep everything else.
+	   restore == false: drop every page, and loan them from the master again.
+	   Pages that something other than the fork's own page handlers put in
+	   its page table (mmap(), mprotect(), zero-copy bodies) are always
+	   dropped. */
+	bool reset_to_master(bool restore);
+	bool is_persistent() const noexcept { return m_persistent; }
 
 private:
 	void handle_exception(gaddr_t);
@@ -113,6 +133,8 @@ private:
 	bool install_binary(const std::string& file, bool shared = true);
 	void machine_setup(machine_t&, bool init);
 	void setup_virtual_memory(bool init);
+	void setup_fork_arena();
+	void own_page(const riscv::Memory<MARCH>&, gaddr_t pageno);
 	static void setup_syscall_interface();
 
 	machine_t m_machine;
@@ -121,13 +143,16 @@ private:
 	const struct SandboxTenant* m_tenant = nullptr;
 	MachineInstance& m_inst;
 	gaddr_t     m_post_data = 0;
-	gaddr_t     m_arena_watermark = 0; // cached after machine_initialize(); used by fork ctor
+	gaddr_t     m_arena_watermark = 0; // cached after machine_initialize(); where fork arenas begin
+	gaddr_t     m_arena_end = 0; // end of the master's arena, and of its forks' arenas
+	size_t      m_task_pages = 0; // pages made writable by the current task
 
 	std::string m_want_result;
 	std::array<gaddr_t, RESULTS_MAX> m_want_values = {};
 	bool        m_is_paused = false;
 	bool        m_is_storage = false;
 	bool        m_is_debug = false;
+	bool        m_persistent = false; // outlives its task: pages never come from the workspace
 	bool        m_last_newline = true;
 	gaddr_t     m_sighandler = 0;
 	struct VSHA256Context* m_sha_ctx = nullptr;

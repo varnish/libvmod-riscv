@@ -142,6 +142,7 @@ namespace riscv
 		void set_brk_address(address_t addr) noexcept { this->m_brk_address = addr; }
 		// Simple memory mapping implementation
 		auto& mmap_cache() noexcept { return m_mmap_cache; }
+		const auto& mmap_cache() const noexcept { return m_mmap_cache; }
 		address_t mmap_start() const noexcept { return this->m_heap_address + BRK_MAX; }
 		const address_t& mmap_address() const noexcept { return m_mmap_address; }
 		address_t& mmap_address() noexcept { return m_mmap_address; }

@@ -1,6 +1,7 @@
 #pragma once
 #include "script.hpp"
 #include "vcl/vcl_program.hpp"
+#include <atomic>
 #include <mutex>
 namespace riscv {
 	template <int W> struct RSPClient;
@@ -48,6 +49,14 @@ struct MachineInstance
 	std::unique_ptr<riscv::RSPClient<Script::MARCH>> rspclient;
 	Script* rsp_script = nullptr;
 	std::mutex rsp_mtx;
+
+	/* Set once the tenant no longer runs this program (a live update
+	   replaced it, or the tenant is gone), so that permanent VMs of it
+	   are not reused, and do not keep it alive longer than needed. */
+	std::atomic<bool> retired {false};
+	static void retire(const std::shared_ptr<MachineInstance>& inst) noexcept {
+		if (inst != nullptr) inst->retired.store(true, std::memory_order_relaxed);
+	}
 };
 
 } // rvs

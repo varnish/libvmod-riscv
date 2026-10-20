@@ -28,7 +28,7 @@ namespace rvs
 
 extern "C"
 rvs::Script* riscv_fork(VRT_CTX, struct vmod_priv* priv,
-	const char* tenant, size_t tenantlen, int debug)
+	const char* tenant, size_t tenantlen, int debug, int permanent)
 {
 	using namespace rvs;
 
@@ -41,7 +41,7 @@ rvs::Script* riscv_fork(VRT_CTX, struct vmod_priv* priv,
 		return nullptr;
 	}
 
-	return tenptr->vmfork(ctx, debug);
+	return tenptr->vmfork(ctx, debug, permanent);
 }
 
 extern "C"
