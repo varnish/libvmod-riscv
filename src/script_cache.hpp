@@ -38,6 +38,8 @@ struct Cache {
 		entry = {};
 		return owned;
 	}
+	/* Forget every entry. Owned items must be destroyed first. */
+	void reset() { cache = {}; m_size = 0; }
 	bool full() const { return size() >= max_size(); }
 	size_t size() const { return m_size; }
 	size_t max_size() const { return m_max_entries; }

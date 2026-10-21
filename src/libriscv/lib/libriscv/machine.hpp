@@ -393,6 +393,13 @@ namespace riscv
 		void setup_native_heap(size_t sysnum, uint64_t addr, size_t size);
 		void setup_native_heap(size_t sysnum, uint64_t addr, size_t size, unsigned max_chunks);
 		void transfer_arena_from(const Machine& other);
+		/// @brief Called by arena() when the machine has no arena, so that the
+		/// native heap can be created when it is first used, instead of up front
+		/// (eg. with setup_native_heap()). Until then has_arena() is false, so a
+		/// machine that never allocates never pays for an arena. Shared by every
+		/// machine of this type: the handler decides which machines get one.
+		/// If it creates none, arena() throws as usual.
+		static inline void (*on_missing_arena) (Machine&) = nullptr;
 		// Optional custom memory-related system calls
 		static void setup_native_memory(size_t sysnum);
 
@@ -434,6 +441,7 @@ namespace riscv
 		FileDescriptors& fds();
 		// Signal structure, lazily created
 		Signals<W>& signals();
+		bool has_signals() const noexcept { return m_signals != nullptr; }
 		SignalAction<W>& sigaction(int sig) { return signals().get(sig); }
 
 		// Resets the machine to the initial state. It is, however, not a

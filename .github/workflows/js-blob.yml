@@ -1,0 +1,60 @@
+name: QuickJS blob
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'program/cpp/**'
+      - 'program/Makefile'
+      - 'program/js.elf'
+      - 'ext/json/**'
+      - 'ext/tinyxml2/**'
+      - 'src/libriscv/binaries/barebones/libc/**'
+      - '.github/workflows/js-blob.yml'
+  pull_request:
+    paths:
+      - 'program/cpp/**'
+      - 'program/Makefile'
+      - 'program/js.elf'
+      - 'ext/json/**'
+      - 'ext/tinyxml2/**'
+      - 'src/libriscv/binaries/barebones/libc/**'
+      - '.github/workflows/js-blob.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  blob:
+    name: Rebuild js.elf from source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Install llvm-objcopy
+        run: sudo apt-get update && sudo apt-get install -y llvm-18
+
+      - name: Build js.elf
+        run: make -C program blob -j4
+
+      - name: Compare with the committed blob
+        run: |
+          sha256sum program/js.elf
+          if ! git diff --quiet -- program/js.elf; then
+            echo "::error::The committed js.elf does not match a build from source. Rebuild it (make -C program blob) and commit the result."
+            exit 1
+          fi
+
+      - name: Upload blob
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: js-blob
+          path: program/js.elf

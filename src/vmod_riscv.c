@@ -14,7 +14,7 @@ extern void init_tenants_file(VRT_CTX, struct vmod_priv*, const char*);
 extern void finalize_tenants_impl(VRT_CTX, struct vmod_priv*);
 extern void tenant_append_main_argument(VRT_CTX, struct vmod_priv*, const char*, const char*);
 
-extern void* riscv_fork(VRT_CTX, struct vmod_priv*, const char* ten, size_t tenlen, int dbg);
+extern void* riscv_fork(VRT_CTX, struct vmod_priv*, const char* ten, size_t tenlen, int dbg, int permanent);
 // Functions operating on a machine already forked, which
 // is accessible through a priv_task.
 extern const char* riscv_current_call(VRT_CTX, const char*, const char*);
@@ -107,7 +107,17 @@ VCL_BOOL vmod_fork(VRT_CTX, struct vmod_priv *priv, VCL_STRING tenant, VCL_STRIN
 	   and names no tenant. */
 	if (tenant == NULL)
 		return (0);
-	return riscv_fork(ctx, priv, tenant, strlen(tenant), debug != NULL) != NULL;
+	return riscv_fork(ctx, priv, tenant, strlen(tenant), debug != NULL, 0) != NULL;
+}
+/* Fork into a permanent VM, which goes back to the worker thread's
+   pool when the request (priv_task) ends. */
+VCL_BOOL vmod_permanent_fork(VRT_CTX, struct vmod_priv *priv, VCL_STRING tenant, VCL_STRING debug)
+{
+	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+
+	if (tenant == NULL)
+		return (0);
+	return riscv_fork(ctx, priv, tenant, strlen(tenant), debug != NULL, 1) != NULL;
 }
 
 /* Check if there is a VM currently for this request. */
@@ -122,6 +132,22 @@ VCL_INT vmod_add_backend(VRT_CTX, VCL_BACKEND dir)
 	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
 
 	return riscv_current_add_backend(ctx, dir);
+}
+extern const char* riscv_bench_fork(VRT_CTX, struct vmod_priv*, const char*, long, const char*);
+VCL_STRING vmod_bench_fork(VRT_CTX, struct vmod_priv *priv, VCL_STRING tenant,
+    VCL_INT iterations, VCL_ENUM mode)
+{
+	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+
+	if (tenant == NULL)
+		return (NULL);
+	return (riscv_bench_fork(ctx, priv, tenant, iterations, mode));
+}
+extern long riscv_pooled_vms(void);
+VCL_INT vmod_pooled_vms(VRT_CTX)
+{
+	CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+	return (riscv_pooled_vms());
 }
 VCL_INT vmod_vcall(VRT_CTX, VCL_ENUM e)
 {

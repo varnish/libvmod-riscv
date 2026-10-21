@@ -1,0 +1,153 @@
+varnishtest "riscv.permanent_fork(): a reset undoes what a task did to its VM"
+
+# A permanent VM serves task after task. Whatever one task did to it -
+# written memory, changed page protections, mappings, heap allocations,
+# signal handlers - must not be visible to the next.
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+#define SYS_mmap         222
+#define SYS_mprotect     226
+#define SYS_rt_sigaction 134
+#define NATIVE_MALLOC    580
+
+static long syscall6(long n, long a0, long a1, long a2, long a3, long a4, long a5)
+{
+	register long r0 asm("a0") = a0;
+	register long r1 asm("a1") = a1;
+	register long r2 asm("a2") = a2;
+	register long r3 asm("a3") = a3;
+	register long r4 asm("a4") = a4;
+	register long r5 asm("a5") = a5;
+	register long syscall_id asm("a7") = n;
+	asm volatile ("ecall" : "+r"(r0) : "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5), "r"(syscall_id) : "memory");
+	return r0;
+}
+
+alignas(4096) static long data[512] = {11};
+alignas(4096) static long guarded[512] = {22};
+
+static void on_recv(int req)
+{
+	char url[128];
+	get_url(req, url, sizeof(url)-1);
+
+	if (strcmp(url, "/write") == 0) {
+		*(volatile long *)&data[1] = 77;
+		decision("synth", 5, 200 + data[0]);
+	} else if (strcmp(url, "/read") == 0) {
+		decision("synth", 5, 200 + data[0] + data[1]);
+	} else if (strcmp(url, "/protect") == 0) {
+		/* Written, then made read-only */
+		*(volatile long *)&guarded[1] = 77;
+		syscall3(SYS_mprotect, (long)guarded, 4096, 1 /* PROT_READ */);
+		decision("synth", 5, 200 + guarded[0]);
+	} else if (strcmp(url, "/guarded") == 0) {
+		/* The master's data, and writable again */
+		*(volatile long *)&guarded[2] = 1;
+		decision("synth", 5, 200 + guarded[0] + guarded[1] + guarded[2]);
+	} else if (strcmp(url, "/mmap") == 0) {
+		long* p = (long *)syscall6(SYS_mmap, 0, 4096, 3, 0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */, -1, 0);
+		const long old = p[0];
+		*(volatile long *)&p[0] = 77;
+		syscall3(SYS_mprotect, (long)p, 4096, 0 /* PROT_NONE */);
+		decision("synth", 5, 200 + old);
+	} else if (strcmp(url, "/malloc") == 0) {
+		/* More than half the heap, and never freed */
+		const long p = syscall1(NATIVE_MALLOC, 10 << 20);
+		decision("synth", 5, p != 0 ? 200 : 500);
+	} else if (strcmp(url, "/sigaction") == 0) {
+		long act[3] = {0x1000, 0, 0};
+		syscall4(SYS_rt_sigaction, 10, (long)act, 0, 8);
+		decision("synth", 5, 200);
+	} else {
+		decision("synth", 5, 404);
+	}
+}
+
+void start(int argc, char** argv) {
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+varnish v1 -arg "-p thread_pools=1" -arg "-p thread_pool_min=5" -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"max_heap": 16
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/pooled") {
+			return (synth(200));
+		}
+		if (!riscv.permanent_fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(400));
+	}
+
+	sub vcl_synth {
+		set resp.http.X-Pooled = riscv.pooled_vms();
+	}
+} -start
+
+client c1 {
+	loop 10 {
+		# Written memory is restored
+		txreq -url "/write" -hdr "Host: xpizza.com"
+		rxresp
+		expect resp.status == 211
+		txreq -url "/read" -hdr "Host: xpizza.com"
+		rxresp
+		expect resp.status == 211
+
+		# A page written and then made read-only is neither kept
+		# as it was written, nor read-only
+		txreq -url "/protect" -hdr "Host: xpizza.com"
+		rxresp
+		expect resp.status == 222
+		txreq -url "/guarded" -hdr "Host: xpizza.com"
+		rxresp
+		expect resp.status == 223
+
+		# A mapping is gone, with its data and its protection
+		txreq -url "/mmap" -hdr "Host: xpizza.com"
+		rxresp
+		expect resp.status == 200
+
+		# Every task has the whole heap
+		txreq -url "/malloc" -hdr "Host: xpizza.com"
+		rxresp
+		expect resp.status == 200
+
+		# A signal handler is not undone: the VM is not reused
+		txreq -url "/sigaction" -hdr "Host: xpizza.com"
+		rxresp
+		expect resp.status == 200
+		txreq -url "/read" -hdr "Host: xpizza.com"
+		rxresp
+		expect resp.status == 211
+	}
+
+	# 80 tasks, and the VMs were reused
+	txreq -url "/pooled"
+	rxresp
+	expect resp.http.X-Pooled <= 5
+} -run

@@ -1,0 +1,59 @@
+varnishtest "QuickJS - a .js tenant runs on the embedded QuickJS program"
+
+varnish v1 -arg "-p workspace_client=128k" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"test.com": {
+				"filename": "${testdir}/javascript/hello.js"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.url == "/update") {
+			if (!riscv.live_update_file("test.com", "${testdir}/javascript/updated.js")) {
+				return (synth(500, "Update failed"));
+			}
+			return (synth(200, "Updated"));
+		}
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.run();
+		if (riscv.want_result() == "synth") {
+			return (synth(riscv.want_status()));
+		}
+		return (synth(500));
+	}
+
+	sub vcl_synth {
+		riscv.run();
+	}
+} -start
+
+client c1 {
+	txreq -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Script == "hello.js"
+
+	txreq -url "/missing" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 404
+	expect resp.http.X-Script == "hello.js"
+
+	txreq -url "/update" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 200
+
+	txreq -url "/" -hdr "Host: test.com"
+	rxresp
+	expect resp.status == 202
+	expect resp.http.X-Script == "updated.js"
+} -run

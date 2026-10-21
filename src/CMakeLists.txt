@@ -2,6 +2,7 @@ add_vmod(vmod_riscv vmod_riscv.vcc "Low-Latency Configuration VMOD"
 	builder/builder.cpp
 	builder/builder_rust.cpp
 	backend.cpp
+	bench_fork.cpp
 	live_update.cpp
 	machine_instance.cpp
 	sandbox_tenant.cpp
@@ -25,12 +26,19 @@ add_vmod(vmod_riscv vmod_riscv.vcc "Low-Latency Configuration VMOD"
 	vcl/vcl_syscalls.cpp
 	vcl/vcl_varnish.c
 	vcl/vclc_blob.c
+	js/js_program.cpp
+	js/js_blob.c
 )
 # vcl/vclc_blob.c embeds the sandboxed VCL compiler with .incbin
 set(VCLC_ELF "${CMAKE_CURRENT_SOURCE_DIR}/../vcl/vclc.elf")
 set_source_files_properties(vcl/vclc_blob.c PROPERTIES
 	COMPILE_DEFINITIONS "VCLC_ELF_PATH=\"${VCLC_ELF}\""
 	OBJECT_DEPENDS "${VCLC_ELF}")
+# js/js_blob.c embeds the QuickJS guest the same way
+set(JS_ELF "${CMAKE_CURRENT_SOURCE_DIR}/../program/js.elf")
+set_source_files_properties(js/js_blob.c PROPERTIES
+	COMPILE_DEFINITIONS "JS_ELF_PATH=\"${JS_ELF}\""
+	OBJECT_DEPENDS "${JS_ELF}")
 #add_vmod_vsc(vmod_riscv VSC_vmod_kvm.vsc)
 
 # RISC-V sandbox library

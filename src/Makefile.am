@@ -20,8 +20,10 @@ AM_CPPFLAGS = \
 	-DRISCV_PROGRAM_PATH=\"$(abs_top_srcdir)\" \
 	$(CRYPTO_CFLAGS)
 
-## vcl/vclc_blob.c .incbins the sandboxed VCL compiler from this path.
-AM_CFLAGS   = $(VARNISHAPI_CFLAGS) -Wall -DVCLC_ELF_PATH=\"$(abs_top_srcdir)/vcl/vclc.elf\"
+## vcl/vclc_blob.c .incbins the sandboxed VCL compiler from this path,
+## and js/js_blob.c the QuickJS guest.
+AM_CFLAGS   = $(VARNISHAPI_CFLAGS) -Wall -DVCLC_ELF_PATH=\"$(abs_top_srcdir)/vcl/vclc.elf\" \
+	-DJS_ELF_PATH=\"$(abs_top_srcdir)/program/js.elf\"
 AM_CXXFLAGS = $(VARNISHAPI_CFLAGS) -Wall
 AM_LDFLAGS  = $(VARNISHAPI_LIBS) $(VMOD_LDFLAGS)
 
@@ -44,6 +46,7 @@ libvmod_riscv_la_SOURCES = \
 	builder/builder.cpp \
 	builder/builder_rust.cpp \
 	backend.cpp \
+	bench_fork.cpp \
 	live_update.cpp \
 	machine_instance.cpp \
 	sandbox_tenant.cpp \
@@ -66,7 +69,9 @@ libvmod_riscv_la_SOURCES = \
 	vcl/vcl_stats.cpp \
 	vcl/vcl_syscalls.cpp \
 	vcl/vcl_varnish.c \
-	vcl/vclc_blob.c
+	vcl/vclc_blob.c \
+	js/js_program.cpp \
+	js/js_blob.c
 
 nodist_libvmod_riscv_la_SOURCES = \
 	vcc_if.c \
@@ -99,12 +104,15 @@ noinst_HEADERS = \
 	vcl/compiler.hpp \
 	vcl/vcl_program.hpp \
 	vcl/vcl_stats.hpp \
-	vcl/vcl_varnish.h
+	vcl/vcl_varnish.h \
+	js/js_program.hpp
 
 dist_man_MANS = vmod_riscv.3
 
-## The embedded compiler is an .incbin, which dependency tracking cannot see.
+## The embedded compiler and QuickJS guest are .incbins, which dependency
+## tracking cannot see.
 vcl/vclc_blob.lo: $(top_srcdir)/vcl/vclc.elf
+js/js_blob.lo: $(top_srcdir)/program/js.elf
 
 ## --- VCC interface + man page generation ---------------------------------
 ## The sources #include "vcc_if.h" (CMake's base name), so we generate

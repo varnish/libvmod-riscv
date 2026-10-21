@@ -1,5 +1,6 @@
 #include "sandbox_tenant.hpp"
 #include "varnish.hpp"
+#include "js/js_program.hpp"
 extern "C" {
 #include "update_result.h"
 }
@@ -67,6 +68,7 @@ riscv_update(VRT_CTX, rvs::SandboxTenant* vrm, struct update_params *params)
 			/* Live-debugging temporary tenant */
 			old = rvs::atomic_exchange(&vrm->debug_program, inst);
 		}
+		MachineInstance::retire(old);
 
 		if (old != nullptr) { // 10 == on_live_update
 			const auto luaddr = old->callback_entries.at(10);
@@ -153,7 +155,14 @@ int riscv_update_file(VRT_CTX, rvs::SandboxTenant* vrm,
 		const std::string path = apply_dollar_vars(std::string(filename));
 		if (rvs::vcl::is_vcl_source(path)) {
 			/* A compiled policy has no serialized state to hand over. */
-			rvs::atomic_store(&vrm->program, rvs::vcl::load(path, ctx, vrm));
+			MachineInstance::retire(
+				rvs::atomic_exchange(&vrm->program, rvs::vcl::load(path, ctx, vrm)));
+			return 1;
+		}
+		if (rvs::js::is_js_source(path)) {
+			/* The script is the program's argument, and replaces it. */
+			MachineInstance::retire(
+				rvs::atomic_exchange(&vrm->program, rvs::js::load(path, ctx, vrm)));
 			return 1;
 		}
 		auto binary = file_loader(path);
@@ -180,6 +189,7 @@ int riscv_update_file(VRT_CTX, rvs::SandboxTenant* vrm,
 
 		/* Atomically swap in the new program */
 		auto old = rvs::atomic_exchange(&vrm->program, inst);
+		MachineInstance::retire(old);
 
 		/* Transfer serialized state if both machines support it */
 		if (old != nullptr) { // 10 == on_live_update

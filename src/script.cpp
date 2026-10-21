@@ -1,6 +1,7 @@
 #include "script.hpp"
 
 #include <libriscv/native_heap.hpp>
+#include <libriscv/threads.hpp>
 #include "machine/include_api.hpp"
 #include "sandbox_tenant.hpp"
 #include "varnish.hpp"
@@ -52,7 +53,7 @@ void Script::init()
 
 Script::Script(
 	const Script& source, const vrt_ctx* ctx,
-	const SandboxTenant* ten, MachineInstance& inst)
+	const SandboxTenant* ten, MachineInstance& inst, bool persistent)
 	: m_machine(source.machine(), {
 		.memory_max = 0,
 		.minimal_fork = true,
@@ -61,6 +62,7 @@ Script::Script(
 	  m_parent(&source.machine()),
 	  m_ctx(ctx), m_tenant(ten), m_inst(inst),
 	  m_is_debug(source.is_debug()),
+	  m_persistent(persistent),
 	  m_sighandler{source.m_sighandler},
 	  m_regex     {ten->config.max_regex()},
 	  m_directors {ten->config.max_backends()}
@@ -71,33 +73,8 @@ Script::Script(
 	/* No initialization */
 	this->machine_setup(machine(), false);
 
-	/* Set up a fresh arena starting at the master's high-water mark.
-	 * This is O(1): no chunk-list copy, no pointer fixups.
-	 * The fork's allocator covers only [watermark, heap_end), i.e. the region
-	 * beyond everything the master has ever allocated.  Master-owned addresses
-	 * are "unknown" to this arena; the callbacks below handle the two cases
-	 * that would otherwise fail:
-	 *   free()    – silently succeed; the fork is short-lived so the space is
-	 *               recovered when the fork is destroyed.
-	 *   realloc() – allocate fresh memory in the fork's range, return the old
-	 *               size so the ecall layer can memcpy the contents. */
-	if (source.machine().has_arena()) {
-		const auto arena_base = source.machine().memory.heap_address();
-		const auto watermark  = source.m_arena_watermark;
-		const auto remaining  = vrm()->config.max_heap() - (watermark - arena_base);
-		machine().setup_native_heap(NATIVE_SYSCALLS_BASE, watermark, remaining);
-
-		machine().arena().on_unknown_free(
-			[](auto /*ptr*/, auto* /*ch*/) -> int { return 0; });
-
-		const riscv::Arena* src_arena = &source.machine().arena();
-		machine().arena().on_unknown_realloc(
-			[src_arena, this](auto ptr, auto newsize) -> riscv::Arena::ReallocResult {
-				const size_t old_len = src_arena->size(ptr);
-				const auto   new_ptr = machine().arena().malloc(newsize);
-				return {new_ptr, old_len};
-			});
-	}
+	/* Most requests never allocate, so the fork's native heap is only
+	   created when the guest first uses it: see on_missing_arena. */
 	/* Load the compiled regexes of the source */
 	m_regex.loan_from(source.m_regex);
 	/* Load the directors of the source */
@@ -106,6 +83,126 @@ Script::Script(
 	TIMING_LOCATION(t1);
 	printf("Total time in Script constr body: %ldns\n", nanodiff(t0, t1));
 #endif
+}
+
+/* Set up a fresh arena starting at the master's high-water mark.
+ * This is O(1): no chunk-list copy, no pointer fixups.
+ * The fork's allocator covers only [watermark, heap_end), i.e. the region
+ * beyond everything the master has ever allocated.  Master-owned addresses
+ * are "unknown" to this arena; the callbacks below handle the two cases
+ * that would otherwise fail:
+ *   free()    – silently succeed; the space is recovered when the fork is
+ *               destroyed, or reset to its master.
+ *   realloc() – allocate fresh memory in the fork's range, return the old
+ *               size so the ecall layer can memcpy the contents. */
+void Script::setup_fork_arena()
+{
+	const Script& source = m_inst.script;
+	const auto watermark = source.m_arena_watermark;
+	machine().setup_native_heap(NATIVE_SYSCALLS_BASE, watermark, source.m_arena_end - watermark);
+
+	machine().arena().on_unknown_free(
+		[](auto /*ptr*/, auto* /*ch*/) -> int { return 0; });
+
+	const riscv::Arena* src_arena = &source.machine().arena();
+	machine().arena().on_unknown_realloc(
+		[src_arena, this](auto ptr, auto newsize) -> riscv::Arena::ReallocResult {
+			const size_t old_len = src_arena->size(ptr);
+			const auto   new_ptr = machine().arena().malloc(newsize);
+			return {new_ptr, old_len};
+		});
+}
+
+bool Script::reset_to_master(bool restore)
+{
+	const Script& source = m_inst.script;
+	const machine_t& master = *m_parent;
+	auto& mem = machine().memory;
+	/* State a new fork does not have, or has a copy of the master's,
+	   and that is not worth undoing: the fork is not reused. */
+	if (UNLIKELY(machine().has_signals() || machine().has_file_descriptors()
+		|| mem.execute_segments_count() != master.memory.execute_segments_count()
+		|| machine().has_threads() != master.has_threads()))
+		return false;
+	if (machine().has_threads()) {
+		const auto& mt = machine().threads();
+		const auto& master_mt = master.threads();
+		if (UNLIKELY(mt.m_thread_counter != master_mt.m_thread_counter
+			|| mt.m_threads.size() != master_mt.m_threads.size()
+			|| mt.get_tid() != master_mt.get_tid()))
+			return false;
+	}
+
+	auto& pages = mem.pages();
+	if (restore) {
+		/* Pages written during the task are owned, writable copies.
+		   Give them the master's data back (or zeroes, when the master
+		   has no such page), and make them copy-on-write again, so that
+		   the next task's first write is noticed and only pages written
+		   since are restored. A write to such a page costs a write fault,
+		   but no allocation and no copy. */
+		const auto& master_pages = master.memory.pages();
+		size_t retained = 0;
+		for (auto it = pages.begin(); it != pages.end(); ) {
+			auto& page = it->second;
+			/* A page that was not installed by our own page handlers,
+			   or had its attributes changed since (mmap(), mprotect(),
+			   zero-copy bodies, ...): drop it, and let the next task
+			   fault it in from the master like a new fork would. */
+			if (UNLIKELY(page.attr.user_defined != FORK_PAGE)) {
+				it = pages.erase(it);
+				continue;
+			}
+			if (!page.attr.non_owning) {
+				if (page.attr.write) {
+					auto mit = master_pages.find(it->first);
+					if (mit != master_pages.end() && mit->second.m_page != nullptr)
+						std::memcpy(page.data(), mit->second.data(), riscv::Page::size());
+					else
+						std::memset(page.data(), 0, riscv::Page::size());
+					page.attr.write = false;
+					page.attr.is_cow = true;
+				}
+				retained++;
+			}
+			++it;
+		}
+		/* Bound what an idle fork holds on to */
+		if (UNLIKELY(retained > RETAINED_PAGES_MAX))
+			pages.clear();
+	} else {
+		/* Drop every page. Owned pages are freed, and loaned pages
+		   are loaned again on use. */
+		pages.clear();
+	}
+	mem.invalidate_reset_cache();
+	mem.mmap_address() = master.memory.mmap_address();
+	mem.set_brk_address(master.memory.brk_address());
+	mem.mmap_cache() = master.memory.mmap_cache();
+	machine().cpu.registers().copy_from(
+		riscv::Registers<MARCH>::Options::NoVectors, master.cpu.registers());
+	/* An arena is only there if the task allocated */
+	if (machine().has_arena())
+		machine().arena().reset();
+	m_task_pages = 0;
+
+	m_regex.foreach_owned([] (auto& entry) { VRE_free(&entry.item); });
+	m_regex.reset();
+	m_regex.loan_from(source.m_regex);
+	m_directors.reset();
+	m_directors.loan_from(source.m_directors);
+
+	m_vcl_task.reason.clear();
+	m_vcl_task.stat_seen.clear();
+	m_want_result.clear();
+	m_want_values = {};
+	m_is_paused = false;
+	m_sighandler = source.m_sighandler;
+	m_sha_ctx = nullptr;
+	m_post_data = 0;
+	m_last_newline = true;
+	m_ctx = nullptr;
+	return true;
 }
 
 Script::Script(
@@ -218,14 +315,23 @@ void Script::machine_setup(machine_t& machine, bool init)
 			attr.non_owning = true;
 			attr.is_cow = foreign_page.attr.write || foreign_page.attr.is_cow;
 			attr.write = false;
+			attr.user_defined = FORK_PAGE;
 			riscv::PageData* data = const_cast<riscv::PageData*>(foreign_page.m_page.get());
 			return mem.allocate_page(pageno, attr, data);
 		};
 		/* Give this fork its own copy of a loaned page */
 		auto copy_page = [this] (auto& mem, gaddr_t pageno, riscv::Page& page) -> void {
 			assert(page.attr.is_cow);
+			/* A page restored by reset_to_master(): it has the master's
+			   data already, and only needs to become writable again */
+			if (!page.attr.non_owning && page.m_page != nullptr) {
+				this->own_page(mem, pageno);
+				page.attr.write = true;
+				page.attr.is_cow = false;
+				return;
+			}
 			/* Pages are allocated from workspace */
-			auto* data = (riscv::PageData*) riscv_ws_alloc_spare(
+			auto* data = m_persistent ? nullptr : (riscv::PageData*) riscv_ws_alloc_spare(
 				m_ctx->ws, riscv::Page::size(), WS_PAGE_SPARE);
 			if (LIKELY(data != nullptr)) {
 				std::memcpy(data, page.data(), page.size());
@@ -236,14 +342,8 @@ void Script::machine_setup(machine_t& machine, bool init)
 				return;
 			}
 			// With heap as fallback, to allow bigger VMs
-			const auto mem_usage = mem.owned_pages_active() * riscv::Page::size();
-			if (mem_usage < this->tenant().config.max_memory()) {
-				page.make_writable();
-				return;
-			}
-			throw riscv::MachineException(
-				riscv::OUT_OF_MEMORY, "Out of memory (max_memory limit reached)",
-					pageno * riscv::Page::size());
+			this->own_page(mem, pageno);
+			page.make_writable();
 		};
 		machine.memory.set_page_fault_handler(
 		[this, copy_page] (auto& mem, size_t pageno, bool init) -> riscv::Page& {
@@ -260,7 +360,7 @@ void Script::machine_setup(machine_t& machine, bool init)
 				return page;
 			}
 			/* Pages are allocated from workspace, while it has room */
-			auto* data = (riscv::PageData*) riscv_ws_alloc_spare(
+			auto* data = m_persistent ? nullptr : (riscv::PageData*) riscv_ws_alloc_spare(
 				m_ctx->ws, riscv::Page::size(), WS_PAGE_SPARE);
 			if (LIKELY(data != nullptr)) {
 				if (init) {
@@ -269,18 +369,15 @@ void Script::machine_setup(machine_t& machine, bool init)
 				return mem.allocate_page(pageno,
 					riscv::PageAttributes{
 						.non_owning = true, // don't delete!
-						.user_defined = 1 },
+						.user_defined = FORK_PAGE },
 					data);
 			}
 			// With heap as fallback, to allow bigger VMs
-			const auto mem_usage = mem.owned_pages_active() * riscv::Page::size();
-			if (mem_usage < this->tenant().config.max_memory()) {
-				using namespace riscv;
-				return mem.allocate_page(pageno, init ? PageData::INITIALIZED : PageData::UNINITIALIZED);
-			}
-			throw riscv::MachineException(
-				riscv::OUT_OF_MEMORY, "Out of memory (max_memory limit reached)",
-					pageno * riscv::Page::size());
+			this->own_page(mem, pageno);
+			using namespace riscv;
+			auto& page = mem.allocate_page(pageno, init ? PageData::INITIALIZED : PageData::UNINITIALIZED);
+			page.attr.user_defined = FORK_PAGE;
+			return page;
 		});
 		// Copy-on-write handling
 		machine.memory.set_page_write_handler(copy_page);
@@ -358,6 +455,14 @@ void Script::machine_setup(machine_t& machine, bool init)
 				"Unhandled system call: " + std::to_string(num);
 			script->print(text);
 		};
+		// Most requests never allocate, so a fork's native heap is only
+		// created when the guest first uses it. See setup_fork_arena().
+		machine.on_missing_arena = [] (machine_t& m) {
+			auto* script = m.get_userdata<Script>();
+			if (script != nullptr && script->m_parent != nullptr
+				&& script->m_parent->has_arena())
+				script->setup_fork_arena();
+		};
 		machine.setup_linux_syscalls(false, false);
 		machine.setup_posix_threads();
 		// Custom system call API >= 500
@@ -366,6 +471,7 @@ void Script::machine_setup(machine_t& machine, bool init)
 		const uint64_t arena_base = machine.memory.mmap_allocate(vrm()->config.max_heap());
 		machine.setup_native_heap(NATIVE_SYSCALLS_BASE,
 			arena_base, vrm()->config.max_heap());
+		this->m_arena_end = arena_base + vrm()->config.max_heap();
 	#ifdef ENABLE_TIMING
 		TIMING_LOCATION(t3);
 	#endif
@@ -381,6 +487,21 @@ void Script::machine_setup(machine_t& machine, bool init)
 #endif
 	} // init
 } // machine_setup()
+
+/* Account for a page the task makes its own, against max_memory.
+   A persistent fork counts the pages this task wrote to, as the pages
+   it keeps between tasks are not allocated again. */
+void Script::own_page(const riscv::Memory<MARCH>& mem, gaddr_t pageno)
+{
+	const bool below = m_persistent
+		? m_task_pages < tenant().config.max_memory() / riscv::Page::size()
+		: mem.owned_pages_active() * riscv::Page::size() < tenant().config.max_memory();
+	if (UNLIKELY(!below))
+		throw riscv::MachineException(
+			riscv::OUT_OF_MEMORY, "Out of memory (max_memory limit reached)",
+				pageno * riscv::Page::size());
+	m_task_pages++;
+}
 
 void Script::handle_exception(gaddr_t address)
 {

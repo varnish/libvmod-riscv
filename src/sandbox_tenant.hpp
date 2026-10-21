@@ -11,7 +11,15 @@ struct SandboxTenant
 {
 	using ghandler_t = std::function<void(Script&)>;
 
-	Script* vmfork(const vrt_ctx*, bool debug);
+	Script* vmfork(const vrt_ctx*, bool debug, bool permanent = false);
+
+	/* Permanent VMs (riscv.permanent_fork()): forks that outlive their
+	   task. Each worker thread keeps a few idle ones, which are reset
+	   to their master with Script::reset_to_master() when a task ends. */
+	Script* pool_acquire(const vrt_ctx*, std::shared_ptr<MachineInstance>);
+	static void pool_release(Script*, bool restore = true);
+	/* Permanent VMs that exist, idle or in use, over all threads */
+	static long pooled_count();
 	void load(const vrt_ctx*);
 	bool no_program_loaded() const noexcept { return this->program == nullptr; }
 	/* The file load() reads the program from, with $vars applied. */
@@ -22,6 +30,7 @@ struct SandboxTenant
 	bool reusable_source() const;
 
 	SandboxTenant(const vrt_ctx*, const TenantConfig&);
+	~SandboxTenant();
 	static void init();
 	void init_vmods(const vrt_ctx*);
 

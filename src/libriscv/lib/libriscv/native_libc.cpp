@@ -184,8 +184,12 @@ const Arena& Machine<W>::arena() const {
 }
 template <int W>
 Arena& Machine<W>::arena() {
-	if (UNLIKELY(m_arena == nullptr))
-		throw MachineException(SYSTEM_CALL_FAILED, "Arena not created on this machine");
+	if (UNLIKELY(m_arena == nullptr)) {
+		if (on_missing_arena != nullptr)
+			on_missing_arena(*this);
+		if (m_arena == nullptr)
+			throw MachineException(SYSTEM_CALL_FAILED, "Arena not created on this machine");
+	}
 	return *m_arena;
 }
 template <int W>
