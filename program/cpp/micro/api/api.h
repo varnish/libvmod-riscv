@@ -7,6 +7,7 @@
 #include <array>
 #include <memory>
 #include <optional>
+#include <span>
 #include "api_structs.h"
 #define PPT() template <typename... Args>
 
@@ -37,6 +38,52 @@ std::optional<std::string> base64_decode(std::string_view text, unsigned flags =
 
 /* SHA-256 */
 std::array<uint8_t, 32> sha256(std::string_view data);
+
+/* Outgoing HTTP(S) requests (Varnish Enterprise), to the URLs the tenant's
+   "fetch" allow list permits. Start several, then wait for any or all. */
+struct FetchResponse {
+	/* The HTTP status, 0 when the transfer failed */
+	int status() const noexcept { return m_status; }
+	/* 0 on success, a CURLcode when the transfer failed, FETCH_EPENDING
+	   until fetch_wait() completes it, or a negative FETCH_E* when the
+	   request was refused (only from fetch()) */
+	int error() const noexcept { return m_error; }
+	bool ok() const noexcept { return m_error == 0; }
+	std::string_view body() const noexcept { return {m_body, m_body_len}; }
+	/* "Name: value\n" lines */
+	std::string_view headers() const noexcept { return {m_headers, m_headers_len}; }
+	std::optional<std::string_view> header(std::string_view name) const;
+
+	FetchResponse() = default;
+	explicit FetchResponse(int error) : m_error(error) {}
+	FetchResponse(FetchResponse&&) noexcept;
+	FetchResponse& operator=(FetchResponse&&) noexcept;
+	~FetchResponse();
+private:
+	/* The layout of struct fetch_response (syscalls.h). The system call
+	   allocates body and headers on the native heap, which is also where
+	   malloc and operator new allocate (libc/heap_linux.cpp, heap.cpp). */
+	int32_t m_status = 0;
+	int32_t m_error = FETCH_EPENDING;
+	char*   m_body = nullptr;
+	size_t  m_body_len = 0;
+	char*   m_headers = nullptr;
+	size_t  m_headers_len = 0;
+};
+/* Start a request: a handle, or a negative FETCH_E*. flags: FETCH_FLAG_INSECURE
+   accepts any TLS certificate. Headers are "Name: value" lines. */
+int fetch_get(std::string_view url, std::string_view headers = {}, unsigned flags = 0);
+int fetch_post(std::string_view url, std::string_view body, std::string_view headers = {}, unsigned flags = 0);
+/* Wait for all of the handles, or with FETCH_FLAG_ANY for at least one of
+   them, at most timeout_ms (< 0: until done, 0: poll). A finished handle
+   becomes -1, and its response is at the same index. Returns how many
+   finished, or a negative FETCH_E*. */
+long fetch_wait(std::span<int32_t> handles, std::span<FetchResponse> responses,
+	unsigned flags = 0, int timeout_ms = -1);
+/* Abandon a request */
+void fetch_free(int handle);
+/* One GET, waited for */
+FetchResponse fetch(std::string_view url, std::string_view headers = {}, unsigned flags = 0);
 
 /* Regular expressions */
 struct Regex {

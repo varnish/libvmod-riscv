@@ -14,7 +14,9 @@
 # identical for everyone. Debug info (zig's musl and libc++ carry the path
 # zig is installed at) and assembler temporaries are stripped, but not
 # .symtab: the host resolves fast_exit by name, and names functions in
-# backtraces. `zig objcopy` cannot do this, so it takes llvm-objcopy (set
+# backtraces. Zig's __anon_<N> symbols go too: since 0.17 N carries the id
+# of the compiler thread that made it, so it changes from build to build.
+# `zig objcopy` cannot do this, so it takes llvm-objcopy (set
 # OBJCOPY if it is not found).
 ROOT := $(abspath ..)
 
@@ -37,5 +39,6 @@ blob:
 	  cmake -S program/cpp -B build -DGCC_TRIPLE=$(GCC_TRIPLE) \
 	    -DCMAKE_TOOLCHAIN_FILE=micro/toolchain.cmake
 	$(MAKE) -C $(STAGE)/build js
-	$(OBJCOPY) --strip-debug --discard-locals $(STAGE)/build/js js.elf
+	$(OBJCOPY) --strip-debug --discard-locals \
+	  --wildcard --strip-symbol='__anon_*' $(STAGE)/build/js js.elf
 	rm -rf $(STAGE)

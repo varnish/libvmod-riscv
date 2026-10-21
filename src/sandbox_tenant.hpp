@@ -20,6 +20,9 @@ struct SandboxTenant
 	static void pool_release(Script*, bool restore = true);
 	/* Permanent VMs that exist, idle or in use, over all threads */
 	static long pooled_count();
+	/* Keep this VMOD loaded after its last VCL is gone, for code of it
+	   that can still run then: a thread-exit destructor, a callback. */
+	static void pin_vmod();
 	void load(const vrt_ctx*);
 	bool no_program_loaded() const noexcept { return this->program == nullptr; }
 	/* The file load() reads the program from, with $vars applied. */

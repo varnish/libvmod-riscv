@@ -16,6 +16,7 @@ BuildRequires: varnish-plus-devel
 BuildRequires: cmake
 BuildRequires: gcc-c++
 BuildRequires: pkgconfig(openssl)
+BuildRequires: pkgconfig(libcurl)
 
 %if 0%{?rhel} >= 8
 BuildRequires: python3-docutils

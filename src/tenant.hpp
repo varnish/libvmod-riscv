@@ -24,6 +24,33 @@ inline std::shared_ptr<T> atomic_exchange(std::shared_ptr<T>* p, std::type_ident
 }
 #pragma GCC diagnostic pop
 
+/* An origin a tenant may send requests to, with ECALL_FETCH. Parsed by
+   curl, as the URLs the guest gives are, so that both are read the same. */
+struct FetchRule {
+	std::string scheme;
+	std::string host;
+	unsigned    port = 0;
+	std::string path; // a prefix
+	bool operator==(const FetchRule&) const = default;
+};
+
+/* Outgoing HTTP access ("fetch" in the tenant JSON). Disabled when the
+   allow list is empty. */
+struct FetchConfig {
+	std::vector<std::string> allow;
+	std::vector<FetchRule> rules; // parsed from allow
+	uint32_t max_requests       = 8;      // per task
+	uint32_t timeout_ms         = 5000;   // the whole transfer
+	uint32_t connect_timeout_ms = 2000;
+	uint32_t max_request_body   = 1u << 20;
+	uint32_t max_response_body  = 16u << 20;
+	bool     allow_insecure     = false;  // FETCH_FLAG_INSECURE
+	bool operator==(const FetchConfig&) const = default;
+
+	/* Parse the allow list into rules, or throw */
+	void compile();
+};
+
 struct TenantGroup {
 	uint64_t max_instructions  = 20'000'000ull;
 	uint32_t max_memory_mb     = 32; // 32MB
@@ -31,6 +58,7 @@ struct TenantGroup {
 	size_t   max_backends = 8;
 	size_t   max_regex    = 32;
 	bool	 verbose      = false;
+	std::shared_ptr<const FetchConfig> fetch;
 
 	/* Atomically swappable: readers snapshot this shared_ptr, writers
 	   create a new vector and exchange the pointer. */

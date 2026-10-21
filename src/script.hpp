@@ -14,6 +14,7 @@ namespace rvs {
 struct SandboxTenant;
 struct MachineInstance;
 struct TenantConfig;
+struct FetchState;
 
 class Script {
 public:
@@ -100,6 +101,10 @@ public:
 	gaddr_t resolve_address(const char* name) const;
 	auto    callsite(gaddr_t addr) const { return machine().memory.lookup(addr); }
 
+	/* Outgoing HTTP requests of the current task (script_fetch.cpp) */
+	FetchState& fetch_state();
+	void fetch_reset();
+
 	void set_sigaction(int sig, gaddr_t handler);
 	void print_backtrace(const gaddr_t addr);
 	void open_debugger(uint16_t);
@@ -126,6 +131,8 @@ public:
 	   dropped. */
 	bool reset_to_master(bool restore);
 	bool is_persistent() const noexcept { return m_persistent; }
+	/* A task's VM, forked from the master */
+	bool is_fork() const noexcept { return m_parent != nullptr; }
 
 private:
 	void handle_exception(gaddr_t);
@@ -156,6 +163,7 @@ private:
 	bool        m_last_newline = true;
 	gaddr_t     m_sighandler = 0;
 	struct VSHA256Context* m_sha_ctx = nullptr;
+	FetchState* m_fetch = nullptr;
 
 	Cache<struct vre> m_regex;
 	vcl::TaskState m_vcl_task;

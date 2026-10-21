@@ -90,7 +90,7 @@ build_deb() {
 	apt-get install -y --no-install-recommends \
 		build-essential debhelper dh-autoreconf devscripts fakeroot \
 		autoconf automake libtool pkg-config cmake make \
-		libssl-dev python3 python3-docutils \
+		libssl-dev libcurl4-openssl-dev python3 python3-docutils \
 		"$vcp_pkg" "$vcp_dev"
 
 	# Ensure a C++20-capable compiler. Ubuntu jammy defaults to g++-11; pull in
@@ -186,7 +186,7 @@ build_rpm() {
 	# tar/gzip are needed by `make dist' and rpmbuild and are not preinstalled on
 	# the Amazon Linux 2023 base image.
 	$PM install -y \
-		rpm-build make cmake python3 pkgconfig openssl-devel tar gzip \
+		rpm-build make cmake python3 pkgconfig openssl-devel libcurl-devel tar gzip \
 		autoconf automake libtool \
 		"$vcp_pkg" "$vcp_dev"
 

@@ -10,6 +10,7 @@ add_vmod(vmod_riscv vmod_riscv.vcc "Low-Latency Configuration VMOD"
 	script_debug.cpp
 	script_functions.cpp
 	script_base64.cpp
+	script_fetch.cpp
 	script_sha256.cpp
 	tenancy.cpp
 	varnish_cpp_interface.cpp
@@ -51,6 +52,11 @@ target_compile_definitions(riscv PUBLIC RISCV_SYSCALLS_MAX=601)
 add_subdirectory(../ext/json ext_json)
 find_package(OpenSSL REQUIRED)
 target_link_libraries(vmod_riscv riscv nlohmann_json::nlohmann_json OpenSSL::Crypto)
+# ECALL_FETCH uses libcurv, which varnishd (Enterprise) links and starts
+if (VARNISH_PLUS)
+	find_package(CURL REQUIRED)
+	target_link_libraries(vmod_riscv CURL::libcurl)
+endif()
 
 # Find mimalloc (optional)
 find_package(mimalloc QUIET)

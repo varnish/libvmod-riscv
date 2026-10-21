@@ -199,6 +199,7 @@ bool Script::reset_to_master(bool restore)
 	m_is_paused = false;
 	m_sighandler = source.m_sighandler;
 	m_sha_ctx = nullptr;
+	fetch_reset();
 	m_post_data = 0;
 	m_last_newline = true;
 	m_ctx = nullptr;
@@ -251,6 +252,7 @@ Script::Script(
 
 Script::~Script()
 {
+	fetch_reset();
 	// free any owned regex pointers
 	m_regex.foreach_owned(
 		[] (auto& entry) {

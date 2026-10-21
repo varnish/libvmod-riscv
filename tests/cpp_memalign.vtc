@@ -1,0 +1,80 @@
+varnishtest "C++ guest: aligned allocations on the native heap, with holes too small for the padding"
+
+feature cmd "ls /usr/bin/riscv64-linux-gnu-g++* >/dev/null 2>&1"
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include <api.h>
+#include <cstdint>
+#include <cstdlib>
+#include <string>
+static std::string result;
+static bool aligned(void* p, uintptr_t align) {
+	return p != nullptr && ((uintptr_t)p & (align-1)) == 0;
+}
+static const char* go(const char*, size_t)
+{
+	/* 16-byte holes: picked first for a 16-byte chunk, never aligned
+	   to a page, and too small to hold the padding in front of one */
+	void* chunks[64];
+	for (auto& chunk : chunks)
+		chunk = malloc(16);
+	for (unsigned i = 1; i < 64; i += 2)
+		free(chunks[i]);
+	unsigned ok = 0;
+	void* big[8];
+	for (auto& p : big) {
+		p = aligned_alloc(4096, 16);
+		ok += aligned(p, 4096);
+	}
+	void* p64 = nullptr;
+	ok += posix_memalign(&p64, 64, 100) == 0 && aligned(p64, 64);
+	void* p32 = aligned_alloc(32, 48);
+	ok += aligned(p32, 32);
+	for (auto* p : big)
+		free(p);
+	free(p64);
+	free(p32);
+	for (unsigned i = 0; i < 64; i += 2)
+		free(chunks[i]);
+	result = "ok=" + std::to_string(ok);
+	return result.c_str();
+}
+int main() {
+	api::register_function("go", go);
+	api::wait_for_requests([] (api::Request) {});
+}
+EOF
+}
+
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"t": {
+				"filename": "${tmpdir}/${testname}.cpp",
+				"group": "test"
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+	sub vcl_recv {
+		if (!riscv.fork("t")) { return (synth(500)); }
+		set req.http.X-R = riscv.call("go", "");
+		return (synth(200));
+	}
+	sub vcl_synth {
+		set resp.http.X-R = req.http.X-R;
+	}
+} -start
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.http.X-R == "ok=10"
+	txreq
+	rxresp
+	expect resp.http.X-R == "ok=10"
+} -run

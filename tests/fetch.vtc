@@ -1,0 +1,231 @@
+varnishtest "ECALL_FETCH: concurrent GETs, wait for any and all, POST, allow list and limits"
+
+feature cmd "varnishd -V 2>&1 | grep -q varnish-plus"
+# The VMOD logs this at tenant load when it has no ECALL_FETCH (built
+# without Varnish Enterprise, or with libcurl older than 7.62)
+feature cmd "! grep -q 'ECALL_FETCH is disabled' ${VMOD_SO}"
+
+server s1 {
+	rxreq
+	expect req.method == "GET"
+	expect req.url == "/one"
+	expect req.http.X-Test == "1"
+	txresp -hdr "X-Server: s1" -body "one"
+} -start
+
+server s2 {
+	rxreq
+	delay 1
+	txresp -hdr "X-Server: s2" -body "two"
+} -start
+
+server s3 {
+	rxreq
+	txresp -status 404 -hdr "X-Server: s3" -body "three"
+} -start
+
+server s4 {
+	rxreq
+	expect req.method == "POST"
+	expect req.url == "/post/x"
+	expect req.http.Content-Type == "text/plain"
+	expect req.http.Expect == <undef>
+	expect req.body == "hello post"
+	txresp -body "posted"
+} -start
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+struct fetch_response {
+	int32_t status;
+	int32_t error;
+	char*   body;
+	size_t  body_len;
+	char*   headers;
+	size_t  headers_len;
+};
+
+static long ecall7(long op, long a1, long a2, long a3, long a4, long a5, long a6)
+{
+	register long a0_ asm("a0") = op;
+	register long a1_ asm("a1") = a1;
+	register long a2_ asm("a2") = a2;
+	register long a3_ asm("a3") = a3;
+	register long a4_ asm("a4") = a4;
+	register long a5_ asm("a5") = a5;
+	register long a6_ asm("a6") = a6;
+	register long syscall_id asm("a7") = ECALL_FETCH;
+	asm volatile ("ecall" : "+r"(a0_) : "r"(a1_), "r"(a2_), "r"(a3_), "r"(a4_), "r"(a5_), "r"(a6_), "r"(syscall_id) : "memory");
+	return a0_;
+}
+
+static long slen(const char* s)
+{
+	long n = 0;
+	while (s[n]) n++;
+	return n;
+}
+static bool contains(const char* s, long len, const char* what)
+{
+	const long wlen = slen(what);
+	for (long i = 0; i + wlen <= len; i++) {
+		long j = 0;
+		while (j < wlen && s[i+j] == what[j]) j++;
+		if (j == wlen) return true;
+	}
+	return false;
+}
+
+static long get(const char* url, const char* hdrs = "", long flags = 0)
+{
+	return ecall7(FETCH_GET | flags, (long)url, slen(url), (long)hdrs, slen(hdrs), 0, 0);
+}
+static long post(const char* url, const char* hdrs, const char* body)
+{
+	return ecall7(FETCH_POST, (long)url, slen(url), (long)hdrs, slen(hdrs), (long)body, slen(body));
+}
+static long wait(long flags, int32_t* h, long n, fetch_response* r, long timeout_ms)
+{
+	return ecall7(FETCH_WAIT | flags, (long)h, n, (long)r, timeout_ms, 0, 0);
+}
+
+static char out[1024];
+static long outlen = 0;
+static void put(const char* s, long n) { for (long i = 0; i < n; i++) out[outlen++] = s[i]; }
+static void put_num(long v) { char b[8]; int n = 0; do { b[n++] = '0' + v % 10; v /= 10; } while (v); while (n) out[outlen++] = b[--n]; }
+static void put_resp(const fetch_response& r) { put_num(r.status); put(":", 1); put(r.body, r.body_len); put(";", 1); }
+
+static const char mime[] = "text/plain";
+static void fail(const char* why)
+{
+	synth(500, mime, sizeof(mime)-1, why, slen(why));
+}
+
+/* The master VM outlives every task: it may not start requests */
+static long from_main = 0;
+
+static void on_recv(int req)
+{
+	decision("synth", 5, 200);
+}
+
+void on_synth()
+{
+	const char* u1 = "http://${s1_addr}:${s1_port}/one";
+	const char* u2 = "http://${s2_addr}:${s2_port}/two";
+	const char* u3 = "http://${s3_addr}:${s3_port}/three";
+
+	int32_t h[3] = { (int32_t)get(u1, "X-Test: 1\r\n"), (int32_t)get(u2), (int32_t)get(u3) };
+	if (h[0] < 0 || h[1] < 0 || h[2] < 0) fail("send");
+	fetch_response r[3];
+
+	/* s2 answers after a second */
+	const long polled = wait(0, h, 3, r, 0);
+	if (polled < 0 || polled > 2 || h[1] == -1) fail("poll");
+	/* Returns as soon as one is done: not with s2, unless it is the last */
+	const long any = wait(FETCH_FLAG_ANY, h, 3, r, -1);
+	if (any < 1 || (polled + any < 3 && h[1] == -1)) fail("wait any");
+	const long all = wait(0, h, 3, r, -1);
+	if (polled + any + all != 3 || h[0] != -1 || h[1] != -1 || h[2] != -1) fail("wait all");
+	if (wait(0, h, 3, r, -1) != 0) fail("wait done");
+	for (int i = 0; i < 3; i++) {
+		if (r[i].error != 0 || r[i].body[r[i].body_len] != 0) fail("response");
+		put_resp(r[i]);
+	}
+	if (!contains(r[0].headers, r[0].headers_len, "X-Server: s1\n")) fail("headers");
+
+	int32_t hp = post("http://${s4_addr}:${s4_port}/post/x", "Content-Type: text/plain", "hello post");
+	if (hp < 0 || wait(0, &hp, 1, r, 5000) != 1 || r[0].error != 0) fail("post");
+	put_resp(r[0]);
+
+	/* Refused */
+	if (get("http://${s4_addr}:${s4_port}/other") != FETCH_EACCES) fail("path");
+	if (get("http://user:secret@example.com/") != FETCH_EACCES) fail("host");
+	if (get("http://${s1_addr}:${s1_port}/one\\r\\nX-Evil: 1") != FETCH_EINVAL) fail("url");
+	if (get("ftp://${s1_addr}:${s1_port}/") != FETCH_EINVAL) fail("scheme");
+	if (get(u1, "Bad Name: x") != FETCH_EINVAL) fail("header");
+	if (get(u1, "Host : internal.example.com") != FETCH_EINVAL) fail("header name");
+	if (get(u1, "X-Test: 1\rHost: internal.example.com") != FETCH_EINVAL) fail("bare CR");
+	if (get(u1, "Host: internal.example.com") != FETCH_EINVAL) fail("host header");
+	if (get(u1, "X-Test: 1\r\ncontent-LENGTH: 0") != FETCH_EINVAL) fail("framing header");
+	if (from_main != FETCH_EACCES) fail("main");
+	if (get(u1, "", 0x8000) != FETCH_EINVAL) fail("flags");
+	int32_t bad = 42;
+	if (wait(0, &bad, 1, r, 0) != FETCH_EINVAL) fail("handle");
+	if (ecall7(FETCH_FREE, 42, 0, 0, 0, 0, 0) != FETCH_EINVAL) fail("free");
+
+	/* max_requests is 5: four sent so far */
+	const long h5 = get(u3);
+	if (h5 < 0 || ecall7(FETCH_FREE, h5, 0, 0, 0, 0, 0) != 0) fail("abandon");
+	if (get(u3) != FETCH_ELIMIT) fail("limit");
+
+	put("ok", 2);
+	synth(200, mime, sizeof(mime)-1, out, outlen);
+}
+
+void start(int argc, char** argv) {
+	from_main = get("http://${s1_addr}:${s1_port}/one");
+	register_callback(3, (void(*)())on_synth);
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test",
+				"fetch": {
+					"allow": [
+						"http://${s1_addr}:${s1_port}/",
+						"http://${s2_addr}:${s2_port}/",
+						"http://${s3_addr}:${s3_port}",
+						"http://${s4_addr}:${s4_port}/post/"
+					],
+					"max_requests": 5
+				}
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		return (synth(riscv.want_status()));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.vcall(ON_SYNTH);
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	txreq -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "200:one;200:two;404:three;200:posted;ok"
+} -run
+
+logexpect l1 -v v1 -g raw -d 1 {
+	expect * * VCL_Error "fetch: URL not allowed: http://example.com/"
+} -run
+
+server s1 -wait
+server s2 -wait
+server s4 -wait

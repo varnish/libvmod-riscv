@@ -17,6 +17,8 @@
 # derives each crate's disambiguator from a path dependency's *absolute*
 # path, and that reaches every symbol name and so the layout of .text. A
 # fixed path is what makes the blob come out identical for everyone.
+# Zig's __anon_<N> symbols (from the musl it links in) are stripped: since
+# 0.17 N carries the id of the compiler thread that made it.
 ROOT := $(abspath ..)
 CHECKOUT_TARGET := $(CURDIR)/target
 
@@ -43,5 +45,6 @@ blob:
 	cd $(STAGE)/vclc && \
 	  RUSTFLAGS='$(GUEST_RUSTFLAGS)' CARGO_TARGET_DIR='$(CHECKOUT_TARGET)' \
 	  cargo build --release
-	$(OBJCOPY) --strip-debug --discard-locals $(CHECKOUT_TARGET)/riscv64gc-unknown-linux-musl/release/vclc ../vclc.elf
+	$(OBJCOPY) --strip-debug --discard-locals --wildcard --strip-symbol='__anon_*' \
+	  $(CHECKOUT_TARGET)/riscv64gc-unknown-linux-musl/release/vclc ../vclc.elf
 	rm -rf $(STAGE)

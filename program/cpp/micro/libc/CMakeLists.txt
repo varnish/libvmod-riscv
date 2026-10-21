@@ -1,5 +1,3 @@
-option(LIBC_WRAP_NATIVE "" OFF)
-
 set(LIBC_SOURCES
 	engine.cpp
 	write.cpp
@@ -7,11 +5,13 @@ set(LIBC_SOURCES
 	${BBLIBCPATH}/libcxx.cpp
   )
 if (GCC_TRIPLE STREQUAL "riscv32-unknown-elf" OR GCC_TRIPLE STREQUAL "riscv64-unknown-elf")
-	# There is a problem with heap on 64-bit
 	list(APPEND LIBC_SOURCES
 		assert.cpp
 		${BBLIBCPATH}/heap.cpp
 	)
+else()
+	# musl and glibc: the native heap, see micro.cmake
+	list(APPEND LIBC_SOURCES heap_linux.cpp)
 endif()
 if (NOT USE_NEWLIB)
 	list(APPEND LIBC_SOURCES start.cpp)
@@ -26,10 +26,9 @@ target_include_directories(libc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(libc PUBLIC
 	NATIVE_MEM_SYSCALLS=580
 )
-if (LIBC_WRAP_NATIVE)
-	target_compile_definitions(libc PRIVATE
-		WRAP_NATIVE_SYSCALLS=1)
-endif()
+# micro.cmake wraps the C library's allocator with the native heap
+target_compile_definitions(libc PRIVATE
+	WRAP_NATIVE_SYSCALLS=1)
 
 if (GCC_TRIPLE STREQUAL "riscv64-linux-musl")
 	target_compile_definitions(libc PRIVATE

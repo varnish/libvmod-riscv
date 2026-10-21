@@ -111,6 +111,40 @@ if (req.http.X-JWT-Sub == "") {
 }
 ```
 
+## Outgoing HTTP requests
+
+On Varnish Enterprise, a tenant can make HTTP and HTTPS GET and POST requests with the `ECALL_FETCH` system call. They are run by libcurv, the HTTP engine that varnishd links and starts (the one behind vmod_http), so several requests can be in flight at once while the program carries on. The program then waits for any or all of them. A tenant may only reach the URLs its `fetch` allow list permits; without one, every request is refused:
+```json
+"api.example.com": {
+	"filename": "/path/to/program",
+	"group": "test",
+	"fetch": {
+		"allow": ["https://api.example.com/v1/", "http://10.0.0.5:8080/"],
+		"max_requests": 8,
+		"timeout_ms": 5000,
+		"connect_timeout_ms": 2000,
+		"max_request_body": 1048576,
+		"max_response_body": 16777216,
+		"allow_insecure": false
+	}
+}
+```
+An allow entry is a scheme, host, port (the scheme's default when not given) and path prefix, and both the entries and the program's URLs are parsed by curl. Write a prefix with a trailing slash, unless any path that starts with it is fine. Redirects are not followed, and the program may not set the headers that pick the virtual host or frame the message (`Host`, `Content-Length`, `Transfer-Encoding`, `Connection` and the like). `max_requests` is per task, `timeout_ms` bounds every transfer, and `allow_insecure` decides whether a request may skip TLS certificate verification (for self-signed certificates). The other values shown are the defaults.
+
+```cpp
+int32_t h[3] = {
+	api::fetch_get("https://api.example.com/v1/a", "Accept: application/json"),
+	api::fetch_get("https://api.example.com/v1/b"),
+	api::fetch_post("http://10.0.0.5:8080/log", body, "Content-Type: text/plain"),
+};
+api::FetchResponse r[3];
+api::fetch_wait(h, r, FETCH_FLAG_ANY); // at least one is done: its handle is now -1
+api::fetch_wait(h, r);                 // all of them are done
+if (r[0].ok() && r[0].status() == 200)
+	use(r[0].body(), r[0].header("Content-Type"));
+```
+The whole response is handed over when a request finishes: the system call allocates its body and headers on the program's native heap, with the exact sizes, and `FetchResponse` frees them. See `ECALL_FETCH` in [syscalls.h](/src/machine/syscalls.h) for the system call itself.
+
 ## JavaScript example program
 
 Tenant logic can also be written in plain JavaScript, powered by the embedded [QuickJS-ng](https://github.com/nicowillis/quickjs-ng) engine. No compiler or external toolchain is required: the QuickJS program is embedded in the VMOD. Point `"filename"` at a `.js` file:
@@ -126,7 +160,7 @@ sub vcl_init {
 }
 ```
 
-The VMOD runs the embedded program with the file as its last argument. A reload loads the file again if it has changed, and `live_update_file()` with a `.js` file replaces the script. After changing `program/cpp/js.cpp`, rebuild the embedded program with `make -C program blob` (Zig 0.14.0 and llvm-objcopy) and commit `program/js.elf`.
+The VMOD runs the embedded program with the file as its last argument. A reload loads the file again if it has changed, and `live_update_file()` with a `.js` file replaces the script. After changing `program/cpp/js.cpp`, rebuild the embedded program with `make -C program blob` (Zig 0.17.0 and llvm-objcopy) and commit `program/js.elf`.
 
 The source can also be passed as a string directly in your VCL via `add_main_argument`, with the tenant `filename` pointing at a `js` binary built from `program/cpp/js.cpp`:
 

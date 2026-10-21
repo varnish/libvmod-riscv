@@ -54,3 +54,36 @@
 #define BASE64_FLAG_DECODE 0x1
 #define BASE64_FLAG_URL    0x2
 #define BASE64_FLAG_NOPAD  0x4
+
+/* Outgoing HTTP(S), Varnish Enterprise only (libcurv). The operation is in
+   the low byte of a0 and its flags above it:
+     GET:  a1,a2 = URL  a3,a4 = request headers ("Name: value" lines)
+     POST: GET + a5,a6 = request body
+           -> a handle, or a negative FETCH_E*
+     WAIT: a1 = int32_t handles[]  a2 = count
+           a3 = struct fetch_response[count]  a4 = timeout in ms (<0: none)
+           -> the number of handles it completed. A completed handle is set
+           to -1 and its response filled in; body and headers are on the
+           native heap (sys_free() them).
+     FREE: a1 = handle: abandon the request.
+   struct fetch_response {
+       int32_t status;  // HTTP status, 0 when the transfer failed
+       int32_t error;   // CURLcode, 0 is success
+       char*   body;    size_t body_len;     // NUL-terminated
+       char*   headers; size_t headers_len;  // "Name: value\n" lines
+   }; */
+#define ECALL_FETCH (SYSCALL_BASE+71)
+#define FETCH_GET   0
+#define FETCH_POST  1
+#define FETCH_WAIT  2
+#define FETCH_FREE  3
+#define FETCH_OP_MASK        0xFF
+#define FETCH_FLAG_INSECURE  0x100 /* GET/POST: accept any TLS certificate */
+#define FETCH_FLAG_ANY       0x100 /* WAIT: return when any handle is done */
+#define FETCH_EINVAL  (-1) /* Bad arguments, or unknown handle */
+#define FETCH_EACCES  (-2) /* URL not allowed for this tenant */
+#define FETCH_ELIMIT  (-3) /* Too many requests in this task */
+#define FETCH_EBUSY   (-4) /* The HTTP engine is out of capacity */
+#define FETCH_ENOSYS  (-5) /* Not available in this Varnish */
+#define FETCH_EPENDING (-6) /* Not finished (the guest API's FetchResponse) */
+#define FETCH_EPENDING (-6) /* Not finished (the guest API's FetchResponse) */

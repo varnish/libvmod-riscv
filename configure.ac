@@ -57,6 +57,12 @@ AC_SUBST([VARNISH_LIBRARY_PATH],
 AM_CONDITIONAL([BUILD_RISCV_FOR_VCP],
 	[test -d ${LIBVARNISHAPI_LIBDIR}/varnish-plus])
 
+dnl ECALL_FETCH uses libcurv, which only Varnish Enterprise has
+AM_COND_IF([BUILD_RISCV_FOR_VCP], [
+	PKG_CHECK_MODULES([CURL], [libcurl], [],
+		[AC_MSG_ERROR([libcurl not found. Install libcurl4-openssl-dev or libcurl-devel.])])
+])
+
 dnl Match the static defines the CMake build bakes into config.h
 AC_DEFINE([HAVE_OBJITERATE_F], [1], [Define if ObjIterate has the final flag])
 AC_DEFINE([HAVE_GETPEEREID], [1], [Define if getpeereid() is available])

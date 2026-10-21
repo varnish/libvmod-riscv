@@ -181,6 +181,19 @@ static void configure_tenant(TenantGroup& group, const T& obj)
 	if (obj.contains("max_instructions")) {
 		group.max_instructions = obj["max_instructions"];
 	}
+	if (obj.contains("fetch")) {
+		const auto& f = obj["fetch"];
+		FetchConfig fetch;
+		fetch.allow = f.value("allow", fetch.allow);
+		fetch.max_requests = f.value("max_requests", fetch.max_requests);
+		fetch.timeout_ms = f.value("timeout_ms", fetch.timeout_ms);
+		fetch.connect_timeout_ms = f.value("connect_timeout_ms", fetch.connect_timeout_ms);
+		fetch.max_request_body = f.value("max_request_body", fetch.max_request_body);
+		fetch.max_response_body = f.value("max_response_body", fetch.max_response_body);
+		fetch.allow_insecure = f.value("allow_insecure", fetch.allow_insecure);
+		fetch.compile();
+		group.fetch = std::make_shared<const FetchConfig>(std::move(fetch));
+	}
 	if (obj.contains("arguments")) {
 		group.argv = std::make_shared<std::vector<std::string>>(
 			obj["arguments"].template get<std::vector<std::string>>());

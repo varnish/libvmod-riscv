@@ -72,6 +72,7 @@ bool TenantConfig::same_as(const TenantConfig& other) const
 		&& a.max_backends == b.max_backends
 		&& a.max_regex == b.max_regex
 		&& a.verbose == b.verbose
+		&& (a.fetch == b.fetch || (a.fetch && b.fetch && *a.fetch == *b.fetch))
 		&& *rvs::atomic_load(&a.argv) == *rvs::atomic_load(&b.argv);
 }
 
@@ -225,10 +226,8 @@ void pool_key_create()
 	AZ(pthread_key_create(&pool_key,
 		[] (void* pool) { delete (ForkPool*) pool; }));
 	/* The key's destructor is in this VMOD, and runs whenever a worker
-	   thread exits. Keep the VMOD loaded after its last VCL is gone. */
-	Dl_info info;
-	if (dladdr((void*) &pool_key_create, &info) && info.dli_fname != nullptr)
-		(void) dlopen(info.dli_fname, RTLD_NOW | RTLD_NODELETE);
+	   thread exits */
+	SandboxTenant::pin_vmod();
 }
 
 ForkPool& fork_pool()
@@ -245,6 +244,16 @@ ForkPool& fork_pool()
 }
 
 long SandboxTenant::pooled_count() { return pooled_vms.load(); }
+
+void SandboxTenant::pin_vmod()
+{
+	static pthread_once_t once = PTHREAD_ONCE_INIT;
+	AZ(pthread_once(&once, [] {
+		Dl_info info;
+		if (dladdr((void*) &SandboxTenant::pin_vmod, &info) && info.dli_fname != nullptr)
+			(void) dlopen(info.dli_fname, RTLD_NOW | RTLD_NODELETE);
+	}));
+}
 
 Script* SandboxTenant::pool_acquire(VRT_CTX, std::shared_ptr<MachineInstance> prog)
 {
