@@ -18,6 +18,7 @@ EXTRA_DIST = \
 	ext \
 	src/libriscv \
 	vcl/vclc.elf \
+	program/js.elf \
 	demo
 
 # Ship the demo/example VCL alongside the module.

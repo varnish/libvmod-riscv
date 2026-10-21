@@ -1,5 +1,6 @@
 #include "sandbox_tenant.hpp"
 #include "varnish.hpp"
+#include "js/js_program.hpp"
 extern "C" {
 #include "update_result.h"
 }
@@ -156,6 +157,12 @@ int riscv_update_file(VRT_CTX, rvs::SandboxTenant* vrm,
 			/* A compiled policy has no serialized state to hand over. */
 			MachineInstance::retire(
 				rvs::atomic_exchange(&vrm->program, rvs::vcl::load(path, ctx, vrm)));
+			return 1;
+		}
+		if (rvs::js::is_js_source(path)) {
+			/* The script is the program's argument, and replaces it. */
+			MachineInstance::retire(
+				rvs::atomic_exchange(&vrm->program, rvs::js::load(path, ctx, vrm)));
 			return 1;
 		}
 		auto binary = file_loader(path);

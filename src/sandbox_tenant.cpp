@@ -2,6 +2,7 @@
 #include "varnish.hpp"
 #include <libriscv/util/crc32.hpp>
 #include "builder/builder.hpp"
+#include "js/js_program.hpp"
 #include <atomic>
 #include <climits>
 #include <dlfcn.h>
@@ -115,6 +116,11 @@ void SandboxTenant::load(VRT_CTX)
 		// A .vcl file is compiled to a tenant program, inside the sandbox
 		if (vcl::is_vcl_source(filename)) {
 			this->program = vcl::load(filename, ctx, this);
+			return;
+		}
+		// A .js file is run by the embedded QuickJS program
+		if (js::is_js_source(filename)) {
+			this->program = js::load(filename, ctx, this);
 			return;
 		}
 		// If the filename begins with "rust:", build it as a Rust project

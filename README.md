@@ -113,9 +113,22 @@ if (req.http.X-JWT-Sub == "") {
 
 ## JavaScript example program
 
-Tenant logic can also be written in plain JavaScript, powered by the embedded [QuickJS-ng](https://github.com/nicowillis/quickjs-ng) engine. No compiler or external toolchain is required — the JavaScript source is passed as a string directly in your VCL via `add_main_argument`.
+Tenant logic can also be written in plain JavaScript, powered by the embedded [QuickJS-ng](https://github.com/nicowillis/quickjs-ng) engine. No compiler or external toolchain is required: the QuickJS program is embedded in the VMOD. Point `"filename"` at a `.js` file:
 
-Point the tenant `filename` at the `js` binary built with the VMOD:
+```vcl
+sub vcl_init {
+    riscv.embed_tenants("""{
+        "customer1.com": {
+            "filename": "/path/to/customer1.js"
+        }
+    }""");
+    riscv.finalize_tenants();
+}
+```
+
+The VMOD runs the embedded program with the file as its last argument. A reload loads the file again if it has changed, and `live_update_file()` with a `.js` file replaces the script. After changing `program/cpp/js.cpp`, rebuild the embedded program with `make -C program blob` (Zig 0.14.0 and llvm-objcopy) and commit `program/js.elf`.
+
+The source can also be passed as a string directly in your VCL via `add_main_argument`, with the tenant `filename` pointing at a `js` binary built from `program/cpp/js.cpp`:
 
 ```vcl
 sub vcl_init {
