@@ -5,11 +5,15 @@
 #include "varnish.hpp"
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstring>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <vector>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 /* A build without libcurv (the fuzzer) defines FETCH_SUPPORTED=0 */
 #ifndef FETCH_SUPPORTED
 # ifdef VARNISH_PLUS
@@ -147,15 +151,58 @@ static std::string loggable_url(const char* url)
 	return url_part(u.get(), CURLUPART_URL).value_or("");
 }
 
-void FetchConfig::compile()
+/* The files are read by curl at each new connection, on an engine thread
+   of the worker process: check now that this process can open them, as
+   curl will. A file that goes away later fails the requests that need
+   it, and deliver() logs those as errors. */
+static void check_tls_file(const std::string& url, const char* what, const std::string& path)
+{
+	if (path.empty())
+		return;
+	if (path.front() != '/')
+		throw std::runtime_error("fetch: " + std::string(what) + " must be an absolute path: " + path);
+	const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		throw std::runtime_error("fetch: can not read " + std::string(what) + " "
+			+ path + " (for " + url + "): " + std::strerror(errno));
+	struct stat st;
+	const bool regular = fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
+	close(fd);
+	if (!regular)
+		throw std::runtime_error("fetch: " + std::string(what) + " is not a file: " + path);
+}
+
+static bool same_prefix(const FetchRule& a, const FetchRule& b)
+{
+	return a.scheme == b.scheme && a.host == b.host
+		&& a.port == b.port && a.path == b.path;
+}
+
+void FetchConfig::compile(const std::vector<FetchAllow>& allow)
 {
 	if (timeout_ms == 0)
 		throw std::runtime_error("fetch: timeout_ms must be above zero");
 	rules.clear();
 	for (const auto& entry : allow) {
-		auto parsed = parse_url(entry);
+		auto parsed = parse_url(entry.url);
 		if (!parsed)
-			throw std::runtime_error("fetch: invalid allow entry (an http or https URL): " + entry);
+			throw std::runtime_error("fetch: invalid allow entry (an http or https URL): " + entry.url);
+		const FetchTLS& tls = entry.tls;
+		if (!tls.empty() && parsed->origin.scheme != "https")
+			throw std::runtime_error("fetch: TLS files on an allow entry that is not https: " + entry.url);
+		/* Without the slash, "/mtls" would give its files to "/mtlsX" */
+		if (!tls.empty() && !parsed->origin.path.ends_with('/'))
+			throw std::runtime_error("fetch: the path of an allow entry with TLS files must end with a slash: " + entry.url);
+		if (!tls.client_key.empty() && tls.client_cert.empty())
+			throw std::runtime_error("fetch: client_key without client_cert: " + entry.url);
+		check_tls_file(entry.url, "ca_file", tls.ca_file);
+		check_tls_file(entry.url, "client_cert", tls.client_cert);
+		check_tls_file(entry.url, "client_key", tls.client_key);
+		parsed->origin.tls = tls;
+		/* Only one of them would ever be used */
+		for (const auto& rule : rules)
+			if (same_prefix(rule, parsed->origin) && rule.tls != tls)
+				throw std::runtime_error("fetch: allow entries for the same URL with other TLS files: " + entry.url);
 		rules.push_back(std::move(parsed->origin));
 	}
 	/* A request that its task abandoned runs on in libcurv, which calls
@@ -165,16 +212,105 @@ void FetchConfig::compile()
 }
 
 /* Path prefixes are compared as they are written: an entry should end
-   with a slash, unless any path that starts with it is fine. They are
-   no boundary for a server that decodes %2e%2e in a path. */
-static bool allowed(const FetchConfig& cfg, const FetchRule& origin)
+   with a slash, unless any path that starts with it is fine. Of the
+   rules that allow a URL, the one with the longest prefix gives its TLS
+   files. A path that a server could take above the prefix is refused by
+   fetch_send(), see climbs_up(). */
+static const FetchRule* allowed(const FetchConfig& cfg, const FetchRule& origin)
 {
+	const FetchRule* best = nullptr;
 	for (const auto& rule : cfg.rules) {
 		if (rule.scheme == origin.scheme && rule.host == origin.host
-			&& rule.port == origin.port && origin.path.starts_with(rule.path))
+			&& rule.port == origin.port && origin.path.starts_with(rule.path)
+			&& (best == nullptr || rule.path.size() > best->path.size()))
+			best = &rule;
+	}
+	return best;
+}
+
+/* curl removes the "." and ".." segments of a path, but a server may
+   decode %2e%2e or %2f into one, split segments at a backslash too, or
+   take "..;x" as ".." with a parameter. Decoded until nothing changes,
+   for servers that decode twice. */
+static bool climbs_up(std::string_view path)
+{
+	auto hex = [] (char c) -> int {
+		if (c >= '0' && c <= '9')
+			return c - '0';
+		c |= 0x20;
+		return (c >= 'a' && c <= 'f') ? c - 'a' + 10 : -1;
+	};
+	std::string decoded(path);
+	while (decoded.find('%') != decoded.npos) {
+		std::string next;
+		next.reserve(decoded.size());
+		for (size_t i = 0; i < decoded.size(); i++) {
+			int hi, lo;
+			if (decoded[i] == '%' && i + 2 < decoded.size()
+				&& (hi = hex(decoded[i+1])) >= 0 && (lo = hex(decoded[i+2])) >= 0) {
+				next.push_back(char(hi << 4 | lo));
+				i += 2;
+			} else {
+				next.push_back(decoded[i]);
+			}
+		}
+		if (next == decoded)
+			break;
+		decoded = std::move(next);
+	}
+	size_t start = 0;
+	while (start <= decoded.size()) {
+		size_t end = decoded.find_first_of("/\\", start);
+		if (end == decoded.npos)
+			end = decoded.size();
+		std::string_view segment(decoded.data() + start, end - start);
+		if (segment.substr(0, segment.find(';')) == "..")
 			return true;
+		start = end + 1;
 	}
 	return false;
+}
+
+/* curl before 7.83.1 could reuse a connection, or resume a TLS session,
+   made with other TLS files (CVE-2022-27782). libcurv's connections are
+   shared by every tenant and vmod_http: another request to the origin
+   could go out with this client certificate, or this one over a
+   connection that was verified with other CAs. */
+static bool tls_reuse_is_safe()
+{
+	static const bool safe =
+		curl_version_info(CURLVERSION_NOW)->version_num >= 0x075301;
+	return safe;
+}
+
+static void set_tls_files(struct curv_req* req, const FetchTLS& tls)
+{
+	if (tls.empty())
+		return;
+	if (!tls.ca_file.empty()) {
+		/* These CAs only, not the system's as well. A TLS backend
+		   without CA paths refuses even to unset one, and has none. */
+		CURL_EASYSET(req, CURLOPT_CAINFO, tls.ca_file.c_str());
+		(void)curl_easy_setopt(req->easy, CURLOPT_CAPATH, (const char *)nullptr);
+#if LIBCURL_VERSION_NUM >= 0x075700
+		/* curl caches one CA store per multi handle, by file name. Not
+		   using it reads the file at each new connection, so that a new
+		   one is seen at once, and leaves the store of other requests
+		   (the system CAs of vmod_http) in the cache. A libcurl older
+		   than the headers has no such cache, and refuses the option. */
+		(void)curl_easy_setopt(req->easy, CURLOPT_CA_CACHE_TIMEOUT, 0L);
+#endif
+	}
+	if (!tls.client_cert.empty()) {
+		CURL_EASYSET(req, CURLOPT_SSLCERT, tls.client_cert.c_str());
+		if (!tls.client_key.empty())
+			CURL_EASYSET(req, CURLOPT_SSLKEY, tls.client_key.c_str());
+	}
+	if (!tls_reuse_is_safe()) {
+		CURL_EASYSET(req, CURLOPT_FRESH_CONNECT, 1L);
+		CURL_EASYSET(req, CURLOPT_FORBID_REUSE, 1L);
+		CURL_EASYSET(req, CURLOPT_SSL_SESSIONID_CACHE, 0L);
+	}
 }
 
 /* Headers that frame the message or pick the virtual host are curl's to
@@ -273,13 +409,22 @@ static long fetch_send(machine_t& machine, Script& script, unsigned op, unsigned
 	auto parsed = parse_url(url_buf.to_string());
 	if (!parsed)
 		return FETCH_EINVAL;
-	const auto* ctx = script.ctx();
-	if (!allowed(cfg, parsed->origin)) {
+	auto refuse = [&] (const char* why) {
+		const auto* ctx = script.ctx();
 		if (ctx != nullptr && ctx->vsl != nullptr)
-			VSLb(ctx->vsl, SLT_VCL_Error, "[%s] fetch: URL not allowed: %s",
-				script.name().c_str(), loggable_url(parsed->url.c_str()).c_str());
+			VSLb(ctx->vsl, SLT_VCL_Error, "[%s] fetch: %s: %s",
+				script.name().c_str(), why, loggable_url(parsed->url.c_str()).c_str());
 		return FETCH_EACCES;
-	}
+	};
+	const FetchRule* rule = allowed(cfg, parsed->origin);
+	if (rule == nullptr)
+		return refuse("URL not allowed");
+	if (rule->path != "/" && climbs_up(parsed->origin.path))
+		return refuse("URL not allowed (a .. segment)");
+	/* The TLS files of an entry pin its origin, and a client certificate
+	   is not for a server that was not verified */
+	if ((flags & FETCH_FLAG_INSECURE) && !rule->tls.empty())
+		return refuse("insecure request to an origin with TLS files");
 
 	ReqGuard guard{curv_req_new(CURV_LABEL_OBJECT, "riscv.fetch")};
 	auto* req = guard.req;
@@ -315,6 +460,7 @@ static long fetch_send(machine_t& machine, Script& script, unsigned op, unsigned
 	CURL_EASYSET(req, CURLOPT_XFERINFOFUNCTION, body_limit_cb);
 	CURL_EASYSET(req, CURLOPT_XFERINFODATA, limit);
 	CURL_EASYSET(req, CURLOPT_NOPROGRESS, 0L);
+	set_tls_files(req, rule->tls);
 	if (flags & FETCH_FLAG_INSECURE) {
 		CURL_EASYSET(req, CURLOPT_SSL_VERIFYPEER, 0L);
 		CURL_EASYSET(req, CURLOPT_SSL_VERIFYHOST, 0L);
@@ -395,9 +541,16 @@ static void deliver(machine_t& machine, Script& script, struct curv_req* req, ga
 	if (ctx != nullptr && ctx->vsl != nullptr) {
 		char* url = nullptr;
 		curl_easy_getinfo(req->easy, CURLINFO_EFFECTIVE_URL, &url);
-		VSLb(ctx->vsl, SLT_VCL_Log, "[%s] fetch %s: %ld %s (%.3fs)",
+		/* The TLS files of an allow entry, gone or changed since the
+		   VCL was loaded: the operator's to fix */
+		const bool bad_file = cc == CURLE_SSL_CERTPROBLEM
+			|| cc == CURLE_SSL_CACERT_BADFILE;
+		VSLb(ctx->vsl, bad_file ? SLT_VCL_Error : SLT_VCL_Log,
+			"[%s] fetch %s: %ld %s%s (%.3fs)",
 			script.name().c_str(), loggable_url(url).c_str(), status,
-			curl_easy_strerror(cc), double(req->elapsed));
+			curl_easy_strerror(cc),
+			bad_file ? " (the TLS files of its allow entry)" : "",
+			double(req->elapsed));
 	}
 }
 
@@ -508,7 +661,7 @@ void fetch(machine_t& machine)
 
 /* Not a reason to refuse the tenant: without rules every request is
    refused, and the system call returns FETCH_ENOSYS anyway. */
-void FetchConfig::compile()
+void FetchConfig::compile(const std::vector<FetchAllow>&)
 {
 	rules.clear();
 #ifdef VARNISH_PLUS

@@ -1,0 +1,390 @@
+varnishtest "ECALL_FETCH: per-origin CA file and client certificate from the tenant config"
+
+feature cmd "varnishd -V 2>&1 | grep -q varnish-plus"
+feature cmd "! grep -q 'ECALL_FETCH is disabled' ${VMOD_SO}"
+feature cmd "command -v openssl"
+feature tls
+
+# A CA that signs the server and client certificates, and another CA
+shell {
+	set -e
+	cd ${tmpdir}
+	cat >ext.cnf <<-EOF
+	[server]
+	subjectAltName = IP:127.0.0.1
+	extendedKeyUsage = serverAuth
+	[client]
+	extendedKeyUsage = clientAuth
+	EOF
+	for ca in ca other-ca; do
+		openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=$ca" \
+			-keyout $ca.key -out $ca.pem 2>/dev/null
+	done
+	openssl req -newkey rsa:2048 -nodes -subj "/CN=server" \
+		-keyout server.key -out server.csr 2>/dev/null
+	openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+		-days 1 -extfile ext.cnf -extensions server -out server.crt 2>/dev/null
+	cat server.crt server.key >server.pem
+	openssl req -newkey rsa:2048 -nodes -subj "/CN=tenant-client" \
+		-keyout client.key -out client.csr 2>/dev/null
+	openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+		-days 1 -extfile ext.cnf -extensions client -out client.crt 2>/dev/null
+	cat client.crt client.key >client.pem
+}
+
+# Verified with ca_file
+server s1 {
+	tls_config {
+		cert = ${tmpdir}/server.pem
+	}
+	tls_handshake
+	expect tls.failed == false
+	rxreq
+	txresp -body "ca"
+} -start
+
+# Not signed by the CA of its allow entry
+server s2 {
+	tls_config {
+		cert = ${tmpdir}/server.pem
+	}
+	tls_handshake
+	expect tls.failed == true
+} -start
+
+# Mutual TLS: the client certificate of the most specific allow entry
+server s3 {
+	tls_config {
+		cert = ${tmpdir}/server.pem
+		client_vfy = required
+		client_vfy_ca = ${tmpdir}/ca.pem
+	}
+	tls_handshake
+	expect tls.failed == false
+	expect tls.cert.subject == "tenant-client"
+	rxreq
+	expect req.url == "/mtls/x"
+	txresp -body "mtls"
+} -start
+
+# Mutual TLS, from an allow entry without a client certificate
+server s4 {
+	tls_config {
+		cert = ${tmpdir}/server.pem
+		client_vfy = required
+		client_vfy_ca = ${tmpdir}/ca.pem
+	}
+	tls_handshake
+	expect tls.failed == true
+} -start
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+struct fetch_response {
+	int32_t status;
+	int32_t error;
+	char*   body;
+	size_t  body_len;
+	char*   headers;
+	size_t  headers_len;
+};
+
+static long ecall7(long op, long a1, long a2, long a3, long a4, long a5, long a6)
+{
+	register long a0_ asm("a0") = op;
+	register long a1_ asm("a1") = a1;
+	register long a2_ asm("a2") = a2;
+	register long a3_ asm("a3") = a3;
+	register long a4_ asm("a4") = a4;
+	register long a5_ asm("a5") = a5;
+	register long a6_ asm("a6") = a6;
+	register long syscall_id asm("a7") = ECALL_FETCH;
+	asm volatile ("ecall" : "+r"(a0_) : "r"(a1_), "r"(a2_), "r"(a3_), "r"(a4_), "r"(a5_), "r"(a6_), "r"(syscall_id) : "memory");
+	return a0_;
+}
+
+static long slen(const char* s)
+{
+	long n = 0;
+	while (s[n]) n++;
+	return n;
+}
+
+static char out[1024];
+static long outlen = 0;
+static void put(const char* s, long n) { for (long i = 0; i < n; i++) out[outlen++] = s[i]; }
+static void put_num(long v) { char b[8]; int n = 0; do { b[n++] = '0' + v % 10; v /= 10; } while (v); while (n) out[outlen++] = b[--n]; }
+
+static const char mime[] = "text/plain";
+static void fail(const char* why)
+{
+	synth(500, mime, sizeof(mime)-1, why, slen(why));
+}
+
+/* One GET: "status:body;", "failed;" or "refused;" */
+static void get(const char* url, long flags = 0)
+{
+	fetch_response r;
+	int32_t h = ecall7(FETCH_GET | flags, (long)url, slen(url), (long)"", 0, 0, 0);
+	if (h == FETCH_EACCES) { put("refused;", 8); return; }
+	if (h < 0) fail(url);
+	if (ecall7(FETCH_WAIT, (long)&h, 1, (long)&r, 5000, 0, 0) != 1) fail("wait");
+	if (r.error != 0) {
+		if (r.status != 0 || r.body != 0) fail("failed with a response");
+		put("failed;", 7);
+		return;
+	}
+	put_num(r.status); put(":", 1); put(r.body, r.body_len); put(";", 1);
+}
+
+static void on_recv(int req)
+{
+	decision("synth", 5, 200);
+}
+
+void on_synth()
+{
+	get("https://${s1_addr}:${s1_port}/");
+	get("https://${s2_addr}:${s2_port}/");
+	get("https://${s3_addr}:${s3_port}/mtls/x");
+	get("https://${s4_addr}:${s4_port}/");
+	/* Above the prefix of the entry with the client certificate */
+	get("https://${s3_addr}:${s3_port}/mtls/%2e%2e/admin");
+	get("https://${s3_addr}:${s3_port}/mtls/..;/admin");
+	get("https://${s3_addr}:${s3_port}/mtls/%252E%252E%255cadmin");
+	/* Not verifying a server that its entry has a CA for */
+	get("https://${s1_addr}:${s1_port}/", FETCH_FLAG_INSECURE);
+	synth(200, mime, sizeof(mime)-1, out, outlen);
+}
+
+void start(int argc, char** argv) {
+	register_callback(3, (void(*)())on_synth);
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"tls.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test",
+				"fetch": {
+					"allow_insecure": true,
+					"allow": [
+						{ "url": "https://${s1_addr}:${s1_port}/",
+						  "ca_file": "${tmpdir}/ca.pem" },
+						{ "url": "https://${s2_addr}:${s2_port}/",
+						  "ca_file": "${tmpdir}/other-ca.pem" },
+						{ "url": "https://${s3_addr}:${s3_port}/",
+						  "ca_file": "${tmpdir}/ca.pem" },
+						{ "url": "https://${s3_addr}:${s3_port}/mtls/",
+						  "ca_file": "${tmpdir}/ca.pem",
+						  "client_cert": "${tmpdir}/client.crt",
+						  "client_key": "${tmpdir}/client.key" },
+						{ "url": "https://${s4_addr}:${s4_port}/",
+						  "ca_file": "${tmpdir}/ca.pem" }
+					]
+				}
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		return (synth(riscv.want_status()));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.vcall(ON_SYNTH);
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	txreq -hdr "Host: tls.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "200:ca;failed;200:mtls;failed;refused;refused;refused;refused;"
+} -run
+
+server s1 -wait
+server s2 -wait
+server s3 -wait
+server s4 -wait
+
+# Mistakes in the TLS files of an allow entry fail the VCL
+
+varnish v1 -errvcl {fetch: allow entries for the same URL with other TLS files} {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"fetch": { "allow": [
+					{ "url": "https://127.0.0.1/", "ca_file": "${tmpdir}/ca.pem" },
+					{ "url": "https://127.0.0.1:443/", "ca_file": "${tmpdir}/other-ca.pem" }
+				] }
+			}
+		}""");
+	}
+}
+
+varnish v1 -errvcl {fetch: the path of an allow entry with TLS files must end with a slash} {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"fetch": { "allow": [
+					{ "url": "https://127.0.0.1/mtls", "client_cert": "${tmpdir}/client.pem" }
+				] }
+			}
+		}""");
+	}
+}
+
+varnish v1 -errvcl {fetch: "allow" must be an array} {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"fetch": { "allow": { "url": "https://127.0.0.1/" } }
+			}
+		}""");
+	}
+}
+
+varnish v1 -errvcl {fetch: "ca_file" of an allow entry must be a string} {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"fetch": { "allow": [
+					{ "url": "https://127.0.0.1/", "ca_file": 1 }
+				] }
+			}
+		}""");
+	}
+}
+
+varnish v1 -errvcl {fetch: ca_file is not a file} {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"fetch": { "allow": [
+					{ "url": "https://127.0.0.1/", "ca_file": "${tmpdir}" }
+				] }
+			}
+		}""");
+	}
+}
+
+varnish v1 -errvcl {fetch: client_key without client_cert} {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"fetch": { "allow": [
+					{ "url": "https://127.0.0.1/", "client_key": "${tmpdir}/client.key" }
+				] }
+			}
+		}""");
+	}
+}
+
+varnish v1 -errvcl {fetch: unknown key in allow entry: cafile} {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"fetch": { "allow": [
+					{ "url": "https://127.0.0.1/", "cafile": "${tmpdir}/ca.pem" }
+				] }
+			}
+		}""");
+	}
+}
+
+varnish v1 -errvcl {fetch: can not read ca_file} {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"fetch": { "allow": [
+					{ "url": "https://127.0.0.1/", "ca_file": "${tmpdir}/nope.pem" }
+				] }
+			}
+		}""");
+	}
+}
+
+varnish v1 -errvcl {fetch: TLS files on an allow entry that is not https} {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"fetch": { "allow": [
+					{ "url": "http://127.0.0.1/", "ca_file": "${tmpdir}/ca.pem" }
+				] }
+			}
+		}""");
+	}
+}
+
+varnish v1 -errvcl {fetch: ca_file must be an absolute path} {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"fetch": { "allow": [
+					{ "url": "https://127.0.0.1/", "ca_file": "ca.pem" }
+				] }
+			}
+		}""");
+	}
+}

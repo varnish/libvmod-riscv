@@ -129,7 +129,28 @@ On Varnish Enterprise, a tenant can make HTTP and HTTPS GET and POST requests wi
 	}
 }
 ```
-An allow entry is a scheme, host, port (the scheme's default when not given) and path prefix, and both the entries and the program's URLs are parsed by curl. Write a prefix with a trailing slash, unless any path that starts with it is fine. Redirects are not followed, and the program may not set the headers that pick the virtual host or frame the message (`Host`, `Content-Length`, `Transfer-Encoding`, `Connection` and the like). `max_requests` is per task, `timeout_ms` bounds every transfer, and `allow_insecure` decides whether a request may skip TLS certificate verification (for self-signed certificates). The other values shown are the defaults.
+Each allow list entry specifies a scheme, host, port (using the scheme's default if omitted), and path prefix. Both the entries and the program's request URLs are parsed by curl. End the prefix with a trailing slash unless it should match any path beginning with that prefix. URLs are rejected if a server could interpret their paths as traversing above the allowed prefix, including paths containing encoded parent-directory segments (`%2e%2e`), `..;`, or backslashes.
+
+Redirects are not followed. Programs cannot set headers that select the virtual host or control message framing, such as `Host`, `Content-Length`, `Transfer-Encoding`, and `Connection`. `max_requests` applies per task, `timeout_ms` limits the duration of each transfer, and `allow_insecure` controls whether requests may disable TLS certificate verification. The other values shown are the defaults.
+
+An HTTPS entry can also be an object specifying TLS files for its origin. Use `ca_file` to verify servers with a private CA or a self-signed certificate, or `client_cert` and `client_key` to configure mutual TLS:
+```json
+"allow": [
+	"https://api.example.com/v1/",
+	{
+		"url": "https://10.0.0.5:8443/internal/",
+		"ca_file": "/etc/varnish/tenants/x/internal-ca.pem",
+		"client_cert": "/etc/varnish/tenants/x/client.pem",
+		"client_key": "/etc/varnish/tenants/x/client.key"
+	}
+]
+```
+
+TLS files must use PEM format, and their paths must be absolute. The sandboxed program cannot access these files or select alternative files, so private keys remain outside the sandbox. `ca_file` replaces the system CA certificates for that entry. You can omit `client_key` if `client_cert` also contains the private key.
+
+Entries with TLS files must have a path ending in a slash. Entries for the same URL cannot specify different TLS files. If multiple entries allow a request URL, the entry with the longest matching path prefix determines which TLS files are used. Requests that disable certificate verification (`FETCH_FLAG_INSECURE`) are rejected for origins configured with TLS files.
+
+The Varnish worker process reads the TLS files for each new connection, so the files must be readable by the worker's user. File changes apply to subsequent connections without a reload. With libcurl versions older than 7.83.1, requests using TLS files disable connection and TLS session reuse to prevent connections from being shared across different TLS configurations.
 
 ```cpp
 int32_t h[3] = {
