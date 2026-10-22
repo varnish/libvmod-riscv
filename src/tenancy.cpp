@@ -234,6 +234,7 @@ static void configure_tenant(TenantGroup& group, const T& obj)
 		fetch.connect_timeout_ms = f.value("connect_timeout_ms", fetch.connect_timeout_ms);
 		fetch.max_request_body = f.value("max_request_body", fetch.max_request_body);
 		fetch.max_response_body = f.value("max_response_body", fetch.max_response_body);
+		fetch.max_redirects = f.value("max_redirects", fetch.max_redirects);
 		fetch.allow_insecure = f.value("allow_insecure", fetch.allow_insecure);
 		fetch.compile(allow);
 		group.fetch = std::make_shared<const FetchConfig>(std::move(fetch));

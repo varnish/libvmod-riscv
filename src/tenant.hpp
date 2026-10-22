@@ -62,6 +62,7 @@ struct FetchConfig {
 	uint32_t connect_timeout_ms = 2000;
 	uint32_t max_request_body   = 1u << 20;
 	uint32_t max_response_body  = 16u << 20;
+	uint32_t max_redirects      = 0;      // per request, 0: not followed
 	bool     allow_insecure     = false;  // FETCH_FLAG_INSECURE
 	bool operator==(const FetchConfig&) const = default;
 

@@ -10,8 +10,10 @@
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 #include <fcntl.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
 /* A build without libcurv (the fuzzer) defines FETCH_SUPPORTED=0 */
@@ -43,10 +45,34 @@ extern "C" {
 **/
 namespace rvs {
 
-/* Handles index the in-flight tasks; a slot is free when null */
+#if FETCH_SUPPORTED
+using FetchHeaders = std::vector<std::pair<std::string, std::string>>;
+
+/* A request as the guest gave it, kept while it is in flight only when
+   its redirects are followed: each hop is sent again from it. The body of
+   a POST is in the curv_req, and goes from one hop to the next. */
+struct FetchRequest {
+	unsigned     op = FETCH_GET;
+	unsigned     flags = 0;
+	FetchHeaders headers;
+	FetchRule    origin;            // of the URL it was last sent to
+	uint32_t     max_redirects = 0; // when it was sent, 0: not kept
+	uint32_t     redirects = 0;     // followed so far
+	long         timeout_ms = 0;    // left of timeout_ms, for the hops to come
+	vtim_dur     elapsed = 0;       // of the hops before this one
+};
+
+/* A slot is free when its task is null */
+struct FetchSlot {
+	struct curv_task* task = nullptr;
+	FetchRequest      request;
+};
+#endif
+
+/* Handles index the slots of the in-flight tasks */
 struct FetchState {
 #if FETCH_SUPPORTED
-	std::vector<struct curv_task*> slots;
+	std::vector<FetchSlot> slots;
 #endif
 	uint32_t started = 0;
 };
@@ -63,6 +89,8 @@ struct GuestFetchResponse {
 static constexpr size_t FETCH_WAIT_MAX = 64;
 static constexpr size_t FETCH_URL_MAX = 8192;
 static constexpr size_t FETCH_HEADERS_MAX = 65536;
+/* As curl's own default limit is 30 */
+static constexpr uint32_t FETCH_REDIRECTS_MAX = 20;
 /* Waiting for any of several requests, how long at most between looks */
 static constexpr int FETCH_POLL_MAX_MS = 16;
 
@@ -80,9 +108,9 @@ void Script::fetch_reset()
 	if (m_fetch == nullptr)
 		return;
 #if FETCH_SUPPORTED
-	for (auto*& task : m_fetch->slots)
-		if (task != nullptr)
-			curv_engine_detach(&task);
+	for (auto& slot : m_fetch->slots)
+		if (slot.task != nullptr)
+			curv_engine_detach(&slot.task);
 #endif
 	delete m_fetch;
 	m_fetch = nullptr;
@@ -95,6 +123,11 @@ struct CurlFree {
 	void operator()(CURLU* u) const { curl_url_cleanup(u); }
 };
 using curl_string = std::unique_ptr<char, CurlFree>;
+
+struct VsbFree {
+	void operator()(struct vsb* v) const { VSB_destroy(&v); }
+};
+using vsb_ptr = std::unique_ptr<struct vsb, VsbFree>;
 
 static std::string lowercase(std::string s)
 {
@@ -182,6 +215,9 @@ void FetchConfig::compile(const std::vector<FetchAllow>& allow)
 {
 	if (timeout_ms == 0)
 		throw std::runtime_error("fetch: timeout_ms must be above zero");
+	if (max_redirects > FETCH_REDIRECTS_MAX)
+		throw std::runtime_error("fetch: max_redirects must be at most "
+			+ std::to_string(FETCH_REDIRECTS_MAX));
 	rules.clear();
 	for (const auto& entry : allow) {
 		auto parsed = parse_url(entry.url);
@@ -271,6 +307,32 @@ static bool climbs_up(std::string_view path)
 	return false;
 }
 
+/* The allow entry that gives a URL its TLS files, or null and why not */
+static const FetchRule* permitted(const FetchConfig& cfg, const FetchRule& origin,
+	unsigned flags, const char*& why)
+{
+	const FetchRule* rule = allowed(cfg, origin);
+	if (rule == nullptr)
+		why = "URL not allowed";
+	else if (rule->path != "/" && climbs_up(origin.path))
+		why = "URL not allowed (a .. segment)";
+	/* The TLS files of an entry pin its origin, and a client certificate
+	   is not for a server that was not verified */
+	else if ((flags & FETCH_FLAG_INSECURE) && !rule->tls.empty())
+		why = "insecure request to an origin with TLS files";
+	else
+		return rule;
+	return nullptr;
+}
+
+static void log_refused(const Script& script, bool redirect, const char* why, const std::string& url)
+{
+	const auto* ctx = script.ctx();
+	if (ctx != nullptr && ctx->vsl != nullptr)
+		VSLb(ctx->vsl, SLT_VCL_Error, "[%s] fetch%s: %s: %s", script.name().c_str(),
+			redirect ? " (redirect)" : "", why, loggable_url(url.c_str()).c_str());
+}
+
 /* curl before 7.83.1 could reuse a connection, or resume a TLS session,
    made with other TLS files (CVE-2022-27782). libcurv's connections are
    shared by every tenant and vmod_http: another request to the origin
@@ -313,18 +375,24 @@ static void set_tls_files(struct curv_req* req, const FetchTLS& tls)
 	}
 }
 
+/* names are in lowercase */
+static bool header_is(std::string_view name, std::initializer_list<std::string_view> names)
+{
+	return std::any_of(names.begin(), names.end(), [name] (std::string_view n) {
+		return n.size() == name.size() && strncasecmp(n.data(), name.data(), n.size()) == 0;
+	});
+}
+
 /* Headers that frame the message or pick the virtual host are curl's to
    write: from the guest they would reach another host than the allow list
    says, or desync a connection that other tasks then reuse. */
 static bool reserved_header(std::string_view name)
 {
-	static constexpr std::array<std::string_view, 10> reserved {
+	return header_is(name, {
 		"host", "content-length", "transfer-encoding", "connection",
 		"keep-alive", "proxy-connection", "te", "trailer", "upgrade",
 		"expect",
-	};
-	return std::find(reserved.begin(), reserved.end(), lowercase(std::string(name)))
-		!= reserved.end();
+	});
 }
 
 /* "Name: value" lines, separated by \n or \r\n. A CR or other control
@@ -332,10 +400,11 @@ static bool reserved_header(std::string_view name)
    which with validate=1 allows only tchars in names and VCHAR, SP and
    HTAB in values: it must stay on, or "X: a\rHost: b" is one line here
    and two to some servers. */
-static bool add_headers(struct curv_req* req, std::string_view block)
+static std::optional<FetchHeaders> parse_headers(std::string_view block)
 {
 	if (block.find('\0') != block.npos)
-		return false;
+		return std::nullopt;
+	FetchHeaders headers;
 	while (!block.empty()) {
 		const size_t eol = block.find('\n');
 		std::string_view line = block.substr(0, eol);
@@ -346,17 +415,16 @@ static bool add_headers(struct curv_req* req, std::string_view block)
 			continue;
 		const size_t colon = line.find(':');
 		if (colon == line.npos || colon == 0)
-			return false;
+			return std::nullopt;
 		std::string_view value = line.substr(colon + 1);
 		while (!value.empty() && value.front() == ' ')
 			value.remove_prefix(1);
-		const std::string name(line.substr(0, colon));
+		std::string name(line.substr(0, colon));
 		if (reserved_header(name))
-			return false;
-		if (curv_req_set_reqheader(req, name.c_str(), std::string(value).c_str(), 1) != 0)
-			return false;
+			return std::nullopt;
+		headers.emplace_back(std::move(name), std::string(value));
 	}
-	return true;
+	return headers;
 }
 
 struct ReqGuard {
@@ -377,6 +445,58 @@ static int body_limit_cb(void* priv, curl_off_t, curl_off_t, curl_off_t, curl_of
 	const auto* limit = (const BodyLimit*)priv;
 	const struct vsb* body = limit->req->resp_body;
 	return body != nullptr && size_t(VSB_len(body)) > limit->max;
+}
+
+/* Hand a request, the guest's or a redirect of it, to libcurv in its
+   slot. The URL must be one that rule permits, and the body of a POST is
+   the request's from now on. Nothing throws once libcurv has it. */
+static long fetch_exec(const FetchConfig& cfg, FetchSlot& slot, const FetchRule& rule,
+	const std::string& url, long timeout_ms, vsb_ptr body)
+{
+	const FetchRequest& request = slot.request;
+	ReqGuard guard{curv_req_new(CURV_LABEL_OBJECT, "riscv.fetch")};
+	auto* req = guard.req;
+	req->req_body = body.release();
+	for (const auto& [name, value] : request.headers)
+		if (curv_req_set_reqheader(req, name.c_str(), value.c_str(), 1) != 0)
+			return FETCH_EINVAL;
+	char* curl_url = (char *)curv_req_alloc(req, url.size() + 1);
+	std::memcpy(curl_url, url.c_str(), url.size() + 1);
+	CURL_EASYSET(req, CURLOPT_URL, curl_url);
+	/* libcurv makes it a POST when there is a body */
+	if (req->req_body != nullptr) {
+		/* Do not wait for a 100 Continue that may never come */
+		curv_req_set_reqheader(req, "Expect", nullptr, 0);
+	}
+#if LIBCURL_VERSION_NUM >= 0x075500
+	CURL_EASYSET(req, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+	CURL_EASYSET(req, CURLOPT_PROTOCOLS, long(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
+	/* A redirect could leave the allow list: fetch_follow() checks it */
+	CURL_EASYSET(req, CURLOPT_FOLLOWLOCATION, 0L);
+	CURL_EASYSET(req, CURLOPT_TIMEOUT_MS, timeout_ms);
+	CURL_EASYSET(req, CURLOPT_CONNECTTIMEOUT_MS, long(cfg.connect_timeout_ms));
+	/* To curl, 0 is no limit at all */
+	if (cfg.max_response_body > 0)
+		CURL_EASYSET(req, CURLOPT_MAXFILESIZE_LARGE, curl_off_t(cfg.max_response_body));
+	auto* limit = (BodyLimit *)curv_req_alloc(req, sizeof(BodyLimit));
+	*limit = {req, cfg.max_response_body};
+	CURL_EASYSET(req, CURLOPT_XFERINFOFUNCTION, body_limit_cb);
+	CURL_EASYSET(req, CURLOPT_XFERINFODATA, limit);
+	CURL_EASYSET(req, CURLOPT_NOPROGRESS, 0L);
+	set_tls_files(req, rule.tls);
+	if (request.flags & FETCH_FLAG_INSECURE) {
+		CURL_EASYSET(req, CURLOPT_SSL_VERIFYPEER, 0L);
+		CURL_EASYSET(req, CURLOPT_SSL_VERIFYHOST, 0L);
+	}
+	if (req->cc != CURLE_OK)
+		return FETCH_EINVAL;
+	if (curv_engine_exec(&guard.req, &slot.task, 0, 0) != nullptr) {
+		/* It did not take the request */
+		return FETCH_EBUSY;
+	}
+	return 0;
 }
 
 static long fetch_send(machine_t& machine, Script& script, unsigned op, unsigned flags)
@@ -409,75 +529,144 @@ static long fetch_send(machine_t& machine, Script& script, unsigned op, unsigned
 	auto parsed = parse_url(url_buf.to_string());
 	if (!parsed)
 		return FETCH_EINVAL;
-	auto refuse = [&] (const char* why) {
-		const auto* ctx = script.ctx();
-		if (ctx != nullptr && ctx->vsl != nullptr)
-			VSLb(ctx->vsl, SLT_VCL_Error, "[%s] fetch: %s: %s",
-				script.name().c_str(), why, loggable_url(parsed->url.c_str()).c_str());
+	const char* why = nullptr;
+	const FetchRule* rule = permitted(cfg, parsed->origin, flags, why);
+	if (rule == nullptr) {
+		log_refused(script, false, why, parsed->url);
 		return FETCH_EACCES;
-	};
-	const FetchRule* rule = allowed(cfg, parsed->origin);
-	if (rule == nullptr)
-		return refuse("URL not allowed");
-	if (rule->path != "/" && climbs_up(parsed->origin.path))
-		return refuse("URL not allowed (a .. segment)");
-	/* The TLS files of an entry pin its origin, and a client certificate
-	   is not for a server that was not verified */
-	if ((flags & FETCH_FLAG_INSECURE) && !rule->tls.empty())
-		return refuse("insecure request to an origin with TLS files");
-
-	ReqGuard guard{curv_req_new(CURV_LABEL_OBJECT, "riscv.fetch")};
-	auto* req = guard.req;
-	if (!add_headers(req, hdr_buf.to_string()))
-		return FETCH_EINVAL;
-	char* url = (char *)curv_req_alloc(req, parsed->url.size() + 1);
-	std::memcpy(url, parsed->url.c_str(), parsed->url.size() + 1);
-	CURL_EASYSET(req, CURLOPT_URL, url);
-	if (op == FETCH_POST) {
-		/* libcurv makes it a POST when there is a body */
-		req->req_body = VSB_new_auto();
-		AN(req->req_body);
-		const auto body = body_buf.to_string();
-		VSB_bcat(req->req_body, body.data(), body.size());
-		AZ(VSB_finish(req->req_body));
-		/* Do not wait for a 100 Continue that may never come */
-		curv_req_set_reqheader(req, "Expect", nullptr, 0);
 	}
-#if LIBCURL_VERSION_NUM >= 0x075500
-	CURL_EASYSET(req, CURLOPT_PROTOCOLS_STR, "http,https");
-#else
-	CURL_EASYSET(req, CURLOPT_PROTOCOLS, long(CURLPROTO_HTTP | CURLPROTO_HTTPS));
-#endif
-	/* A redirect could leave the allow list */
-	CURL_EASYSET(req, CURLOPT_FOLLOWLOCATION, 0L);
-	CURL_EASYSET(req, CURLOPT_TIMEOUT_MS, long(cfg.timeout_ms));
-	CURL_EASYSET(req, CURLOPT_CONNECTTIMEOUT_MS, long(cfg.connect_timeout_ms));
-	/* To curl, 0 is no limit at all */
-	if (cfg.max_response_body > 0)
-		CURL_EASYSET(req, CURLOPT_MAXFILESIZE_LARGE, curl_off_t(cfg.max_response_body));
-	auto* limit = (BodyLimit *)curv_req_alloc(req, sizeof(BodyLimit));
-	*limit = {req, cfg.max_response_body};
-	CURL_EASYSET(req, CURLOPT_XFERINFOFUNCTION, body_limit_cb);
-	CURL_EASYSET(req, CURLOPT_XFERINFODATA, limit);
-	CURL_EASYSET(req, CURLOPT_NOPROGRESS, 0L);
-	set_tls_files(req, rule->tls);
-	if (flags & FETCH_FLAG_INSECURE) {
-		CURL_EASYSET(req, CURLOPT_SSL_VERIFYPEER, 0L);
-		CURL_EASYSET(req, CURLOPT_SSL_VERIFYHOST, 0L);
-	}
-	if (req->cc != CURLE_OK)
+	auto headers = parse_headers(hdr_buf.to_string());
+	if (!headers)
 		return FETCH_EINVAL;
 
 	/* Every handle in use is a request in flight */
-	auto slot = std::find(state.slots.begin(), state.slots.end(), nullptr);
+	auto slot = std::find_if(state.slots.begin(), state.slots.end(),
+		[] (const FetchSlot& s) { return s.task == nullptr; });
 	if (slot == state.slots.end())
-		slot = state.slots.insert(slot, nullptr);
-	if (curv_engine_exec(&guard.req, &*slot, 0, 0) != nullptr) {
-		/* It did not take the request */
-		return FETCH_EBUSY;
+		slot = state.slots.emplace(slot);
+	slot->request = FetchRequest {
+		.op = op,
+		.flags = flags,
+		.headers = std::move(*headers),
+		.origin = std::move(parsed->origin),
+		.max_redirects = cfg.max_redirects,
+		.timeout_ms = long(cfg.timeout_ms),
+	};
+	vsb_ptr body;
+	if (op == FETCH_POST) {
+		body.reset(VSB_new_auto());
+		AN(body);
+		body_buf.foreach([vsb = body.get()] (const char* data, size_t len) {
+			VSB_bcat(vsb, data, len);
+		});
+		AZ(VSB_finish(body.get()));
 	}
+	const long res = fetch_exec(cfg, *slot, *rule, parsed->url, cfg.timeout_ms, std::move(body));
+	/* Kept only to follow redirects */
+	if (res < 0 || cfg.max_redirects == 0)
+		slot->request = {};
+	if (res < 0)
+		return res;
 	state.started++;
 	return slot - state.slots.begin();
+}
+
+static bool same_origin(const FetchRule& a, const FetchRule& b)
+{
+	return a.scheme == b.scheme && a.host == b.host && a.port == b.port;
+}
+
+/* A finished request that is a redirect, which may be followed: it goes on
+   in its slot, to the next URL, and the guest's handle with it. A redirect
+   that is not followed is the response. Whether redirects are followed is
+   decided when the guest sends the request, and the config of now may
+   only lower the limit. */
+static bool fetch_follow(Script& script, const FetchConfig& cfg, FetchSlot& slot,
+	struct curv_req* req)
+{
+	FetchRequest& request = slot.request;
+	if (request.max_redirects == 0 || req->cc != CURLE_OK)
+		return false;
+	long status = 0;
+	curl_easy_getinfo(req->easy, CURLINFO_RESPONSE_CODE, &status);
+	if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308)
+		return false;
+	/* The Location, resolved against the URL of the request by curl */
+	char* location = nullptr;
+	curl_easy_getinfo(req->easy, CURLINFO_REDIRECT_URL, &location);
+	if (location == nullptr)
+		return false;
+	/* What is left of timeout_ms is what the hops took on the network,
+	   by curl's monotonic clock: not the time the guest took to wait */
+	curl_off_t hop_us = 0;
+	curl_easy_getinfo(req->easy, CURLINFO_TOTAL_TIME_T, &hop_us);
+	const long timeout_ms = request.timeout_ms - long(hop_us / 1000);
+	const size_t location_len = std::strlen(location);
+	std::optional<ParsedURL> parsed;
+	const char* why = nullptr;
+	const FetchRule* rule = nullptr;
+	if (request.redirects >= std::min(request.max_redirects, cfg.max_redirects))
+		why = "too many redirects";
+	/* As the guest's own URLs, before and after curl normalizes it */
+	else if (location_len > FETCH_URL_MAX)
+		why = "URL too long";
+	else if (!(parsed = parse_url(location)))
+		why = "not an http or https URL";
+	else if (parsed->url.size() > FETCH_URL_MAX)
+		why = "URL too long";
+	else if (timeout_ms <= 0)
+		why = "timed out";
+	else
+		rule = permitted(cfg, parsed->origin, request.flags, why);
+	if (rule == nullptr) {
+		log_refused(script, true, why, (parsed && parsed->url.size() <= FETCH_URL_MAX)
+			? parsed->url : std::string(location, std::min(location_len, FETCH_URL_MAX)));
+		return false;
+	}
+
+	const auto* ctx = script.ctx();
+	const bool logged = ctx != nullptr && ctx->vsl != nullptr;
+	/* For the log, made first: if it throws, the request is as it was,
+	   and nothing may throw once it is sent */
+	std::string from, to;
+	if (logged) {
+		char* url = nullptr;
+		curl_easy_getinfo(req->easy, CURLINFO_EFFECTIVE_URL, &url);
+		from = loggable_url(url);
+		to = loggable_url(parsed->url.c_str());
+	}
+
+	/* As browsers and curl do, a POST becomes a GET after a 301, 302 or
+	   303, and the headers that describe its body go with it */
+	vsb_ptr body;
+	if (request.op == FETCH_POST && status != 307 && status != 308) {
+		request.op = FETCH_GET;
+		std::erase_if(request.headers, [] (const auto& h) {
+			return header_is(h.first, {"content-type", "content-encoding",
+				"content-language", "content-location"});
+		});
+	} else {
+		/* Not needed by deliver(): it goes on to the next hop */
+		body.reset(std::exchange(req->req_body, nullptr));
+	}
+	/* Credentials are for the origin the guest sent them to */
+	if (!same_origin(request.origin, parsed->origin)) {
+		std::erase_if(request.headers, [] (const auto& h) {
+			return header_is(h.first, {"authorization", "proxy-authorization", "cookie"});
+		});
+	}
+	request.origin = std::move(parsed->origin);
+	if (fetch_exec(cfg, slot, *rule, parsed->url, timeout_ms, std::move(body)) < 0) {
+		log_refused(script, true, "could not be sent", parsed->url);
+		return false;
+	}
+	request.redirects++;
+	request.timeout_ms = timeout_ms;
+	request.elapsed += req->elapsed;
+	if (logged)
+		VSLb(ctx->vsl, SLT_VCL_Log, "[%s] fetch %s: %ld redirect to %s",
+			script.name().c_str(), from.c_str(), status, to.c_str());
+	return true;
 }
 
 static gaddr_t copy_out(machine_t& machine, Script& script, const char* data, size_t len)
@@ -490,8 +679,10 @@ static gaddr_t copy_out(machine_t& machine, Script& script, const char* data, si
 	return addr;
 }
 
-/* Hand a finished request over to the guest */
-static void deliver(machine_t& machine, Script& script, struct curv_req* req, gaddr_t dst)
+/* Hand a finished request over to the guest. With the redirects it
+   followed, the log has their number and the time of every hop. */
+static void deliver(machine_t& machine, Script& script, struct curv_req* req, gaddr_t dst,
+	uint32_t redirects, vtim_dur elapsed)
 {
 	const FetchConfig& cfg = *script.config().group.fetch;
 	GuestFetchResponse resp {};
@@ -545,12 +736,16 @@ static void deliver(machine_t& machine, Script& script, struct curv_req* req, ga
 		   VCL was loaded: the operator's to fix */
 		const bool bad_file = cc == CURLE_SSL_CERTPROBLEM
 			|| cc == CURLE_SSL_CACERT_BADFILE;
+		char hops[32] = "";
+		if (redirects > 0)
+			snprintf(hops, sizeof(hops), ", %u redirect%s",
+				unsigned(redirects), redirects > 1 ? "s" : "");
 		VSLb(ctx->vsl, bad_file ? SLT_VCL_Error : SLT_VCL_Log,
-			"[%s] fetch %s: %ld %s%s (%.3fs)",
+			"[%s] fetch %s: %ld %s%s (%.3fs%s)",
 			script.name().c_str(), loggable_url(url).c_str(), status,
 			curl_easy_strerror(cc),
 			bad_file ? " (the TLS files of its allow entry)" : "",
-			double(req->elapsed));
+			double(elapsed), hops);
 	}
 }
 
@@ -570,7 +765,7 @@ static long fetch_wait(machine_t& machine, Script& script, unsigned flags)
 		const int32_t h = handles[i];
 		if (h == -1)
 			continue;
-		if (h < 0 || size_t(h) >= state.slots.size() || state.slots[h] == nullptr)
+		if (h < 0 || size_t(h) >= state.slots.size() || state.slots[h].task == nullptr)
 			return FETCH_EINVAL;
 		for (unsigned j = 0; j < i; j++)
 			if (handles[j] == h)
@@ -578,28 +773,47 @@ static long fetch_wait(machine_t& machine, Script& script, unsigned flags)
 	}
 
 	long completed = 0;
+	/* A request is done unless it was a redirect that is followed */
 	auto finish = [&] (unsigned i, struct curv_req* req) {
 		/* The slot is free now: until it is destroyed, the request is
 		   only here, and writing guest memory may throw */
 		ReqGuard guard{req};
-		AZ(state.slots[handles[i]]);
+		FetchSlot& slot = state.slots[handles[i]];
+		AZ(slot.task);
+		try {
+			if (fetch_follow(script, *script.config().group.fetch, slot, req))
+				return false;
+		} catch (const std::exception& e) {
+			/* Not sent, as fetch_exec() does not throw once it is:
+			   the redirect is the response */
+			AZ(slot.task);
+			const auto* ctx = script.ctx();
+			if (ctx != nullptr && ctx->vsl != nullptr)
+				VSLb(ctx->vsl, SLT_VCL_Error, "[%s] fetch (redirect): %s",
+					script.name().c_str(), e.what());
+		}
+		const uint32_t redirects = slot.request.redirects;
+		const vtim_dur elapsed = slot.request.elapsed + req->elapsed;
+		slot.request = {};
 		handles[i] = -1;
 		machine.memory.write<int32_t>(handles_addr + i * sizeof(int32_t), -1);
 		deliver(machine, script, req,
-			resps_addr + i * sizeof(GuestFetchResponse));
+			resps_addr + i * sizeof(GuestFetchResponse), redirects, elapsed);
 		completed++;
+		return true;
 	};
 	const bool any = flags & FETCH_FLAG_ANY;
-	const vtim_real deadline = VTIM_real() + timeout_ms / 1e3;
+	const vtim_real deadline = VTIM_mono() + timeout_ms / 1e3;
 	int poll_ms = 1;
 	while (true) {
 		unsigned pending = 0, first = 0;
 		for (unsigned i = 0; i < count; i++) {
 			if (handles[i] == -1)
 				continue;
-			if (auto* req = curv_engine_wait(&state.slots[handles[i]], 0))
-				finish(i, req);
-			else if (pending++ == 0)
+			auto* req = curv_engine_wait(&state.slots[handles[i]].task, 0);
+			if (req != nullptr && finish(i, req))
+				continue;
+			if (pending++ == 0)
 				first = i;
 		}
 		if (pending == 0 || (any && completed > 0) || timeout_ms == 0)
@@ -611,7 +825,7 @@ static long fetch_wait(machine_t& machine, Script& script, unsigned flags)
 		   waking the worker. Requests always end, with CURLOPT_TIMEOUT_MS. */
 		int wait_ms = -1;
 		if (timeout_ms > 0) {
-			wait_ms = int((deadline - VTIM_real()) * 1e3);
+			wait_ms = int((deadline - VTIM_mono()) * 1e3);
 			if (wait_ms <= 0)
 				break;
 		}
@@ -619,7 +833,7 @@ static long fetch_wait(machine_t& machine, Script& script, unsigned flags)
 			wait_ms = (wait_ms < 0) ? poll_ms : std::min(wait_ms, poll_ms);
 			poll_ms = std::min(poll_ms * 2, FETCH_POLL_MAX_MS);
 		}
-		if (auto* req = curv_engine_wait(&state.slots[handles[first]], wait_ms))
+		if (auto* req = curv_engine_wait(&state.slots[handles[first]].task, wait_ms))
 			finish(first, req);
 	}
 	return completed;
@@ -630,9 +844,10 @@ static long fetch_free(machine_t& machine, Script& script)
 	auto [opflags, handle] = machine.sysargs<unsigned, int> ();
 	(void)opflags;
 	auto& state = script.fetch_state();
-	if (handle < 0 || size_t(handle) >= state.slots.size() || state.slots[handle] == nullptr)
+	if (handle < 0 || size_t(handle) >= state.slots.size() || state.slots[handle].task == nullptr)
 		return FETCH_EINVAL;
-	curv_engine_detach(&state.slots[handle]);
+	curv_engine_detach(&state.slots[handle].task);
+	state.slots[handle].request = {};
 	return 0;
 }
 

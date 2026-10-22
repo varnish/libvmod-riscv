@@ -71,7 +71,9 @@ private:
 	size_t  m_headers_len = 0;
 };
 /* Start a request: a handle, or a negative FETCH_E*. flags: FETCH_FLAG_INSECURE
-   accepts any TLS certificate. Headers are "Name: value" lines. */
+   accepts any TLS certificate. Headers are "Name: value" lines. Redirects
+   are followed as the tenant's "max_redirects" allows: one that is not
+   followed is the response. */
 int fetch_get(std::string_view url, std::string_view headers = {}, unsigned flags = 0);
 int fetch_post(std::string_view url, std::string_view body, std::string_view headers = {}, unsigned flags = 0);
 /* Wait for all of the handles, or with FETCH_FLAG_ANY for at least one of

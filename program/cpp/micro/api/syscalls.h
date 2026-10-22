@@ -59,7 +59,8 @@
    the low byte of a0 and its flags above it:
      GET:  a1,a2 = URL  a3,a4 = request headers ("Name: value" lines)
      POST: GET + a5,a6 = request body
-           -> a handle, or a negative FETCH_E*
+           -> a handle, or a negative FETCH_E*. Redirects are followed
+           as the tenant's "max_redirects" allows, under the same handle.
      WAIT: a1 = int32_t handles[]  a2 = count
            a3 = struct fetch_response[count]  a4 = timeout in ms (<0: none)
            -> the number of handles it completed. A completed handle is set

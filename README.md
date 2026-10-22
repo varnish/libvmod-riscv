@@ -125,13 +125,16 @@ On Varnish Enterprise, a tenant can make HTTP and HTTPS GET and POST requests wi
 		"connect_timeout_ms": 2000,
 		"max_request_body": 1048576,
 		"max_response_body": 16777216,
+		"max_redirects": 0,
 		"allow_insecure": false
 	}
 }
 ```
 Each allow list entry specifies a scheme, host, port (using the scheme's default if omitted), and path prefix. Both the entries and the program's request URLs are parsed by curl. End the prefix with a trailing slash unless it should match any path beginning with that prefix. URLs are rejected if a server could interpret their paths as traversing above the allowed prefix, including paths containing encoded parent-directory segments (`%2e%2e`), `..;`, or backslashes.
 
-Redirects are not followed. Programs cannot set headers that select the virtual host or control message framing, such as `Host`, `Content-Length`, `Transfer-Encoding`, and `Connection`. `max_requests` applies per task, `timeout_ms` limits the duration of each transfer, and `allow_insecure` controls whether requests may disable TLS certificate verification. The other values shown are the defaults.
+Programs cannot set headers that select the virtual host or control message framing, such as `Host`, `Content-Length`, `Transfer-Encoding`, and `Connection`. `max_requests` applies per task, `timeout_ms` limits the duration of each request including the redirects it follows, and `allow_insecure` controls whether requests may disable TLS certificate verification. The other values shown are the defaults.
+
+Redirects are disabled by default. Set `max_redirects` to a positive value to enable them and limit the number of redirects followed per request. The maximum supported value is 20. Each redirect target must be permitted by the allow list and uses the TLS files configured in its matching entry. For 301, 302, and 303 redirects, POST requests are converted to GET requests, with the body and `Content-Type` header removed. For 307 and 308 redirects, the method, body, and headers are preserved. The `Authorization`, `Proxy-Authorization`, and `Cookie` headers are removed when a redirect changes the scheme, host, or port. If a redirect cannot be followed because the redirect limit has been reached, the target is not allowed, or `timeout_ms` has elapsed, the redirect response is returned and the reason is logged as a `VCL_Error`. Redirects do not count against `max_requests`.
 
 An HTTPS entry can also be an object specifying TLS files for its origin. Use `ca_file` to verify servers with a private CA or a self-signed certificate, or `client_cert` and `client_key` to configure mutual TLS:
 ```json
