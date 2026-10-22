@@ -1,14 +1,28 @@
 #include "sandbox_tenant.hpp"
 #include "varnish.hpp"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <string_view>
 #include <unordered_set>
 #include <libriscv/util/crc32.hpp>
 using json = nlohmann::json;
+#ifdef VARNISH_PLUS
+/* In cache_varnishd.h, which does not build as C++. Varnish Cache has
+   VRT_LookupDirector() in vrt.h. */
+extern "C" VCL_BACKEND VPI_LookupDirector(VRT_CTX, VCL_STRING name);
+#endif
 
 namespace rvs {
 extern std::vector<uint8_t> file_loader(const std::string& filename);
-using MapType = std::unordered_map<uint32_t, std::shared_ptr<SandboxTenant>>;
+/* A tenant as one VCL has it: a published tenant may be shared by several
+   VCLs, but the backends it names are those of this VCL. They live as long
+   as the VCL, and so as long as its registry. */
+struct TenantEntry
+{
+	std::shared_ptr<SandboxTenant> tenant;
+	std::vector<VCL_BACKEND> backends;
+};
+using MapType = std::unordered_map<uint32_t, TenantEntry>;
 
 /* The tenants of one VCL, kept in its PRIV_VCL. Every VCL has its own, so
    a reload builds a new set beside the running one, and a VCL that fails
@@ -139,14 +153,51 @@ static void publish(const std::shared_ptr<SandboxTenant>& tenant)
 
 /* The map is keyed by a CRC of the name, which anyone can collide, so a
    lookup is only a hit when the name itself matches too. */
-inline SandboxTenant* find_tenant(TenantRegistry* reg, std::string_view name)
+inline TenantEntry* find_entry(TenantRegistry* reg, std::string_view name)
 {
 	if (reg == nullptr)
 		return nullptr;
 	auto it = reg->map.find(riscv::crc32c(name.data(), name.size()));
-	if (it != reg->map.end() && it->second->config.name == name)
-		return it->second.get();
+	if (it != reg->map.end() && it->second.tenant->config.name == name)
+		return &it->second;
 	return nullptr;
+}
+inline SandboxTenant* find_tenant(TenantRegistry* reg, std::string_view name)
+{
+	auto* entry = find_entry(reg, name);
+	return entry ? entry->tenant.get() : nullptr;
+}
+
+static VCL_BACKEND lookup_backend(VRT_CTX, const std::string& name)
+{
+#ifdef VARNISH_PLUS
+	return VPI_LookupDirector(ctx, name.c_str());
+#else
+	return VRT_LookupDirector(ctx, name.c_str());
+#endif
+}
+
+/* Look up the backends a tenant names in the VCL being loaded. A backend
+   the VCL declares is found by its name. A director a VMOD created is not,
+   on Varnish Enterprise. The named backends take slots of max_backends,
+   which leaves riscv.add_backend() the rest. */
+static std::vector<VCL_BACKEND> resolve_backends(VRT_CTX, const TenantConfig& config)
+{
+	const auto& names = config.group.backends;
+	const size_t max = std::min(config.max_backends(), Cache<const director>::CACHE_MAX);
+	if (names.size() > max)
+		throw std::runtime_error("Tenant " + config.name + " names more than "
+			+ std::to_string(max) + " backends");
+	std::vector<VCL_BACKEND> backends;
+	for (const auto& name : names) {
+		if (std::count(names.begin(), names.end(), name) > 1)
+			throw std::runtime_error("Tenant " + config.name + " names backend '" + name + "' twice");
+		VCL_BACKEND dir = lookup_backend(ctx, name);
+		if (dir == nullptr)
+			throw std::runtime_error("Tenant " + config.name + ": no backend named '" + name + "'");
+		backends.push_back(dir);
+	}
+	return backends;
 }
 
 inline void load_tenant(VRT_CTX, TenantRegistry& reg, TenantConfig&& config)
@@ -155,14 +206,15 @@ inline void load_tenant(VRT_CTX, TenantRegistry& reg, TenantConfig&& config)
 		const auto hash = riscv::crc32c(config.name.c_str(), config.name.size());
 		auto existing = reg.map.find(hash);
 		if (existing != reg.map.end()) {
-			if (existing->second->config.name == config.name)
+			const auto& other = existing->second.tenant->config.name;
+			if (other == config.name)
 				throw std::runtime_error("Tenant " + config.name + " already existed!");
 			throw std::runtime_error("Tenant " + config.name + " has the same hash as tenant "
-				+ existing->second->config.name + "; rename one of them");
+				+ other + "; rename one of them");
 		}
 		auto tenant = std::make_shared<SandboxTenant>(ctx, config);
 		reg.pending.insert(tenant.get());
-		reg.map.emplace(hash, std::move(tenant));
+		reg.map.emplace(hash, TenantEntry{std::move(tenant), {}});
 	} catch (const std::exception& e) {
 		VRT_fail(ctx, "Exception when creating machine '%s': %s",
 			config.name.c_str(), e.what());
@@ -238,6 +290,9 @@ static void configure_tenant(TenantGroup& group, const T& obj)
 		fetch.allow_insecure = f.value("allow_insecure", fetch.allow_insecure);
 		fetch.compile(allow);
 		group.fetch = std::make_shared<const FetchConfig>(std::move(fetch));
+	}
+	if (obj.contains("backends")) {
+		group.backends = obj["backends"].template get<std::vector<std::string>>();
 	}
 	if (obj.contains("arguments")) {
 		group.argv = std::make_shared<std::vector<std::string>>(
@@ -335,6 +390,21 @@ rvs::SandboxTenant* tenant_find(struct vmod_priv* priv, const char* name, size_t
 	return rvs::find_tenant(rvs::registry(priv), {name, namelen});
 }
 
+namespace rvs {
+Script* tenant_fork(VRT_CTX, struct vmod_priv* priv, std::string_view name,
+	bool debug, bool permanent)
+{
+	auto* entry = find_entry(registry(priv), name);
+	if (UNLIKELY(entry == nullptr)) {
+		VSLb(ctx->vsl, SLT_VCL_Error,
+		    "riscv.fork: Could not find tenant '%.*s'",
+		    (int)name.size(), name.data());
+		return nullptr;
+	}
+	return entry->tenant->vmfork(ctx, entry->backends, debug, permanent);
+}
+} // rvs
+
 extern "C"
 void init_tenants_str(VRT_CTX, struct vmod_priv* priv, const char* str)
 {
@@ -375,7 +445,14 @@ void finalize_tenants_impl(VRT_CTX, struct vmod_priv* priv)
 		return;
 	prune_index();
 	try {
-		for (auto& [hash, tenant] : reg->map) {
+		/* Every pending tenant finds its backends before any is loaded,
+		   so that a missing one leaves the others pending, not skipped */
+		for (auto& [hash, entry] : reg->map) {
+			if (reg->pending.contains(entry.tenant.get()))
+				entry.backends = resolve_backends(ctx, entry.tenant->config);
+		}
+		for (auto& [hash, entry] : reg->map) {
+			auto& tenant = entry.tenant;
 			if (!reg->pending.erase(tenant.get()))
 				continue;
 			/* Stamped before reading, so that a file replaced while it

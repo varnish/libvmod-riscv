@@ -1,0 +1,263 @@
+varnishtest "RISC-V: a tenant's \"backends\", selected by name"
+
+server s1 -repeat 20 {
+	rxreq
+	txresp -hdr "X-Server: s1"
+} -start
+
+server s2 -repeat 20 {
+	rxreq
+	txresp -hdr "X-Server: s2"
+} -start
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+#define find_backend(name) \
+	syscall3(ECALL_FIND_BACKEND, (long)name, sizeof(name)-1, 0)
+#define select_backend(name) \
+	syscall3(ECALL_FIND_BACKEND, (long)name, sizeof(name)-1, 1)
+
+static long s2_at_init = -2;
+
+static void on_recv(int req)
+{
+	char url[128];
+	const long len = get_url(req, url, sizeof(url)-1);
+	url[len < 0 ? 0 : len] = 0;
+
+	if (strcmp(url, "/s2") == 0) {
+		decision("pass", 4, syscall1(ECALL_SET_BACKEND, find_backend("s2")));
+	} else if (strcmp(url, "/init") == 0) {
+		decision("pass", 4, s2_at_init);
+	} else if (strcmp(url, "/select") == 0) {
+		decision("pass", 4, select_backend("s2"));
+	} else if (strcmp(url, "/select-unknown") == 0) {
+		decision("pass", 4, select_backend("s3"));
+	} else if (strcmp(url, "/unknown") == 0) {
+		decision("pass", 4, find_backend("s3"));
+	} else if (strcmp(url, "/added") == 0) {
+		decision("pass", 4, syscall1(ECALL_SET_BACKEND, 2));
+	} else {
+		decision("pass", 4, 0);
+	}
+}
+
+void start(int, char**) {
+	/* The index is known before any request */
+	s2_at_init = find_backend("s2");
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+varnish v1 -arg "-p thread_pools=1" -vcl+backend {
+	vcl 4.1;
+	import riscv;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"backends": ["s1", "s2"]
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		set req.backend_hint = s1;
+		if (req.http.X-Permanent) {
+			if (!riscv.permanent_fork(req.http.Host)) {
+				return (synth(403));
+			}
+		} elsif (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		if (req.url == "/added") {
+			# After the tenant's two
+			set req.http.X-Added = riscv.add_backend(s2);
+		}
+		riscv.vcall(ON_REQUEST);
+		set req.http.X-Result = riscv.want_status();
+		return (pass);
+	}
+
+	sub vcl_deliver {
+		set resp.http.X-Result = req.http.X-Result;
+		set resp.http.X-Added = req.http.X-Added;
+		set resp.http.X-Pooled = riscv.pooled_vms();
+	}
+} -start
+
+client c1 {
+	# Selected by name, in the order of "backends"
+	txreq -url "/s2" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Server == "s2"
+	expect resp.http.X-Result == "0"
+
+	# Looked up during initialization
+	txreq -url "/init" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.http.X-Server == "s1"
+	expect resp.http.X-Result == "1"
+
+	# Found and selected in one call
+	txreq -url "/select" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.http.X-Server == "s2"
+	expect resp.http.X-Result == "0"
+
+	# Not selected when the tenant does not have it
+	txreq -url "/select-unknown" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.http.X-Server == "s1"
+	expect resp.http.X-Result == "-1"
+
+	# A name the tenant does not have, even if the VCL does
+	txreq -url "/unknown" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.http.X-Server == "s1"
+	expect resp.http.X-Result == "-1"
+
+	# riscv.add_backend() comes after them
+	txreq -url "/added" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.http.X-Server == "s2"
+	expect resp.http.X-Added == "2"
+	expect resp.http.X-Result == "0"
+} -run
+
+# A permanent VM gets the backends again for every task, so they do not
+# pile up in front of riscv.add_backend() when the VM is reused.
+client c1 {
+	loop 4 {
+		txreq -url "/s2" -hdr "Host: xpizza.com" -hdr "X-Permanent: 1"
+		rxresp
+		expect resp.http.X-Server == "s2"
+		expect resp.http.X-Result == "0"
+
+		txreq -url "/added" -hdr "Host: xpizza.com" -hdr "X-Permanent: 1"
+		rxresp
+		expect resp.http.X-Server == "s2"
+		expect resp.http.X-Added == "2"
+		expect resp.http.X-Result == "0"
+	}
+	# 8 tasks did not create 8 VMs: they were reused
+	expect resp.http.X-Pooled <= 4
+} -run
+
+# Every VCL finds the backends by name for itself, even when it keeps
+# running the tenant of the VCL before it.
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend s1 { .host = "${s1_addr}"; .port = "${s1_port}"; }
+	backend s2 { .host = "${s1_addr}"; .port = "${s1_port}"; }
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"backends": ["s1", "s2"]
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (req.http.X-Permanent) {
+			if (!riscv.permanent_fork(req.http.Host)) {
+				return (synth(403));
+			}
+		} elsif (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		if (req.url == "/added") {
+			set req.http.X-Added = riscv.add_backend(s2);
+		}
+		riscv.vcall(ON_REQUEST);
+		set req.http.X-Result = riscv.want_status();
+		return (pass);
+	}
+
+	sub vcl_deliver {
+		set resp.http.X-Result = req.http.X-Result;
+		set resp.http.X-Added = req.http.X-Added;
+		set resp.http.X-Pooled = riscv.pooled_vms();
+	}
+}
+
+client c2 {
+	txreq -url "/s2" -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.http.X-Server == "s1"
+	expect resp.http.X-Result == "0"
+
+	# The permanent VMs of the VCL before are reused, with the
+	# backends of this VCL
+	loop 4 {
+		txreq -url "/s2" -hdr "Host: xpizza.com" -hdr "X-Permanent: 1"
+		rxresp
+		expect resp.http.X-Server == "s1"
+		expect resp.http.X-Result == "0"
+
+		txreq -url "/added" -hdr "Host: xpizza.com" -hdr "X-Permanent: 1"
+		rxresp
+		expect resp.http.X-Server == "s1"
+		expect resp.http.X-Added == "2"
+		expect resp.http.X-Result == "0"
+	}
+	expect resp.http.X-Pooled <= 4
+} -run
+
+varnish v1 -errvcl {Tenant bad.com: no backend named 's3'} {
+	vcl 4.1;
+	import riscv;
+	backend s1 { .host = "${s1_addr}"; .port = "${s1_port}"; }
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"backends": ["s1", "s3"]
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+}
+
+varnish v1 -errvcl {Tenant bad.com names backend 's1' twice} {
+	vcl 4.1;
+	import riscv;
+	backend s1 { .host = "${s1_addr}"; .port = "${s1_port}"; }
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"backends": ["s1", "s1"]
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+}
+
+varnish v1 -errvcl {Tenant bad.com names more than 32 backends} {
+	vcl 4.1;
+	import riscv;
+	backend s1 { .host = "${s1_addr}"; .port = "${s1_port}"; }
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"backends": ["b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9", "b10", "b11", "b12", "b13", "b14", "b15", "b16", "b17", "b18", "b19", "b20", "b21", "b22", "b23", "b24", "b25", "b26", "b27", "b28", "b29", "b30", "b31", "b32"]
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+}

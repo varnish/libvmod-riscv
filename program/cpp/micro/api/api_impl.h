@@ -435,6 +435,16 @@ inline std::string HTTP_Resp::reason() const {
 inline void HTTP_Req::set_backend(int be) {
 	syscall(ECALL_SET_BACKEND, be);
 }
+inline int find_backend(std::string_view name)
+{
+	asm ("" ::: "memory");
+	return syscall(ECALL_FIND_BACKEND, (long) name.data(), name.size(), 0);
+}
+inline bool HTTP_Req::set_backend(std::string_view name) {
+	/* Finds and selects it in one call */
+	asm ("" ::: "memory");
+	return syscall(ECALL_FIND_BACKEND, (long) name.data(), name.size(), 1) == 0;
+}
 
 inline void HTTP_Resp::set_cacheable(bool c) {
 	syscall(ECALL_CACHEABLE, 1, c);

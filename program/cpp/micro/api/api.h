@@ -32,6 +32,10 @@ void hash_data(const HeaderField&);
 /* Caching */
 void make_uncacheable_for(float secs);
 
+/* The index of a backend in the tenant's "backends", for set_backend(),
+   or -1. It does not change, so it may be looked up during init. */
+int find_backend(std::string_view name);
+
 /* Base64 (RFC 4648), flags: BASE64_FLAG_URL, BASE64_FLAG_NOPAD */
 std::string base64_encode(std::string_view data, unsigned flags = 0);
 std::optional<std::string> base64_decode(std::string_view text, unsigned flags = 0);
@@ -163,6 +167,8 @@ struct HTTP {
 struct HTTP_Req : public HTTP {
 	std::string method() const;
 	void set_backend(int);
+	/* A backend of the tenant's "backends", by name. False if not there. */
+	bool set_backend(std::string_view name);
 };
 struct HTTP_Resp : public HTTP {
 	std::string reason() const;

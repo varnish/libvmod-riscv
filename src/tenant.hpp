@@ -74,10 +74,13 @@ struct TenantGroup {
 	uint64_t max_instructions  = 20'000'000ull;
 	uint32_t max_memory_mb     = 32; // 32MB
 	uint32_t max_heap_mb       = 512; // 512MB
-	size_t   max_backends = 8;
+	size_t   max_backends = 32;
 	size_t   max_regex    = 32;
 	bool	 verbose      = false;
 	std::shared_ptr<const FetchConfig> fetch;
+	/* VCL backends the guest may select, by name. Each VCL looks them
+	   up for itself, and they take the first slots of set_backend(). */
+	std::vector<std::string> backends;
 
 	/* Atomically swappable: readers snapshot this shared_ptr, writers
 	   create a new vector and exchange the pointer. */

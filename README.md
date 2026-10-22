@@ -111,6 +111,30 @@ if (req.http.X-JWT-Sub == "") {
 }
 ```
 
+## Selecting backends
+
+A tenant can specify which VCL backends its program may select. During VCL initialization, `finalize_tenants()` resolves each configured backend by name. If any backend is missing, `vcl_init` fails:
+```json
+"api.example.com": {
+	"filename": "/path/to/program",
+	"group": "test",
+	"backends": ["origin", "images"]
+}
+```
+The program can then select a backend by name or by its index in the configured list:
+```cpp
+static void on_client_request(Request req)
+{
+	if (req.url().starts_with("/img/"))
+		req.set_backend("images");
+}
+```
+Backend indices remain stable for the lifetime of the tenant. A program can use `api::find_backend()` during initialization to look up an index, then pass that index to `req.set_backend(int)` when handling requests. Alternatively, `req.set_backend("images")` looks up and selects the backend in a single call.
+
+Each tenant supports up to 32 backends. Configured backends occupy the first slots; backends added for individual requests with `riscv.add_backend()` use the remaining slots. If all 32 slots are occupied by configured backends, `riscv.add_backend()` returns `-1`.
+
+Name resolution supports backends declared in VCL with `backend name { ... }`. On Varnish Enterprise, it does not support directors created by VMODs such as `directors`, `goto`, and `udo`.
+
 ## Outgoing HTTP requests
 
 On Varnish Enterprise, a tenant can make HTTP and HTTPS GET and POST requests with the `ECALL_FETCH` system call. They are run by libcurv, the HTTP engine that varnishd links and starts (the one behind vmod_http), so several requests can be in flight at once while the program carries on. The program then waits for any or all of them. A tenant may only reach the URLs its `fetch` allow list permits; without one, every request is refused:
