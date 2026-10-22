@@ -36,7 +36,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.0
+          version: 0.17.0
 
       - name: Install llvm-objcopy
         run: sudo apt-get update && sudo apt-get install -y llvm-18

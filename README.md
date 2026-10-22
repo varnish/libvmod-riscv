@@ -111,6 +111,64 @@ if (req.http.X-JWT-Sub == "") {
 }
 ```
 
+## Outgoing HTTP requests
+
+On Varnish Enterprise, a tenant can make HTTP and HTTPS GET and POST requests with the `ECALL_FETCH` system call. They are run by libcurv, the HTTP engine that varnishd links and starts (the one behind vmod_http), so several requests can be in flight at once while the program carries on. The program then waits for any or all of them. A tenant may only reach the URLs its `fetch` allow list permits; without one, every request is refused:
+```json
+"api.example.com": {
+	"filename": "/path/to/program",
+	"group": "test",
+	"fetch": {
+		"allow": ["https://api.example.com/v1/", "http://10.0.0.5:8080/"],
+		"max_requests": 8,
+		"timeout_ms": 5000,
+		"connect_timeout_ms": 2000,
+		"max_request_body": 1048576,
+		"max_response_body": 16777216,
+		"max_redirects": 0,
+		"allow_insecure": false
+	}
+}
+```
+Each allow list entry specifies a scheme, host, port (using the scheme's default if omitted), and path prefix. Both the entries and the program's request URLs are parsed by curl. End the prefix with a trailing slash unless it should match any path beginning with that prefix. URLs are rejected if a server could interpret their paths as traversing above the allowed prefix, including paths containing encoded parent-directory segments (`%2e%2e`), `..;`, or backslashes.
+
+Programs cannot set headers that select the virtual host or control message framing, such as `Host`, `Content-Length`, `Transfer-Encoding`, and `Connection`. `max_requests` applies per task, `timeout_ms` limits the duration of each request including the redirects it follows, and `allow_insecure` controls whether requests may disable TLS certificate verification. The other values shown are the defaults.
+
+Redirects are disabled by default. Set `max_redirects` to a positive value to enable them and limit the number of redirects followed per request. The maximum supported value is 20. Each redirect target must be permitted by the allow list and uses the TLS files configured in its matching entry. For 301, 302, and 303 redirects, POST requests are converted to GET requests, with the body and `Content-Type` header removed. For 307 and 308 redirects, the method, body, and headers are preserved. The `Authorization`, `Proxy-Authorization`, and `Cookie` headers are removed when a redirect changes the scheme, host, or port. If a redirect cannot be followed because the redirect limit has been reached, the target is not allowed, or `timeout_ms` has elapsed, the redirect response is returned and the reason is logged as a `VCL_Error`. Redirects do not count against `max_requests`.
+
+An HTTPS entry can also be an object specifying TLS files for its origin. Use `ca_file` to verify servers with a private CA or a self-signed certificate, or `client_cert` and `client_key` to configure mutual TLS:
+```json
+"allow": [
+	"https://api.example.com/v1/",
+	{
+		"url": "https://10.0.0.5:8443/internal/",
+		"ca_file": "/etc/varnish/tenants/x/internal-ca.pem",
+		"client_cert": "/etc/varnish/tenants/x/client.pem",
+		"client_key": "/etc/varnish/tenants/x/client.key"
+	}
+]
+```
+
+TLS files must use PEM format, and their paths must be absolute. The sandboxed program cannot access these files or select alternative files, so private keys remain outside the sandbox. `ca_file` replaces the system CA certificates for that entry. You can omit `client_key` if `client_cert` also contains the private key.
+
+Entries with TLS files must have a path ending in a slash. Entries for the same URL cannot specify different TLS files. If multiple entries allow a request URL, the entry with the longest matching path prefix determines which TLS files are used. Requests that disable certificate verification (`FETCH_FLAG_INSECURE`) are rejected for origins configured with TLS files.
+
+The Varnish worker process reads the TLS files for each new connection, so the files must be readable by the worker's user. File changes apply to subsequent connections without a reload. With libcurl versions older than 7.83.1, requests using TLS files disable connection and TLS session reuse to prevent connections from being shared across different TLS configurations.
+
+```cpp
+int32_t h[3] = {
+	api::fetch_get("https://api.example.com/v1/a", "Accept: application/json"),
+	api::fetch_get("https://api.example.com/v1/b"),
+	api::fetch_post("http://10.0.0.5:8080/log", body, "Content-Type: text/plain"),
+};
+api::FetchResponse r[3];
+api::fetch_wait(h, r, FETCH_FLAG_ANY); // at least one is done: its handle is now -1
+api::fetch_wait(h, r);                 // all of them are done
+if (r[0].ok() && r[0].status() == 200)
+	use(r[0].body(), r[0].header("Content-Type"));
+```
+The whole response is handed over when a request finishes: the system call allocates its body and headers on the program's native heap, with the exact sizes, and `FetchResponse` frees them. See `ECALL_FETCH` in [syscalls.h](/src/machine/syscalls.h) for the system call itself.
+
 ## JavaScript example program
 
 Tenant logic can also be written in plain JavaScript, powered by the embedded [QuickJS-ng](https://github.com/nicowillis/quickjs-ng) engine. No compiler or external toolchain is required: the QuickJS program is embedded in the VMOD. Point `"filename"` at a `.js` file:
@@ -126,7 +184,7 @@ sub vcl_init {
 }
 ```
 
-The VMOD runs the embedded program with the file as its last argument. A reload loads the file again if it has changed, and `live_update_file()` with a `.js` file replaces the script. After changing `program/cpp/js.cpp`, rebuild the embedded program with `make -C program blob` (Zig 0.14.0 and llvm-objcopy) and commit `program/js.elf`.
+The VMOD runs the embedded program with the file as its last argument. A reload loads the file again if it has changed, and `live_update_file()` with a `.js` file replaces the script. After changing `program/cpp/js.cpp`, rebuild the embedded program with `make -C program blob` (Zig 0.17.0 and llvm-objcopy) and commit `program/js.elf`.
 
 The source can also be passed as a string directly in your VCL via `add_main_argument`, with the tenant `filename` pointing at a `js` binary built from `program/cpp/js.cpp`:
 

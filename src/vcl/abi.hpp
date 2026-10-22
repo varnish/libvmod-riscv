@@ -8,7 +8,8 @@
  *
  * Numbers are Carapace's 490..=510 shifted by 50, so the whole block sits
  * between the VMOD's own API (500..=539, machine/syscalls.h; its base64 is
- * 570) and the native heap and memory helpers (580.., NATIVE_SYSCALLS_BASE).
+ * 570 and fetch 571) and the native heap and memory helpers (580..,
+ * NATIVE_SYSCALLS_BASE).
  * The compiler's `define_syscalls!` table (vcl/compiler/src/ir.rs) is the
  * other half of this file; a number changed here has to change there.
  *

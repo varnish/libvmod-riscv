@@ -85,7 +85,7 @@ make -C vcl/vclc blob            # after changing vcl/compiler or vcl/runtime
 Both builds are pinned to Rust 1.91.0 and are reproducible, so an unchanged
 source gives an unchanged blob. They need the `riscv64gc-unknown-none-elf` and
 `riscv64gc-unknown-linux-musl` targets, which the toolchain files install,
-and Zig 0.14.0: `zig cc` links `vclc.elf` against its own musl, so no RISC-V
+and Zig 0.17.0: `zig cc` links `vclc.elf` against its own musl, so no RISC-V
 cross-gcc is needed. Set `ZIG` if `zig` is not on the `PATH`. CI rebuilds
 both blobs from source and fails if they differ from the committed ones.
 

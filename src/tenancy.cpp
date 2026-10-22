@@ -170,6 +170,43 @@ inline void load_tenant(VRT_CTX, TenantRegistry& reg, TenantConfig&& config)
 }
 
 template <typename T>
+static std::string allow_string(const T& value, const std::string& key)
+{
+	if (!value.is_string())
+		throw std::runtime_error("fetch: \"" + key + "\" of an allow entry must be a string");
+	return value.template get<std::string>();
+}
+
+/* An allow entry is a URL, or an object with the URL and the TLS files
+   for it. Unknown keys are refused: a misspelt "ca_file" would otherwise
+   leave the system CAs in place. */
+template <typename T>
+static FetchAllow parse_fetch_allow(const T& e)
+{
+	FetchAllow entry;
+	if (e.is_string()) {
+		entry.url = e.template get<std::string>();
+		return entry;
+	}
+	if (!e.is_object() || !e.contains("url"))
+		throw std::runtime_error("fetch: an allow entry is a URL, or an object with \"url\"");
+	for (const auto& kv : e.items()) {
+		const auto& key = kv.key();
+		if (key == "url")
+			entry.url = allow_string(kv.value(), key);
+		else if (key == "ca_file")
+			entry.tls.ca_file = allow_string(kv.value(), key);
+		else if (key == "client_cert")
+			entry.tls.client_cert = allow_string(kv.value(), key);
+		else if (key == "client_key")
+			entry.tls.client_key = allow_string(kv.value(), key);
+		else
+			throw std::runtime_error("fetch: unknown key in allow entry: " + key);
+	}
+	return entry;
+}
+
+template <typename T>
 static void configure_tenant(TenantGroup& group, const T& obj)
 {
 	if (obj.contains("max_memory")) {
@@ -180,6 +217,27 @@ static void configure_tenant(TenantGroup& group, const T& obj)
 	}
 	if (obj.contains("max_instructions")) {
 		group.max_instructions = obj["max_instructions"];
+	}
+	if (obj.contains("fetch")) {
+		const auto& f = obj["fetch"];
+		FetchConfig fetch;
+		std::vector<FetchAllow> allow;
+		if (f.contains("allow")) {
+			if (!f["allow"].is_array())
+				throw std::runtime_error("fetch: \"allow\" must be an array");
+			for (const auto& e : f["allow"]) {
+				allow.push_back(parse_fetch_allow(e));
+			}
+		}
+		fetch.max_requests = f.value("max_requests", fetch.max_requests);
+		fetch.timeout_ms = f.value("timeout_ms", fetch.timeout_ms);
+		fetch.connect_timeout_ms = f.value("connect_timeout_ms", fetch.connect_timeout_ms);
+		fetch.max_request_body = f.value("max_request_body", fetch.max_request_body);
+		fetch.max_response_body = f.value("max_response_body", fetch.max_response_body);
+		fetch.max_redirects = f.value("max_redirects", fetch.max_redirects);
+		fetch.allow_insecure = f.value("allow_insecure", fetch.allow_insecure);
+		fetch.compile(allow);
+		group.fetch = std::make_shared<const FetchConfig>(std::move(fetch));
 	}
 	if (obj.contains("arguments")) {
 		group.argv = std::make_shared<std::vector<std::string>>(

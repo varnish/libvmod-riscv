@@ -52,6 +52,7 @@ add_executable(fuzz_api
 	${SRC}/script.cpp
 	${SRC}/script_functions.cpp
 	${SRC}/script_base64.cpp
+	${SRC}/script_fetch.cpp
 	${SRC}/script_sha256.cpp
 	${SRC}/script_debug.cpp
 	${SRC}/machine_instance.cpp
@@ -73,6 +74,9 @@ target_compile_definitions(fuzz_api PRIVATE
 	VMOD=1 _GNU_SOURCE VARNISH_PLUS=1
 	FUZZ_GUEST_ELF="${GUEST_ELF}"
 )
+## ECALL_FETCH needs libcurv in varnishd: the fuzzer gets the FETCH_ENOSYS stub
+set_source_files_properties(${SRC}/script_fetch.cpp PROPERTIES
+	COMPILE_DEFINITIONS "FETCH_SUPPORTED=0")
 set_source_files_properties(${SRC}/vcl/vclc_blob.c PROPERTIES
 	COMPILE_DEFINITIONS "VCLC_ELF_PATH=\"${SRC}/../vcl/vclc.elf\"")
 ## Only the VCL glue the scripting API reaches is linked in: the rest of

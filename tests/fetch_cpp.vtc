@@ -1,0 +1,91 @@
+varnishtest "ECALL_FETCH from C++: api::fetch_get/post, fetch_wait for any and all, FetchResponse"
+
+feature cmd "varnishd -V 2>&1 | grep -q varnish-plus"
+# The VMOD logs this at tenant load when it has no ECALL_FETCH (built
+# without Varnish Enterprise, or with libcurl older than 7.62)
+feature cmd "! grep -q 'ECALL_FETCH is disabled' ${VMOD_SO}"
+feature cmd "ls /usr/bin/riscv64-linux-gnu-g++* >/dev/null 2>&1"
+
+server s1 {
+	rxreq
+	expect req.http.X-A == "1"
+	txresp -hdr "X-Server: one" -body "one"
+} -start
+server s2 {
+	rxreq
+	delay 0.5
+	txresp -body "two"
+} -start
+server s3 {
+	rxreq
+	expect req.body == "data"
+	txresp -status 201 -body "three"
+} -start
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include <api.h>
+#include <string>
+static std::string result;
+static const char* go(const char*, size_t)
+{
+	int32_t h[2] = {
+		api::fetch_get("http://${s1_addr}:${s1_port}/", "X-A: 1"),
+		api::fetch_get("http://${s2_addr}:${s2_port}/"),
+	};
+	api::FetchResponse r[2];
+	long any = api::fetch_wait(h, r, FETCH_FLAG_ANY);
+	result = "any=" + std::to_string(any) + " h1=" + std::to_string(h[1]);
+	long all = api::fetch_wait(h, r);
+	result += " all=" + std::to_string(all);
+	for (auto& resp : r)
+		result += " " + std::to_string(resp.status()) + ":" + std::string(resp.body());
+	result += " hdr=" + std::string(r[0].header("x-server").value_or("none"));
+	int32_t p = api::fetch_post("http://${s3_addr}:${s3_port}/", "data");
+	api::FetchResponse pr;
+	api::fetch_wait({&p, 1}, {&pr, 1});
+	result += " post=" + std::to_string(pr.status()) + ":" + std::string(pr.body());
+	auto denied = api::fetch("http://example.com/");
+	result += " denied=" + std::to_string(denied.error());
+	return result.c_str();
+}
+int main() {
+	api::register_function("go", go);
+	api::wait_for_requests([] (api::Request) {});
+}
+EOF
+}
+
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"t": {
+				"filename": "${tmpdir}/${testname}.cpp",
+				"group": "test",
+				"fetch": { "allow": [
+					"http://${s1_addr}:${s1_port}/",
+					"http://${s2_addr}:${s2_port}/",
+					"http://${s3_addr}:${s3_port}/"
+				] }
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+	sub vcl_recv {
+		if (!riscv.fork("t")) { return (synth(500)); }
+		set req.http.X-R = riscv.call("go", "");
+		return (synth(200));
+	}
+	sub vcl_synth {
+		set resp.http.X-R = req.http.X-R;
+	}
+} -start
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.http.X-R == "any=1 h1=1 all=1 200:one 200:two hdr=one post=201:three denied=-2"
+} -run

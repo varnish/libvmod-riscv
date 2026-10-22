@@ -24,6 +24,52 @@ inline std::shared_ptr<T> atomic_exchange(std::shared_ptr<T>* p, std::type_ident
 }
 #pragma GCC diagnostic pop
 
+/* TLS files for the requests to an origin, as absolute paths. They are
+   the host's: the guest never sees them, and can not pick others. */
+struct FetchTLS {
+	std::string ca_file;     // verify the server with these CAs only
+	std::string client_cert; // present this certificate (mutual TLS)
+	std::string client_key;  // its private key, unless in client_cert
+	bool operator==(const FetchTLS&) const = default;
+	bool empty() const noexcept {
+		return ca_file.empty() && client_cert.empty() && client_key.empty();
+	}
+};
+
+/* An entry of the "allow" list, as written. Only its rule is kept. */
+struct FetchAllow {
+	std::string url;
+	FetchTLS    tls;
+};
+
+/* An origin a tenant may send requests to, with ECALL_FETCH. Parsed by
+   curl, as the URLs the guest gives are, so that both are read the same. */
+struct FetchRule {
+	std::string scheme;
+	std::string host;
+	unsigned    port = 0;
+	std::string path; // a prefix
+	FetchTLS    tls;
+	bool operator==(const FetchRule&) const = default;
+};
+
+/* Outgoing HTTP access ("fetch" in the tenant JSON). Disabled when the
+   allow list is empty. */
+struct FetchConfig {
+	std::vector<FetchRule> rules; // parsed from the allow list
+	uint32_t max_requests       = 8;      // per task
+	uint32_t timeout_ms         = 5000;   // the whole transfer
+	uint32_t connect_timeout_ms = 2000;
+	uint32_t max_request_body   = 1u << 20;
+	uint32_t max_response_body  = 16u << 20;
+	uint32_t max_redirects      = 0;      // per request, 0: not followed
+	bool     allow_insecure     = false;  // FETCH_FLAG_INSECURE
+	bool operator==(const FetchConfig&) const = default;
+
+	/* Parse the allow list into rules, or throw */
+	void compile(const std::vector<FetchAllow>& allow);
+};
+
 struct TenantGroup {
 	uint64_t max_instructions  = 20'000'000ull;
 	uint32_t max_memory_mb     = 32; // 32MB
@@ -31,6 +77,7 @@ struct TenantGroup {
 	size_t   max_backends = 8;
 	size_t   max_regex    = 32;
 	bool	 verbose      = false;
+	std::shared_ptr<const FetchConfig> fetch;
 
 	/* Atomically swappable: readers snapshot this shared_ptr, writers
 	   create a new vector and exchange the pointer. */

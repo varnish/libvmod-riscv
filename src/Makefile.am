@@ -28,7 +28,7 @@ AM_CXXFLAGS = $(VARNISHAPI_CFLAGS) -Wall
 AM_LDFLAGS  = $(VARNISHAPI_LIBS) $(VMOD_LDFLAGS)
 
 if BUILD_RISCV_FOR_VCP
-AM_CPPFLAGS += -DVARNISH_PLUS=1
+AM_CPPFLAGS += -DVARNISH_PLUS=1 $(CURL_CFLAGS)
 endif
 
 vmod_LTLIBRARIES = libvmod_riscv.la
@@ -54,6 +54,7 @@ libvmod_riscv_la_SOURCES = \
 	script_debug.cpp \
 	script_functions.cpp \
 	script_base64.cpp \
+	script_fetch.cpp \
 	script_sha256.cpp \
 	tenancy.cpp \
 	varnish_cpp_interface.cpp \
@@ -83,6 +84,11 @@ libvmod_riscv_la_LIBADD = \
 	$(CRYPTO_LIBS) \
 	$(PTHREAD_LIBS)
 
+if BUILD_RISCV_FOR_VCP
+## ECALL_FETCH uses libcurv, which varnishd (Enterprise) links and starts
+libvmod_riscv_la_LIBADD += $(CURL_LIBS)
+endif
+
 noinst_HEADERS = \
 	builder/builder.hpp \
 	machine_instance.hpp \
@@ -100,6 +106,7 @@ noinst_HEADERS = \
 	vmod_riscv.h \
 	vmod_riscv_sandbox.h \
 	vmod_util.h \
+	vcp/curv.h \
 	vcl/abi.hpp \
 	vcl/compiler.hpp \
 	vcl/vcl_program.hpp \

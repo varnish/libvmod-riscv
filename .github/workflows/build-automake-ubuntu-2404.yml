@@ -43,6 +43,7 @@ jobs:
             cmake \
             ninja-build \
             libssl-dev \
+            libcurl4-openssl-dev \
             libjemalloc-dev \
             python3 \
             python3-docutils \
@@ -58,7 +59,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.14.0
+          version: 0.17.0
 
       - name: Build RISC-V programs
         run: program/build.sh

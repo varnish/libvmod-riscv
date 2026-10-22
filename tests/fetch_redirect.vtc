@@ -1,0 +1,279 @@
+varnishtest "ECALL_FETCH: following redirects with max_redirects, each hop checked against the allow list"
+
+feature cmd "varnishd -V 2>&1 | grep -q varnish-plus"
+feature cmd "! grep -q 'ECALL_FETCH is disabled' ${VMOD_SO}"
+
+# Same origin, relative Location: the credentials stay
+server s1 {
+	rxreq
+	expect req.url == "/a"
+	txresp -status 302 -hdr "Location: /b"
+	rxreq
+	expect req.method == "GET"
+	expect req.url == "/b"
+	expect req.http.Authorization == "Bearer x"
+	expect req.http.Cookie == "c=1"
+	txresp -body "b"
+} -start
+
+# Where s2 redirects to
+server s3 {
+	rxreq
+	expect req.method == "POST"
+	expect req.url == "/in/p"
+	expect req.body == "data"
+	expect req.http.Content-Type == "text/plain"
+	expect req.http.X-Keep == "1"
+	expect req.http.Authorization == <undef>
+	expect req.http.Cookie == <undef>
+	txresp -body "posted"
+} -start
+
+# 307 to another origin: still a POST with its body, without credentials
+server s2 {
+	rxreq
+	expect req.method == "POST"
+	txresp -status 307 -hdr "Location: http://${s3_addr}:${s3_port}/in/p"
+} -start
+
+# 303 after a POST: a GET, without the body or its headers
+server s4 {
+	rxreq
+	expect req.method == "POST"
+	txresp -status 303 -hdr "Location: /done"
+	rxreq
+	expect req.method == "GET"
+	expect req.url == "/done"
+	expect req.bodylen == 0
+	expect req.http.Content-Type == <undef>
+	expect req.http.X-Keep == "1"
+	txresp -body "done"
+} -start
+
+# Away from the allow list: not followed, the redirect is the response
+server s5 {
+	rxreq
+	txresp -status 301 -hdr "Location: http://example.com/x"
+} -start
+
+# A loop: max_redirects is 2, so three requests and then the redirect
+server s6 {
+	rxreq
+	txresp -status 302 -hdr "Location: /loop"
+	rxreq
+	txresp -status 302 -hdr "Location: /loop"
+	rxreq
+	txresp -status 302 -hdr "Location: /loop"
+} -start
+
+# A Location longer than the program's URLs may be: not followed
+server s7 {
+	rxreq
+	txresp -status 302 -hdr "Location: /${string,repeat,9000,a}"
+} -start
+
+shell {
+cat >${tmpdir}/${testname}.cpp <<-EOF
+#include "riscv_api.hpp"
+
+struct fetch_response {
+	int32_t status;
+	int32_t error;
+	char*   body;
+	size_t  body_len;
+	char*   headers;
+	size_t  headers_len;
+};
+
+static long ecall7(long op, long a1, long a2, long a3, long a4, long a5, long a6)
+{
+	register long a0_ asm("a0") = op;
+	register long a1_ asm("a1") = a1;
+	register long a2_ asm("a2") = a2;
+	register long a3_ asm("a3") = a3;
+	register long a4_ asm("a4") = a4;
+	register long a5_ asm("a5") = a5;
+	register long a6_ asm("a6") = a6;
+	register long syscall_id asm("a7") = ECALL_FETCH;
+	asm volatile ("ecall" : "+r"(a0_) : "r"(a1_), "r"(a2_), "r"(a3_), "r"(a4_), "r"(a5_), "r"(a6_), "r"(syscall_id) : "memory");
+	return a0_;
+}
+
+static long slen(const char* s)
+{
+	long n = 0;
+	while (s[n]) n++;
+	return n;
+}
+static bool contains(const char* s, long len, const char* what)
+{
+	const long wlen = slen(what);
+	for (long i = 0; i + wlen <= len; i++) {
+		long j = 0;
+		while (j < wlen && s[i+j] == what[j]) j++;
+		if (j == wlen) return true;
+	}
+	return false;
+}
+
+static long get(const char* url, const char* hdrs = "")
+{
+	return ecall7(FETCH_GET, (long)url, slen(url), (long)hdrs, slen(hdrs), 0, 0);
+}
+static long post(const char* url, const char* hdrs, const char* body)
+{
+	return ecall7(FETCH_POST, (long)url, slen(url), (long)hdrs, slen(hdrs), (long)body, slen(body));
+}
+static long wait(int32_t* h, long n, fetch_response* r)
+{
+	return ecall7(FETCH_WAIT, (long)h, n, (long)r, 10000, 0, 0);
+}
+
+static char out[1024];
+static long outlen = 0;
+static void put(const char* s, long n) { for (long i = 0; i < n; i++) out[outlen++] = s[i]; }
+static void put_num(long v) { char b[8]; int n = 0; do { b[n++] = '0' + v % 10; v /= 10; } while (v); while (n) out[outlen++] = b[--n]; }
+static void put_resp(const fetch_response& r) { put_num(r.status); put(":", 1); put(r.body, r.body_len); put(";", 1); }
+
+static const char mime[] = "text/plain";
+static void fail(const char* why)
+{
+	synth(500, mime, sizeof(mime)-1, why, slen(why));
+}
+
+static void on_recv(int req)
+{
+	decision("synth", 5, 200);
+}
+
+void on_synth()
+{
+	const char* creds = "Authorization: Bearer x\r\nCookie: c=1\r\n";
+	const char* post_hdrs = "Authorization: Bearer x\r\nCookie: c=1\r\nContent-Type: text/plain\r\nX-Keep: 1";
+	/* Six requests, max_requests is 6: the hops do not count */
+	int32_t h[6] = {
+		(int32_t)get("http://${s1_addr}:${s1_port}/a", creds),
+		(int32_t)post("http://${s2_addr}:${s2_port}/p", post_hdrs, "data"),
+		(int32_t)post("http://${s4_addr}:${s4_port}/p", post_hdrs, "data"),
+		(int32_t)get("http://${s5_addr}:${s5_port}/"),
+		(int32_t)get("http://${s6_addr}:${s6_port}/loop"),
+		(int32_t)get("http://${s7_addr}:${s7_port}/"),
+	};
+	for (int i = 0; i < 6; i++)
+		if (h[i] < 0) fail("send");
+	fetch_response r[6];
+	if (wait(h, 6, r) != 6) fail("wait");
+	for (int i = 0; i < 6; i++) {
+		if (r[i].error != 0) fail("response");
+		put_resp(r[i]);
+	}
+	if (!contains(r[3].headers, r[3].headers_len, "Location: http://example.com/x\n")) fail("location");
+
+	put("ok", 2);
+	synth(200, mime, sizeof(mime)-1, out, outlen);
+}
+
+void start(int argc, char** argv) {
+	register_callback(3, (void(*)())on_synth);
+	wait_for_requests(on_recv);
+}
+EOF
+bash ${testdir}/build.sh ${tmpdir}/${testname}.cpp ${testdir} ${tmpdir}/${testname}
+}
+
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"xpizza.com": {
+				"filename": "${tmpdir}/${testname}",
+				"group": "test",
+				"fetch": {
+					"allow": [
+						"http://${s1_addr}:${s1_port}/",
+						"http://${s2_addr}:${s2_port}/",
+						"http://${s3_addr}:${s3_port}/in/",
+						"http://${s4_addr}:${s4_port}/",
+						"http://${s5_addr}:${s5_port}/",
+						"http://${s6_addr}:${s6_port}/",
+						"http://${s7_addr}:${s7_port}/"
+					],
+					"max_requests": 6,
+					"max_redirects": 2
+				}
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork(req.http.Host)) {
+			return (synth(403));
+		}
+		riscv.vcall(ON_REQUEST);
+		return (synth(riscv.want_status()));
+	}
+
+	sub vcl_synth {
+		if (riscv.active()) {
+			riscv.vcall(ON_SYNTH);
+			return (deliver);
+		}
+	}
+} -start
+
+client c1 {
+	txreq -hdr "Host: xpizza.com"
+	rxresp
+	expect resp.status == 200
+	expect resp.body == "200:b;200:posted;200:done;301:;302:;302:;ok"
+} -run
+
+logexpect l1 -v v1 -g raw -d 1 {
+	expect * * VCL_Error "fetch \\(redirect\\): URL not allowed: http://example.com/x"
+} -run
+
+logexpect l2 -v v1 -g raw -d 1 {
+	expect * * VCL_Error "fetch \\(redirect\\): too many redirects: http://${s6_addr}:${s6_port}/loop"
+} -run
+
+logexpect l3 -v v1 -g raw -d 1 {
+	expect * * VCL_Error "fetch \\(redirect\\): URL too long: http://${s7_addr}:${s7_port}/aaaa"
+} -run
+
+# The log of a response has the redirects it followed
+logexpect l4 -v v1 -g raw -d 1 {
+	expect * * VCL_Log "fetch http://${s1_addr}:${s1_port}/b: 200 .*, 1 redirect\\)$"
+} -run
+
+logexpect l5 -v v1 -g raw -d 1 {
+	expect * * VCL_Log "fetch http://${s6_addr}:${s6_port}/loop: 302 .*, 2 redirects\\)$"
+} -run
+
+server s1 -wait
+server s2 -wait
+server s3 -wait
+server s4 -wait
+server s6 -wait
+server s7 -wait
+
+varnish v1 -errvcl {fetch: max_redirects must be at most 20} {
+	vcl 4.1;
+	import riscv;
+	backend default none;
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"bad.com": {
+				"filename": "${tmpdir}/${testname}",
+				"fetch": {
+					"allow": [ "http://127.0.0.1/" ],
+					"max_redirects": 21
+				}
+			}
+		}""");
+	}
+}

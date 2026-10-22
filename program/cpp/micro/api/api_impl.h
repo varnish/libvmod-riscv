@@ -1,5 +1,8 @@
 #pragma once
 #include "strace.h"
+#include <heap.hpp>
+#include <strings.h>
+#include <utility>
 extern "C" {
 	void breakpoint();
 }
@@ -214,6 +217,87 @@ inline std::array<uint8_t, 32> sha256(std::string_view data)
 	syscall(ECALL_SHA256, (long) data.data(), data.size(), (long) digest.data(), digest.size());
 	asm ("" ::: "memory");
 	return digest;
+}
+
+static_assert(sizeof(FetchResponse) == 8 + 4 * sizeof(size_t),
+	"FetchResponse must have the layout of struct fetch_response");
+inline FetchResponse::FetchResponse(FetchResponse&& other) noexcept
+{
+	*this = std::move(other);
+}
+inline FetchResponse& FetchResponse::operator=(FetchResponse&& other) noexcept
+{
+	if (this != &other) {
+		sys_free(m_body);
+		sys_free(m_headers);
+		m_status = other.m_status;
+		m_error = other.m_error;
+		m_body = std::exchange(other.m_body, nullptr);
+		m_body_len = std::exchange(other.m_body_len, 0);
+		m_headers = std::exchange(other.m_headers, nullptr);
+		m_headers_len = std::exchange(other.m_headers_len, 0);
+	}
+	return *this;
+}
+inline FetchResponse::~FetchResponse()
+{
+	sys_free(m_body);
+	sys_free(m_headers);
+}
+inline std::optional<std::string_view> FetchResponse::header(std::string_view name) const
+{
+	std::string_view rest = headers();
+	while (!rest.empty()) {
+		const size_t eol = rest.find('\n');
+		const std::string_view line = rest.substr(0, eol);
+		rest = (eol == rest.npos) ? std::string_view() : rest.substr(eol + 1);
+		if (line.size() > name.size() + 1 && line[name.size()] == ':'
+			&& strncasecmp(line.data(), name.data(), name.size()) == 0)
+			return line.substr(name.size() + 2);
+	}
+	return std::nullopt;
+}
+inline int fetch_get(std::string_view url, std::string_view headers, unsigned flags)
+{
+	asm ("" ::: "memory");
+	return syscall(ECALL_FETCH, FETCH_GET | flags, (long) url.data(), url.size(),
+		(long) headers.data(), headers.size(), 0, 0);
+}
+inline int fetch_post(std::string_view url, std::string_view body, std::string_view headers, unsigned flags)
+{
+	asm ("" ::: "memory");
+	return syscall(ECALL_FETCH, FETCH_POST | flags, (long) url.data(), url.size(),
+		(long) headers.data(), headers.size(), (long) body.data(), body.size());
+}
+inline long fetch_wait(std::span<int32_t> handles, std::span<FetchResponse> responses,
+	unsigned flags, int timeout_ms)
+{
+	if (responses.size() < handles.size())
+		return FETCH_EINVAL;
+	/* The system call overwrites the responses of the handles that finish */
+	for (size_t i = 0; i < handles.size(); i++)
+		if (handles[i] != -1)
+			responses[i] = FetchResponse();
+	asm ("" ::: "memory");
+	const long n = syscall(ECALL_FETCH, FETCH_WAIT | flags, (long) handles.data(),
+		handles.size(), (long) responses.data(), timeout_ms);
+	asm ("" ::: "memory");
+	return n;
+}
+inline void fetch_free(int handle)
+{
+	syscall(ECALL_FETCH, FETCH_FREE, handle);
+}
+inline FetchResponse fetch(std::string_view url, std::string_view headers, unsigned flags)
+{
+	int32_t handle = fetch_get(url, headers, flags);
+	if (handle < 0)
+		return FetchResponse(handle);
+	FetchResponse response;
+	const long n = fetch_wait({&handle, 1}, {&response, 1});
+	if (n < 0)
+		return FetchResponse(int(n));
+	return response;
 }
 
 inline HeaderField::HeaderField(gethdr_e wh, size_t idx)
