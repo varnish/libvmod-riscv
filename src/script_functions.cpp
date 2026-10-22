@@ -6,6 +6,7 @@
 #include "script_functions.hpp"
 #include "machine/include_api.hpp"
 #include "machine_instance.hpp"
+#include "sandbox_tenant.hpp"
 #include "varnish.hpp"
 #include "vcl/vcl_varnish.h"
 extern "C" {
@@ -455,17 +456,43 @@ APICALL(set_decision)
 	}
 	machine.stop();
 }
+/* Only a backend that VCL gave this machine, in the tenant's "backends"
+   or with riscv.add_backend(). An empty slot would clear the backend hint. */
+static long select_backend(Script& script, unsigned be)
+{
+	if (be >= script.directors().size() || script.directors().get(be) == nullptr)
+		return -1;
+	return riscv_SetBackend(script.ctx(), script.directors().get(be));
+}
 APICALL(set_backend)
 {
 	auto [be] = machine.sysargs<unsigned> ();
+	machine.set_result(select_backend(get_script(machine), be));
+}
+APICALL(find_backend)
+{
+	auto [addr, len, select] = machine.sysargs<gaddr_t, gaddr_t, int> ();
 	auto& script = get_script(machine);
-	/* Only a backend that VCL gave this machine with riscv.add_backend().
-	   An empty slot would clear the backend hint. */
-	if (be >= script.directors().size() || script.directors().get(be) == nullptr) {
+	/* No name is this long */
+	if (len > 256) {
 		machine.set_result(-1);
 		return;
 	}
-	machine.set_result(riscv_SetBackend(script.ctx(), script.directors().get(be)));
+	/* Read-only: a string literal is in pages a fork may not write */
+	const auto buffer = machine.memory.membuffer(addr, len);
+	const std::string copy = buffer.is_sequential() ? std::string() : buffer.to_string();
+	const std::string_view name = buffer.is_sequential() ? buffer.strview() : copy;
+	/* The tenant's "backends" take the first slots, in this order. Also
+	   answers during initialization, before any backend is given. */
+	const auto& names = script.tenant().config.group.backends;
+	const auto it = std::find(names.begin(), names.end(), name);
+	if (it == names.end()) {
+		machine.set_result(-1);
+		return;
+	}
+	const unsigned be = it - names.begin();
+	/* With select, also make it the backend, in the same call */
+	machine.set_result(select ? select_backend(script, be) : be);
 }
 APICALL(backend_decision)
 {
@@ -1270,6 +1297,7 @@ void Script::setup_syscall_interface()
 	}
 	machine_t::install_syscall_handler(ECALL_BASE64, base64);
 	machine_t::install_syscall_handler(ECALL_FETCH, fetch);
+	machine_t::install_syscall_handler(ECALL_FIND_BACKEND, find_backend);
 
 	// A custom intruction used to handle indexed dynamic calls.
 	using namespace riscv;

@@ -1,6 +1,8 @@
 #pragma once
 #include <vector>
 #include <stdexcept>
+#include <algorithm>
+#include <array>
 
 template <typename T>
 struct Cache {
@@ -39,7 +41,7 @@ struct Cache {
 		return owned;
 	}
 	/* Forget every entry. Owned items must be destroyed first. */
-	void reset() { cache = {}; m_size = 0; }
+	void reset() { std::fill_n(cache.begin(), m_size, Entry{}); m_size = 0; }
 	bool full() const { return size() >= max_size(); }
 	size_t size() const { return m_size; }
 	size_t max_size() const { return m_max_entries; }
@@ -67,7 +69,7 @@ struct Cache {
 		}
 	}
 
-	static constexpr size_t CACHE_MAX = 16;
+	static constexpr size_t CACHE_MAX = 32;
 	Cache(size_t max) : m_max_entries(std::min(max, CACHE_MAX)) {}
 
 	unsigned m_size = 0;

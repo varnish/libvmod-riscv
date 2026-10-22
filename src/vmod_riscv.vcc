@@ -106,10 +106,15 @@ $Function VOID load_tenants(PRIV_VCL, STRING json_filepath)
 	},
 	"tenant_name": {
 		"filename": "/path/to/program",
-		"group": "group_name"
+		"group": "group_name",
+		"backends": ["b0", "b1"]
 	}
 
 - max_memory and max_heap are in megabytes.
+- "backends" names VCL backends the program may select with its
+  set_backend(), as 0, 1, ... in this order. finalize_tenants() fails
+  vcl_init if this VCL has no backend by one of the names. They take
+  slots of max_backends, leaving riscv.add_backend() the rest.
 - A tenant without a "group" uses the built-in "test" group.
   Naming a group that the JSON does not define fails vcl_init.
 
@@ -167,10 +172,11 @@ $Function BOOL    active()
 $Function INT     add_backend(BACKEND backend)
 
 - Lets the current machine select this backend with the guest's
-  set_backend(n), where n is the number this returns: zero for the first
+  set_backend(n), where n is the number this returns. The tenant's
+  "backends" come first, so with none, it is zero for the first
   backend added to the machine, one for the next, and so on.
 - Returns -1 if there is no active machine, or it has too many backends
-  (the group's max_backends, at most 16).
+  (the group's max_backends, 32).
 - Backends are added per request, after riscv.fork().
 
 Example:

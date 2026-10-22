@@ -73,6 +73,7 @@ bool TenantConfig::same_as(const TenantConfig& other) const
 		&& a.max_regex == b.max_regex
 		&& a.verbose == b.verbose
 		&& (a.fetch == b.fetch || (a.fetch && b.fetch && *a.fetch == *b.fetch))
+		&& a.backends == b.backends
 		&& *rvs::atomic_load(&a.argv) == *rvs::atomic_load(&b.argv);
 }
 
@@ -313,7 +314,16 @@ static const struct vmod_priv_methods riscv_pool_priv_methods[1] = {{
 }};
 #endif
 
-Script* SandboxTenant::vmfork(VRT_CTX, bool debug, bool permanent)
+/* The backends the VCL gave the tenant take the first slots, in the order
+   of its "backends", so a guest index means the same in every fork. */
+static void add_vcl_backends(Script* script, std::span<const VCL_BACKEND> backends)
+{
+	for (auto* dir : backends)
+		script->directors().manage(dir, 0);
+}
+
+Script* SandboxTenant::vmfork(VRT_CTX, std::span<const VCL_BACKEND> backends,
+	bool debug, bool permanent)
 {
 	auto* priv_task = VRT_priv_task(ctx, get_priv_key(ctx));
 	if (!priv_task->priv)
@@ -333,10 +343,14 @@ Script* SandboxTenant::vmfork(VRT_CTX, bool debug, bool permanent)
 			return nullptr;
 		}
 		if (permanent && !debug) {
-			Script* script;
+			Script* script = nullptr;
 			try {
 				script = pool_acquire(ctx, std::move(prog));
+				add_vcl_backends(script, backends);
 			} catch (std::exception& e) {
+				/* Not in the task yet, so nothing else would free it */
+				if (script != nullptr)
+					destroy_pooled(script);
 				VRT_fail(ctx, "VM '%s' exception: %s", config.name.c_str(), e.what());
 				return nullptr;
 			}
@@ -358,16 +372,21 @@ Script* SandboxTenant::vmfork(VRT_CTX, bool debug, bool permanent)
 		// IMPORTANT: Make sure Script* is 32-byte aligned
 		saddr = (saddr + 0x1F) & ~(uintptr_t)0x1F;
 		auto* script = (Script*) saddr;
+		bool constructed = false;
 
 		try {
 			new (script) Script{prog->script, ctx, this, *prog};
+			constructed = true;
 			/* This creates a self-reference, which ensures that open
 			   Script instances will keep the machine instance alive. */
 			script->assign_instance(prog);
+			add_vcl_backends(script, backends);
 
 		} catch (std::exception& e) {
-			VRT_fail(ctx,
-				"VM '%s' exception: %s", script->name().c_str(), e.what());
+			VRT_fail(ctx, "VM '%s' exception: %s", config.name.c_str(), e.what());
+			/* Not in the task yet, so nothing else would destroy it */
+			if (constructed)
+				script->~Script();
 			return nullptr;
 		}
 	#ifdef ENABLE_TIMING

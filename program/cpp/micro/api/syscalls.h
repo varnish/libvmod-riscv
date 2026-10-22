@@ -48,6 +48,7 @@
 #define ECALL_BASE64_DECODE (SYSCALL_BASE + 38)
 #define ECALL_REGISTER_FUNC (SYSCALL_BASE + 39)
 
+/* The VCL policy ABI is at 540..560 (src/vcl/abi.hpp) */
 #define ECALL_LAST (SYSCALL_BASE+40)
 
 #define ECALL_BASE64 (SYSCALL_BASE+70)
@@ -87,4 +88,8 @@
 #define FETCH_EBUSY   (-4) /* The HTTP engine is out of capacity */
 #define FETCH_ENOSYS  (-5) /* Not available in this Varnish */
 #define FETCH_EPENDING (-6) /* Not finished (the guest API's FetchResponse) */
-#define FETCH_EPENDING (-6) /* Not finished (the guest API's FetchResponse) */
+
+/* a0,a1 = the name of a backend in the tenant's "backends"
+   a2 = 0 -> its index for ECALL_SET_BACKEND, or -1
+   a2 = 1 -> also selects it, as ECALL_SET_BACKEND: 0, or -1 */
+#define ECALL_FIND_BACKEND (SYSCALL_BASE+72)
