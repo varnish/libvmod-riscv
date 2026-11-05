@@ -2,6 +2,7 @@
 #include <sys/random.h>
 #include <cstdlib>
 #include <algorithm>
+#include <vector>
 #include <cstring>
 #include <ctime>
 namespace varnish = api;
@@ -11,29 +12,73 @@ namespace varnish = api;
    vcl_recv:    set req.http.X-Token = riscv.call("authorize", req.url);
    vcl_deliver: riscv.deliver_transform("personalize", req.http.X-Token);
 
-   A manifest request without a token starts a session with a random viewer ID
-   and a token scoped to the manifest's directory. Authorized manifest requests
-   renew the session. Rewriting adds the viewer's token to supported manifest
-   URIs. All other requests require a valid token. VCL removes the token from
-   the URL before the cache lookup, so all viewers share one cached copy of
-   each object.
+   A manifest request without a token starts a session with a random viewer ID.
+   Authorized manifest requests renew the session. Rewriting signs each
+   supported manifest URI for the viewer, so a token is only valid for the
+   path it was issued for. All other requests require a valid token. VCL
+   removes the token from the URL before the cache lookup, so all viewers
+   share one cached copy of each object.
 
-   Token: <viewer id>.<expires>.<scope depth>.<HMAC-SHA256/128>
+   Token:    <viewer id>.<expires>.<HMAC-SHA256/128 of "<viewer id>.<expires>\n<path>">
+   Template: <viewer id>.<expires>.<P>.<S>.<HMAC of "<viewer id>.<expires>.<P>.<S>\n<prefix><slashes><suffix>">
+             DASH SegmentTemplate URIs sign the P bytes before the first $
+             and the S bytes after the last $ of the resolved path, plus
+             the / characters between them. Template tokens are not valid
+             for manifests.
+   authorize returns a token for the manifest path, which personalize
+   verifies against req.url before signing anything with it.
    Tenant arguments: [secret, session lifetime in seconds]. */
 static varnish::HmacSha256 hmac {"change-me-varnish-manifest-secret"};
 static long lifetime = 300;
 
-static constexpr unsigned B64URL = BASE64_FLAG_URL | BASE64_FLAG_NOPAD;
 static constexpr std::string_view SESSION_DATA_ID = "com.varnish.viewer-id";
 static constexpr size_t VIEWER_ID_BYTES = 12;
 static constexpr size_t MAC_BYTES = 16;
-static constexpr long MAX_DEPTH = 32;
 static constexpr long MAX_LIFETIME = 10L * 365 * 24 * 3600;
 
-static bool token_char(unsigned char c)
+static constexpr size_t base64url_size(size_t n)
+{
+	return (4 * n + 2) / 3;
+}
+static constexpr size_t MAC_CHARS = base64url_size(MAC_BYTES);
+
+[[gnu::always_inline]] static inline void base64url_encode(const uint8_t* d, size_t n, char* out)
+{
+	static constexpr char alphabet[] =
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+	size_t i = 0;
+	for (; i + 3 <= n; i += 3) {
+		const uint32_t v = (d[i] << 16) | (d[i + 1] << 8) | d[i + 2];
+		*out++ = alphabet[(v >> 18) & 63];
+		*out++ = alphabet[(v >> 12) & 63];
+		*out++ = alphabet[(v >> 6) & 63];
+		*out++ = alphabet[v & 63];
+	}
+	if (n - i == 1) {
+		*out++ = alphabet[d[i] >> 2];
+		*out++ = alphabet[(d[i] & 3) << 4];
+	} else if (n - i == 2) {
+		const uint32_t v = (d[i] << 8) | d[i + 1];
+		*out++ = alphabet[v >> 10];
+		*out++ = alphabet[(v >> 4) & 63];
+		*out++ = alphabet[(v & 15) << 2];
+	}
+}
+
+static void encode_mac(const std::array<uint8_t, 32>& digest, char* out)
+{
+	base64url_encode(digest.data(), MAC_BYTES, out);
+}
+
+static bool viewer_char(char c)
 {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-		|| (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+		|| (c >= '0' && c <= '9') || c == '-' || c == '_';
+}
+
+static std::string slashes_in(std::string_view s)
+{
+	return std::string(std::count(s.begin(), s.end(), '/'), '/');
 }
 
 static bool parse_number(std::string_view s, long& out)
@@ -70,29 +115,6 @@ static bool path_safe(std::string_view path)
 	return true;
 }
 
-/* Return the first depth directories as a path prefix, or std::nullopt if
-   the path is too short. */
-static std::optional<std::string_view> scope_of(std::string_view path, long depth)
-{
-	size_t end = 0;
-	for (long i = 0; i < depth; i++) {
-		end = path.find('/', end + 1);
-		if (end == path.npos)
-			return std::nullopt;
-	}
-	if (end + 1 >= path.size())
-		return std::nullopt;
-	return path.substr(0, end + 1);
-}
-
-static long directory_depth(std::string_view path)
-{
-	long depth = 0;
-	for (const char c : path)
-		depth += (c == '/');
-	return depth - 1;
-}
-
 static bool ends_with_nocase(std::string_view s, std::string_view suffix)
 {
 	if (s.size() < suffix.size())
@@ -127,58 +149,50 @@ static std::string_view query_param(std::string_view query, std::string_view key
 	return {};
 }
 
-static std::string sign(std::string_view viewer, long expires, long depth, std::string_view scope)
-{
-	std::string token;
-	token.reserve(80);
-	token.append(viewer);
-	token += '.';
-	token += std::to_string(expires);
-	token += '.';
-	token += std::to_string(depth);
-	const auto mac = hmac({token, "\n", scope});
-	token += '.';
-	token += varnish::base64_encode({(const char*) mac.data(), MAC_BYTES}, B64URL);
-	return token;
-}
-
-struct Session {
-	std::string_view viewer;
-	long depth;
-};
-
-static std::optional<Session> verify(std::string_view token, std::string_view path, long now)
+static std::optional<std::string_view> verify(std::string_view token, std::string_view path, long now)
 {
 	if (token.size() > 128)
 		return std::nullopt;
-	std::array<std::string_view, 4> part;
-	size_t p = 0;
-	for (size_t i = 0; i < part.size(); i++) {
-		const size_t dot = token.find('.', p);
-		if ((dot == token.npos) != (i == part.size() - 1))
+	std::array<std::string_view, 5> part;
+	size_t n = 0, p = 0;
+	while (true) {
+		if (n == part.size())
 			return std::nullopt;
-		part[i] = token.substr(p, dot == token.npos ? token.npos : dot - p);
+		const size_t dot = token.find('.', p);
+		part[n++] = token.substr(p, dot == token.npos ? token.npos : dot - p);
+		if (dot == token.npos)
+			break;
 		p = dot + 1;
 	}
-	long expires, depth;
-	if (part[0].empty() || !parse_number(part[1], expires) || !parse_number(part[2], depth))
+	long expires;
+	if ((n != 3 && n != 5) || part[0].empty() || !parse_number(part[1], expires) || now >= expires)
 		return std::nullopt;
-	if (depth > MAX_DEPTH || now >= expires)
-		return std::nullopt;
-	const auto scope = scope_of(path, depth);
-	if (!scope)
+	if (!std::all_of(part[0].begin(), part[0].end(), viewer_char))
 		return std::nullopt;
 
-	const std::string_view mac = part[3];
+	const std::string_view mac = part[n - 1];
 	const std::string_view signed_part = token.substr(0, token.size() - mac.size() - 1);
-	const auto expected = hmac({signed_part, "\n", *scope});
-	if (!varnish::equal_constant_time(mac, varnish::base64_encode({(const char*) expected.data(), MAC_BYTES}, B64URL)))
+	std::array<uint8_t, 32> digest;
+	if (n == 3) {
+		digest = hmac({signed_part, "\n", path});
+	} else {
+		long prefix, suffix;
+		if (is_manifest(path) || !parse_number(part[2], prefix) || !parse_number(part[3], suffix)
+			|| size_t(prefix) > path.size() || size_t(suffix) > path.size() - prefix)
+			return std::nullopt;
+		const std::string slashes = slashes_in(path.substr(prefix, path.size() - prefix - suffix));
+		digest = hmac({signed_part, "\n", path.substr(0, prefix), slashes,
+			path.substr(path.size() - suffix)});
+	}
+	char expected[MAC_CHARS];
+	encode_mac(digest, expected);
+	if (!varnish::equal_constant_time(mac, {expected, MAC_CHARS}))
 		return std::nullopt;
-	return Session{part[0], depth};
+	return part[0];
 }
 
-/* Return a new, renewed, or unchanged viewer token for this request,
-   or nullptr if authorization fails. */
+/* Return a new or renewed token for a manifest, the verified token for
+   anything else, or nullptr if authorization fails. */
 static const char* authorize(const char* arg, size_t len)
 {
 	static std::string result;
@@ -192,27 +206,33 @@ static const char* authorize(const char* arg, size_t len)
 	const bool manifest = is_manifest(path);
 	const long now = std::time(nullptr);
 
+	char id[base64url_size(VIEWER_ID_BYTES)];
+	std::string_view viewer;
 	if (token.empty()) {
 		if (!manifest)
 			return nullptr;
-		std::array<uint8_t, VIEWER_ID_BYTES> id;
-		if (getrandom(id.data(), id.size(), 0) != (ssize_t) id.size())
+		std::array<uint8_t, VIEWER_ID_BYTES> bytes;
+		if (getrandom(bytes.data(), bytes.size(), 0) != (ssize_t) bytes.size())
 			return nullptr;
-		const long depth = std::min(directory_depth(path), MAX_DEPTH);
-		const std::string viewer = varnish::base64_encode({(const char*) id.data(), id.size()}, B64URL);
-		result = sign(viewer, now + lifetime, depth, *scope_of(path, depth));
-		return result.c_str();
-	}
-
-	const auto session = verify(token, path, now);
-	if (!session)
-		return nullptr;
-	if (manifest) {
-		const std::string viewer(session->viewer);
-		result = sign(viewer, now + lifetime, session->depth, *scope_of(path, session->depth));
+		base64url_encode(bytes.data(), bytes.size(), id);
+		viewer = {id, sizeof(id)};
 	} else {
-		result = token;
+		const auto verified = verify(token, path, now);
+		if (!verified)
+			return nullptr;
+		if (!manifest) {
+			result = token;
+			return result.c_str();
+		}
+		viewer = *verified;
 	}
+	result = viewer;
+	result += '.';
+	result += std::to_string(now + lifetime);
+	char mac[MAC_CHARS];
+	encode_mac(hmac({result, "\n", path}), mac);
+	result += '.';
+	result.append(mac, MAC_CHARS);
 	return result.c_str();
 }
 
@@ -349,12 +369,10 @@ struct Inserts {
 	std::string_view viewer;
 };
 
-/* Copy unchanged input ranges in bulk and insert each token with one copy
-   to reduce the number of guest memcpy calls during manifest rewriting. */
-struct Output {
-	char*  buf;
-	size_t len;
-	size_t cap;
+struct Uri {
+	size_t path_start;
+	size_t path_end;
+	bool authority;
 };
 
 struct Buffer {
@@ -370,6 +388,137 @@ struct Buffer {
 		varnish::forge_response(500, "", 0, nullptr, 0);
 	return {nbuf, want};
 }
+
+/* Copy unchanged input ranges in bulk and insert each token with one copy
+   to reduce the number of guest memcpy calls during manifest rewriting. */
+struct Output {
+	char*  buf = nullptr;
+	size_t len = 0;
+	size_t cap = 0;
+
+	[[gnu::always_inline]] void reserve(size_t n)
+	{
+		if (len + n + WORD > cap) [[unlikely]] {
+			const Buffer b = grow(buf, cap, len + n + WORD);
+			buf = b.buf;
+			cap = b.cap;
+		}
+	}
+	[[gnu::always_inline]] void put(const char* s, size_t n)
+	{
+		reserve(n);
+		if (n >= 256)
+			std::memcpy(buf + len, s, n);
+		else if (n > 0)
+			copy_words(buf + len, s, n);
+		len += n;
+	}
+	[[gnu::always_inline]] void put(std::string_view s) { put(s.data(), s.size()); }
+	[[gnu::always_inline]] void push(char c)
+	{
+		reserve(1);
+		buf[len++] = c;
+	}
+	std::string_view view(size_t from = 0) const { return {buf + from, len - from}; }
+};
+
+static bool has_dot_segment(std::string_view ref)
+{
+	size_t pos = 0;
+	while ((pos = scan(ref.data(), pos, ref.size(), Bytes<'.'> {})) < ref.size()) {
+		if (pos == 0 || ref[pos - 1] == '/')
+			return true;
+		pos++;
+	}
+	return false;
+}
+
+static size_t remove_dot_segments(char* p, size_t n)
+{
+	size_t w = 0, r = 0;
+	while (r < n) {
+		size_t e = r + 1;
+		while (e < n && p[e] != '/')
+			e++;
+		const char* seg = p + r + 1;
+		const size_t len = e - r - 1;
+		if (len == 1 && seg[0] == '.') {
+			if (e == n)
+				p[w++] = '/';
+		} else if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+			while (w > 0 && p[--w] != '/') {}
+			if (e == n)
+				p[w++] = '/';
+		} else {
+			for (size_t i = r; i < e; i++)
+				p[w++] = p[i];
+		}
+		r = e;
+	}
+	return w;
+}
+
+struct Signer {
+	std::string_view session;
+	std::string_view doc;
+	std::string_view dir;
+	Output msg;
+	size_t head;
+	char token[64];
+	size_t token_len;
+
+	explicit Signer(std::string_view s) : session(s)
+	{
+		msg.put(session);
+		msg.push('\n');
+		head = msg.len;
+	}
+
+	void set_base(std::string_view path)
+	{
+		doc = path;
+		dir = path.substr(0, path.rfind('/') + 1);
+	}
+
+	std::string_view path() const { return msg.view(head); }
+
+	void resolve(std::string_view ref, bool authority)
+	{
+		msg.len = head;
+		if (ref.empty()) {
+			msg.put(authority ? std::string_view("/") : doc);
+		} else {
+			if (ref[0] != '/')
+				msg.put(dir);
+			msg.put(ref);
+			if (has_dot_segment(ref))
+				msg.len = head + remove_dot_segments(msg.buf + head, msg.len - head);
+		}
+	}
+
+	void sign(std::string_view ref, bool authority, bool templ)
+	{
+		resolve(ref, authority);
+		const std::string_view path = this->path();
+		const size_t first = templ ? path.find('$') : path.npos;
+		if (first == path.npos) {
+			encode_mac(hmac({msg.view()}), token);
+			token_len = MAC_CHARS;
+			return;
+		}
+		const size_t last = path.rfind('$');
+		const size_t suffix = path.size() - last - 1;
+		std::string fields = std::to_string(first);
+		fields += '.';
+		fields += std::to_string(suffix);
+		const std::string slashes = slashes_in(path.substr(first, last + 1 - first));
+		encode_mac(hmac({session, ".", fields, "\n", path.substr(0, first), slashes,
+			path.substr(last + 1)}), token + fields.size() + 1);
+		std::memcpy(token, fields.data(), fields.size());
+		token[fields.size()] = '.';
+		token_len = fields.size() + 1 + MAC_CHARS;
+	}
+};
 
 static bool starts_with_at(std::string_view in, size_t pos, std::string_view prefix)
 {
@@ -390,32 +539,16 @@ struct Rewriter {
 	const char* base;
 	size_t size;
 	const Inserts* inserts;
+	Signer* signer;
 	Output out;
 	size_t copied;
 
-	[[gnu::always_inline]] void reserve(size_t n)
-	{
-		if (out.len + n + WORD > out.cap) [[unlikely]] {
-			const Buffer b = grow(out.buf, out.cap, out.len + n + WORD);
-			out.buf = b.buf;
-			out.cap = b.cap;
-		}
-	}
-
-	[[gnu::always_inline]] void put(const char* s, size_t n)
-	{
-		reserve(n);
-		if (n >= 256)
-			std::memcpy(out.buf + out.len, s, n);
-		else if (n > 0)
-			copy_words(out.buf + out.len, s, n);
-		out.len += n;
-	}
-	[[gnu::always_inline]] void put(std::string_view s) { put(s.data(), s.size()); }
+	[[gnu::always_inline]] void put(const char* s, size_t n) { out.put(s, n); }
+	[[gnu::always_inline]] void put(std::string_view s) { out.put(s); }
 
 	[[gnu::always_inline]] void put(const Insert& a)
 	{
-		reserve(a.size);
+		out.reserve(a.size);
 		a.copy(out.buf + out.len);
 		out.len += a.size;
 	}
@@ -426,22 +559,45 @@ struct Rewriter {
 		copied = pos;
 	}
 
-	/* Add the token to the URI in the input range [start, end).
-	   Only HTTP(S) and relative URIs receive tokens; other schemes, such as
-	   skd: and data:, remain unchanged. */
-	[[gnu::always_inline]] void tokenize(size_t start, size_t end)
+	[[gnu::always_inline]] std::optional<Uri> parse(size_t start, size_t end) const
 	{
 		if (start >= end)
-			return;
-		size_t pos = scan(base, start, end, Bytes<'#', '?', '/', ':'> {});
+			return std::nullopt;
+		const size_t pos = scan(base, start, end, Bytes<'#', '?', '/', ':'> {});
+		Uri uri {start, 0, false};
 		if (pos < end && base[pos] == ':') {
 			const std::string_view scheme(base + start, pos - start);
 			if (!((scheme.size() == 4 && ends_with_nocase(scheme, "http"))
 				|| (scheme.size() == 5 && ends_with_nocase(scheme, "https"))))
-				return;
+				return std::nullopt;
+			uri.path_start = pos + 1;
 		}
-		if (pos < end && base[pos] != '#' && base[pos] != '?')
-			pos = scan(base, pos + 1, end, Bytes<'#', '?'> {});
+		if (end - uri.path_start >= 2 && base[uri.path_start] == '/' && base[uri.path_start + 1] == '/') {
+			uri.path_start = scan(base, uri.path_start + 2, end, Bytes<'/', '?', '#'> {});
+			uri.authority = true;
+		}
+		uri.path_end = scan(base, uri.path_start, end, Bytes<'#', '?'> {});
+		return uri;
+	}
+
+	[[gnu::always_inline]] bool resolve(size_t start, size_t end)
+	{
+		const auto uri = parse(start, end);
+		if (uri)
+			signer->resolve({base + uri->path_start, uri->path_end - uri->path_start}, uri->authority);
+		return uri.has_value();
+	}
+
+	/* Sign the URI in the input range [start, end) for the viewer, leaving
+	   its resolved path in the signer. Only HTTP(S) and relative URIs
+	   receive tokens; other schemes, such as skd: and data:, remain unchanged. */
+	[[gnu::always_inline]] bool tokenize(size_t start, size_t end, bool templ = false)
+	{
+		const auto uri = parse(start, end);
+		if (!uri)
+			return false;
+		signer->sign({base + uri->path_start, uri->path_end - uri->path_start}, uri->authority, templ);
+		size_t pos = uri->path_end;
 		const bool has_query = pos < end && base[pos] == '?';
 		if (has_query)
 			pos = scan(base, pos + 1, end, Bytes<'#'> {});
@@ -452,6 +608,8 @@ struct Rewriter {
 			put(inserts->bare);
 		else
 			put(inserts->param);
+		put(signer->token, signer->token_len);
+		return true;
 	}
 };
 
@@ -597,6 +755,13 @@ static bool is_uri_attribute(UriAttributes kind, std::string_view attr)
 	const std::string_view in(r.base, r.size);
 	const char* const base = r.base;
 	const size_t size = r.size;
+	struct Base {
+		long level;
+		std::string doc;
+	};
+	std::vector<Base> bases;
+	bases.push_back({0, std::string(r.signer->doc)});
+	long depth = 0;
 	size_t p = 0;
 	while (p < in.size()) {
 		const size_t start = scan(base, p, size, Bytes<'<'> {});
@@ -612,8 +777,18 @@ static bool is_uri_attribute(UriAttributes kind, std::string_view attr)
 			break;
 		const std::string_view tag = in.substr(start + 1, end - start - 1);
 		p = end + 1;
-		if (tag.empty() || tag[0] == '/' || tag[0] == '?' || tag[0] == '!')
+		if (!tag.empty() && tag[0] == '/') {
+			depth--;
+			if (bases.back().level > depth) {
+				while (bases.size() > 1 && bases.back().level > depth)
+					bases.pop_back();
+				r.signer->set_base(bases.back().doc);
+			}
 			continue;
+		}
+		if (tag.empty() || tag[0] == '?' || tag[0] == '!')
+			continue;
+		const bool open = tag.back() != '/';
 
 		const size_t name_end = scan(tag.data(), 0, tag.size(),
 			Bytes<' ', '\t', '\r', '\n', '/'> {});
@@ -643,21 +818,42 @@ static bool is_uri_attribute(UriAttributes kind, std::string_view attr)
 				if (ve == tag.npos)
 					break;
 				if (is_uri_attribute(kind, attr))
-					r.tokenize(start + 1 + vq + 1, start + 1 + ve);
+					r.tokenize(start + 1 + vq + 1, start + 1 + ve,
+						kind == UriAttributes::SegmentTemplate);
 				a = ve + 1;
 			}
 		} else if ((name == "BaseURL" || name == "Location" || name == "PatchLocation"
-			|| name == "ContentSteering") && tag.back() != '/') {
+			|| name == "ContentSteering") && open) {
 			const size_t text_end = scan(base, end, size, Bytes<'<'> {});
 			size_t ts = end + 1, te = text_end;
 			while (ts < te && is_space(in[ts])) ts++;
 			while (te > ts && is_space(in[te - 1])) te--;
 			/* A BaseURL ending in / is a directory against which segment
 			   URIs are resolved. Its query string would be discarded. */
-			if (te > ts && (name != "BaseURL" || in[te - 1] != '/'))
-				r.tokenize(ts, te);
+			const bool directory = name == "BaseURL" && te > ts && in[te - 1] == '/';
+			const bool resolved = directory ? r.resolve(ts, te) : r.tokenize(ts, te);
+			if (name == "BaseURL" && resolved) {
+				const std::string_view path = r.signer->path();
+				if (bases.back().level < depth) {
+					bases.push_back({depth, std::string(path)});
+					r.signer->set_base(bases.back().doc);
+				} else if (directory && path != r.signer->dir && starts_with_at(in, text_end, "</")) {
+					size_t after = scan(base, text_end, size, Bytes<'>'> {});
+					if (after < size) {
+						after++;
+						while (after < size && is_space(in[after]))
+							after++;
+						r.copy_to(start);
+						r.copied = after;
+						p = after;
+						continue;
+					}
+				}
+			}
 			p = text_end;
 		}
+		if (open)
+			depth++;
 	}
 	r.copy_to(in.size());
 	return r.out;
@@ -665,15 +861,14 @@ static bool is_uri_attribute(UriAttributes kind, std::string_view attr)
 
 static void personalize(const char* arg, const char* data, size_t len)
 {
+	const std::string url = varnish::Request(varnish::HDR_REQ).url();
+	const std::string_view path = std::string_view(url).substr(0, url.find('?'));
 	const std::string_view token(arg);
-	const size_t dot = token.find('.');
-	bool valid = token.size() <= 128 && dot != token.npos && dot > 0;
-	for (size_t i = 0; valid && i < token.size(); i++)
-		valid = token_char(token[i]);
-	if (!valid) {
+	if (!path_safe(path) || !is_manifest(path) || !verify(token, path, std::time(nullptr))) {
 		static constexpr std::string_view denied = "Missing or invalid viewer token";
 		varnish::forge_response(403, "text/plain", 10, denied.data(), denied.size());
 	}
+	const std::string_view session = token.substr(0, token.rfind('.'));
 
 	const std::string_view in(data, len);
 	size_t s = 0;
@@ -686,18 +881,21 @@ static void personalize(const char* arg, const char* data, size_t len)
 		varnish::forge_response(200, "", 0, data, len);
 
 	std::string query = "?token=";
-	query.append(token);
+	query.append(session);
+	query += '.';
 	std::string param = hls ? "&" : "&amp;";
 	param.append(query, 1);
 	Inserts inserts;
 	inserts.query.assign(query);
 	inserts.bare.assign(std::string_view(query).substr(1));
 	inserts.param.assign(param);
-	inserts.viewer = token.substr(0, dot);
+	inserts.viewer = session.substr(0, session.find('.'));
+	Signer signer {session};
+	signer.set_base(path);
 
 	const size_t initial = len + std::min(len, size_t(1) << 20) + 4096;
 	char* buf = (char*) std::malloc(initial);
-	Rewriter r {data, len, &inserts, {buf, 0, buf ? initial : 0}, 0};
+	Rewriter r {data, len, &inserts, &signer, {buf, 0, buf ? initial : 0}, 0};
 	const Output out = hls ? rewrite_hls(r) : rewrite_dash(r);
 	varnish::forge_response(200, "", 0, out.buf, out.len);
 }

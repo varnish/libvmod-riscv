@@ -43,7 +43,7 @@ You can test Common Access Token in Rust like so:
 
 ## Per-viewer streaming manifests
 
-`manifests.vcl` personalizes HLS and DASH manifests for each viewer using signed session tokens while Varnish caches a single copy of each object. This demo requires Varnish Enterprise. Serve the sample streams from a local origin server, start Varnish, and run the session walkthrough:
+`manifests.vcl` signs every URL in HLS and DASH manifests for each viewer while Varnish caches a single copy of each object. This demo requires Varnish Enterprise. Serve the sample streams from a local origin server, start Varnish, and run the session walkthrough:
 
 ```sh
 (cd streams && python3 -m http.server 8081) &

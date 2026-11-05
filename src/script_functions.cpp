@@ -1210,6 +1210,8 @@ APICALL(regex_delete)
 }
 
 void sha256(machine_t&);
+void hmac_sha256(machine_t&);
+void hmac_sha256_key(machine_t&);
 void base64(machine_t&);
 void fetch(machine_t&);
 
@@ -1313,6 +1315,8 @@ void Script::setup_syscall_interface()
 	machine_t::install_syscall_handler(ECALL_FETCH, fetch);
 	machine_t::install_syscall_handler(ECALL_FIND_BACKEND, find_backend);
 	machine_t::install_syscall_handler(ECALL_REGISTER_TRANSFORM, register_transform);
+	machine_t::install_syscall_handler(ECALL_HMAC_SHA256, hmac_sha256);
+	machine_t::install_syscall_handler(ECALL_HMAC_SHA256_KEY, hmac_sha256_key);
 
 	// A custom intruction used to handle indexed dynamic calls.
 	using namespace riscv;

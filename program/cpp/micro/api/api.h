@@ -99,8 +99,7 @@ struct HmacSha256 {
 	std::array<uint8_t, 32> operator()(std::initializer_list<std::string_view> parts) const;
 	std::array<uint8_t, 32> operator()(std::string_view msg) const { return (*this)({msg}); }
 private:
-	std::array<char, 64> ipad;
-	std::array<char, 64> opad;
+	std::array<uint32_t, 16> state;
 };
 bool equal_constant_time(std::string_view a, std::string_view b);
 
