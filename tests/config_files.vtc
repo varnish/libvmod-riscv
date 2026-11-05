@@ -1,0 +1,182 @@
+varnishtest "RISC-V tenants read config files during initialization and reload on changes"
+
+feature cmd "ls /usr/bin/riscv64-linux-gnu-g++* >/dev/null 2>&1"
+
+shell {
+	mkdir -p ${tmpdir}/conf
+	printf 'hello' > ${tmpdir}/conf/greeting.txt
+	cat >${tmpdir}/${testname}.cpp <<-'EOF'
+	#include <api.h>
+	namespace varnish = api;
+
+	static std::string greeting;
+
+	static const char* get(const char*, size_t)
+	{
+		return greeting.c_str();
+	}
+
+	static const char* late(const char*, size_t)
+	{
+		static std::string result;
+		result = varnish::config_file("greeting").value_or("none");
+		return result.c_str();
+	}
+
+	static void on_recv(varnish::Request)
+	{
+	}
+
+	int main()
+	{
+		greeting = varnish::config_file("greeting").value_or("missing");
+		if (greeting == "fail")
+			return 1;
+		if (!varnish::config_file("absent"))
+			greeting += "+absent";
+		varnish::register_function("get", get);
+		varnish::register_function("late", late);
+		varnish::wait_for_requests(on_recv);
+	}
+	EOF
+}
+
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"config": {
+				"filename": "${tmpdir}/${testname}.cpp",
+				"group": "test",
+				"config_files": {"greeting": "${tmpdir}/conf/greeting.txt"}
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork("config")) {
+			return (synth(500));
+		}
+		if (req.url ~ "late") {
+			set req.http.X-Result = riscv.call("late", "");
+		} else {
+			set req.http.X-Result = riscv.call("get", "");
+		}
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		set resp.http.X-Result = req.http.X-Result;
+	}
+} -start
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.http.X-Result == "hello+absent"
+} -run
+
+shell {printf 'world' > ${tmpdir}/conf/greeting.txt}
+delay 1
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.http.X-Result == "world+absent"
+
+	txreq -url "/?late"
+	rxresp
+	expect resp.status == 503
+} -run
+
+shell {
+	printf 'renamed' > ${tmpdir}/conf/.greeting.tmp
+	mv ${tmpdir}/conf/.greeting.tmp ${tmpdir}/conf/greeting.txt
+}
+delay 1
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.http.X-Result == "renamed+absent"
+} -run
+
+# Keep the current program if main() fails during reinitialization.
+shell {printf 'fail' > ${tmpdir}/conf/greeting.txt}
+delay 1
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.http.X-Result == "renamed+absent"
+} -run
+
+# Keep the current program if a config file is removed.
+shell {rm ${tmpdir}/conf/greeting.txt}
+delay 1
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.http.X-Result == "renamed+absent"
+} -run
+
+shell {printf 'back' > ${tmpdir}/conf/greeting.txt}
+delay 1
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.http.X-Result == "back+absent"
+} -run
+
+varnish v1 -vcl {
+	vcl 4.1;
+	import riscv;
+
+	backend default none;
+
+	sub vcl_init {
+		riscv.embed_tenants("""{
+			"config": {
+				"filename": "${tmpdir}/${testname}.cpp",
+				"group": "test",
+				"config_files": {"greeting": "${tmpdir}/conf/greeting.txt"}
+			}
+		}""");
+		riscv.finalize_tenants();
+	}
+
+	sub vcl_recv {
+		if (!riscv.fork("config")) {
+			return (synth(500));
+		}
+		set req.http.X-Result = "v2:" + riscv.call("get", "");
+		return (synth(200));
+	}
+
+	sub vcl_synth {
+		set resp.http.X-Result = req.http.X-Result;
+	}
+}
+varnish v1 -cliok "vcl.discard vcl1"
+
+shell {printf 'shared' > ${tmpdir}/conf/greeting.txt}
+delay 1
+
+client c1 {
+	txreq
+	rxresp
+	expect resp.http.X-Result == "v2:shared+absent"
+} -run
+
+logexpect l1 -v v1 -d 1 -g raw {
+	expect * * VCL_Error "config_file\\(\\) is only available during program initialization"
+	expect * * VCL_Log "riscv: tenant 'config' reloaded after a config file changed"
+	expect * * Error "riscv: tenant 'config' reload failed; keeping the current program: The machine was not waiting for requests"
+} -run

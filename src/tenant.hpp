@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -86,6 +87,10 @@ struct TenantGroup {
 	   create a new vector and exchange the pointer. */
 	std::shared_ptr<std::vector<std::string>> argv =
 		std::make_shared<std::vector<std::string>>();
+
+	/* Logical names mapped to files the program can read during
+	   initialization. A file change triggers reinitialization. */
+	std::map<std::string, std::string> config_files;
 };
 
 /* Identifies the program file a tenant was loaded from, so that a VCL
@@ -98,6 +103,12 @@ struct FileStamp {
 
 	static FileStamp of(const std::string& path);
 	bool operator==(const FileStamp&) const = default;
+};
+
+struct ConfigFile {
+	std::string path;
+	FileStamp   stamp;
+	std::string contents;
 };
 
 struct TenantConfig

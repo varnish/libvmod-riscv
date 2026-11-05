@@ -215,6 +215,24 @@ inline void register_transform(std::string_view name, transform_t func)
 	syscall(ECALL_REGISTER_TRANSFORM, (long) name.data(), name.size(), (long) func);
 }
 
+inline std::optional<std::string> config_file(std::string_view name)
+{
+	std::string out;
+	while (true) {
+		asm ("" ::: "memory");
+		const long len = syscall(ECALL_CONFIG_FILE, (long) name.data(), name.size(),
+			(long) out.data(), out.size());
+		asm ("" ::: "memory");
+		if (len < 0)
+			return std::nullopt;
+		if (size_t(len) <= out.size()) {
+			out.resize(len);
+			return out;
+		}
+		out.resize(len);
+	}
+}
+
 inline std::array<uint8_t, 32> sha256(std::string_view data)
 {
 	std::array<uint8_t, 32> digest;
@@ -330,10 +348,25 @@ inline std::array<uint8_t, 32> HmacSha256::operator()(std::initializer_list<std:
 	}
 	std::array<uint8_t, 32> digest;
 	asm ("" ::: "memory");
-	syscall(ECALL_HMAC_SHA256, (long) state.data(), (long) iov.data(), n / 2,
-		(long) digest.data(), digest.size());
+	if (blocks == 1)
+		syscall(ECALL_HMAC_SHA256, (long) state.data(), (long) iov.data(), n / 2,
+			(long) digest.data(), digest.size());
+	else
+		syscall(ECALL_HMAC_SHA256_RESUME, (long) state.data(), blocks, (long) iov.data(), n / 2,
+			(long) digest.data(), digest.size());
 	asm ("" ::: "memory");
 	return digest;
+}
+inline HmacSha256 HmacSha256::with_prefix(std::string_view prefix) const
+{
+	HmacSha256 result = *this;
+	asm ("" ::: "memory");
+	result.blocks = syscall(ECALL_HMAC_SHA256_ABSORB, (long) state.data(), blocks,
+		(long) prefix.data(), prefix.size(), (long) result.state.data());
+	asm ("" ::: "memory");
+	if (result.blocks == 0)
+		__builtin_trap();
+	return result;
 }
 inline bool equal_constant_time(std::string_view a, std::string_view b)
 {

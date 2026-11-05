@@ -64,5 +64,8 @@ struct SandboxTenant
 /* Fork the tenant of this name in the VCL of priv (a PRIV_VCL) */
 Script* tenant_fork(const vrt_ctx*, vmod_priv* priv, std::string_view name,
 	bool debug, bool permanent);
+std::map<std::string, ConfigFile> read_config_files(const SandboxTenant&);
+bool config_files_current(const MachineInstance&);
+void watch_config_files(const std::shared_ptr<SandboxTenant>&);
 
 } // rvs

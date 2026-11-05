@@ -1,4 +1,5 @@
 #include <api.h>
+#include <nlohmann/json.hpp>
 #include <sys/random.h>
 #include <cstdlib>
 #include <algorithm>
@@ -6,46 +7,95 @@
 #include <cstring>
 #include <ctime>
 namespace varnish = api;
+using json = nlohmann::json;
 
 /* Personalize HLS and DASH manifests from a single cached copy.
 
-   vcl_recv:    set req.http.X-Token = riscv.call("authorize", req.url);
+   vcl_recv:    set req.http.X-Client-IP = client.ip;
+                set req.http.X-Token = riscv.call("authorize", req.url);
+                set req.http.X-Variant = riscv.call("watermark", req.http.X-Token);
    vcl_deliver: riscv.deliver_transform("personalize", req.http.X-Token);
 
-   A manifest request without a token starts a session with a random viewer ID.
-   Authorized manifest requests renew the session. Rewriting signs each
-   supported manifest URI for the viewer, so a token is only valid for the
-   path it was issued for. All other requests require a valid token. VCL
-   removes the token from the URL before the cache lookup, so all viewers
-   share one cached copy of each object.
+   A session starts with a manifest request that carries an entitlement
+   from the subscriber's authentication service: an HS256 JWT in the auth
+   parameter, with required sub and exp claims. An optional path claim
+   restricts access to manifest paths that start with that prefix.
+   Rewriting signs each supported manifest URI for the session, so a token
+   is only valid for the path it was issued for. All other requests require
+   a valid token. VCL removes the auth and token parameters from the URL
+   before the cache lookup, so all viewers share one cached copy of each object.
 
-   Token:    <viewer id>.<expires>.<HMAC-SHA256/128 of "<viewer id>.<expires>\n<path>">
-   Template: <viewer id>.<expires>.<P>.<S>.<HMAC of "<viewer id>.<expires>.<P>.<S>\n<prefix><slashes><suffix>">
+   Token:    <key id>.<subscriber>.<session>.<expires>.<HMAC-SHA256/128 of
+             "<key id>.<subscriber>.<session>.<expires>\n<network>\n<padding><path>">
+   Template: <key id>.<subscriber>.<session>.<expires>.<P>.<S>.<HMAC of
+             "<key id>.<subscriber>.<session>.<expires>.<P>.<S>\n<network>\n<padding><prefix><slashes><suffix>">
+             Newline padding brings the preceding text to a multiple of 64
+             bytes, allowing that prefix to be hashed once per manifest.
              DASH SegmentTemplate URIs sign the P bytes before the first $
              and the S bytes after the last $ of the resolved path, plus
              the / characters between them. Template tokens are not valid
              for manifests.
-   authorize returns a token for the manifest path, which personalize
-   verifies against req.url before signing anything with it.
-   Tenant arguments: [secret, session lifetime in seconds]. */
-static varnish::HmacSha256 hmac {"change-me-varnish-manifest-secret"};
-static long lifetime = 300;
+   The subscriber pseudonym is the first 12 bytes of an HMAC of the sub
+   claim using subscriber_key. The session ID consists of 12 random bytes.
+   Both are base64url-encoded. Manifest URIs expire with the session.
+   Segment URIs in live playlists expire after the segment lifetime or
+   when the session expires, whichever comes first, and are renewed on
+   every playlist refresh. Segment URIs in VOD playlists (ending in
+   EXT-X-ENDLIST) and static MPDs expire with the session. The network is
+   the client address in X-Client-IP, masked to the configured prefix length,
+   or empty when bind_network is not configured.
+
+   watermark selects the A/B variant of the requested path for the session
+   for forensic watermarking at the edge. Let d = HMAC-SHA256 of the path
+   using watermark_key, and i = big-endian(d[0..3]) % 96. Using zero-based
+   indices, take bit i % 6 of the numeric base64url value of session ID
+   character i / 6, then XOR it with the low bit of d[4]. A result of 0
+   selects A; 1 selects B.
+
+   Config files:
+     settings     JSON: keys (key IDs mapped to URL signing secrets), signing_key
+                  (the ID of the key used to sign new tokens), entitlement_keys
+                  (key IDs mapped to HS256 secrets; the JWT kid header must
+                  identify the signing key if multiple keys are configured),
+                  subscriber_key, watermark_key (optional),
+                  session_lifetime (default 21600), segment_lifetime
+                  (default 120), bind_network (optional, {"ipv4": 24, "ipv6": 48})
+     revocations  Optional. Subscriber IDs (sub claims) and session IDs, one per
+                  line. Blank lines and lines starting with # are ignored. */
+struct Key {
+	std::string id;
+	varnish::HmacSha256 hmac;
+};
+static std::vector<Key> keys;
+static const Key* signing = nullptr;
+static std::vector<Key> entitlement_keys;
+static std::optional<varnish::HmacSha256> subscriber_hmac;
+static std::optional<varnish::HmacSha256> watermark_hmac;
+static long session_lifetime = 6 * 3600;
+static long segment_lifetime = 120;
+static int bind_ipv4 = 0;
+static int bind_ipv6 = 0;
+static std::vector<std::string> revoked;
 
 static constexpr std::string_view SESSION_DATA_ID = "com.varnish.viewer-id";
-static constexpr size_t VIEWER_ID_BYTES = 12;
+static constexpr size_t ID_BYTES = 12;
 static constexpr size_t MAC_BYTES = 16;
+static constexpr size_t MAX_KEY_ID = 16;
+static constexpr size_t MAX_TOKEN = 160;
 static constexpr long MAX_LIFETIME = 10L * 365 * 24 * 3600;
+static constexpr unsigned B64URL = BASE64_FLAG_URL | BASE64_FLAG_NOPAD;
 
 static constexpr size_t base64url_size(size_t n)
 {
 	return (4 * n + 2) / 3;
 }
 static constexpr size_t MAC_CHARS = base64url_size(MAC_BYTES);
+static constexpr size_t ID_CHARS = base64url_size(ID_BYTES);
+static constexpr char alphabet[] =
+	"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 [[gnu::always_inline]] static inline void base64url_encode(const uint8_t* d, size_t n, char* out)
 {
-	static constexpr char alphabet[] =
-		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 	size_t i = 0;
 	for (; i + 3 <= n; i += 3) {
 		const uint32_t v = (d[i] << 16) | (d[i + 1] << 8) | d[i + 2];
@@ -70,15 +120,41 @@ static void encode_mac(const std::array<uint8_t, 32>& digest, char* out)
 	base64url_encode(digest.data(), MAC_BYTES, out);
 }
 
-static bool viewer_char(char c)
+static bool id_char(char c)
 {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 		|| (c >= '0' && c <= '9') || c == '-' || c == '_';
 }
 
+static bool valid_id(std::string_view s, size_t min, size_t max)
+{
+	return s.size() >= min && s.size() <= max && std::all_of(s.begin(), s.end(), id_char);
+}
+
+static int base64url_value(char c)
+{
+	if (c >= 'A' && c <= 'Z')
+		return c - 'A';
+	if (c >= 'a' && c <= 'z')
+		return c - 'a' + 26;
+	if (c >= '0' && c <= '9')
+		return c - '0' + 52;
+	return c == '-' ? 62 : 63;
+}
+
 static std::string slashes_in(std::string_view s)
 {
 	return std::string(std::count(s.begin(), s.end(), '/'), '/');
+}
+
+static std::string_view padding(size_t len)
+{
+	static constexpr char newlines[64] = {
+		'\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n',
+		'\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n',
+		'\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n',
+		'\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n', '\n'};
+	return {newlines, (64 - len % 64) % 64};
 }
 
 static bool parse_number(std::string_view s, long& out)
@@ -149,11 +225,170 @@ static std::string_view query_param(std::string_view query, std::string_view key
 	return {};
 }
 
-static std::optional<std::string_view> verify(std::string_view token, std::string_view path, long now)
+static std::string_view as_view(const std::array<uint8_t, 32>& digest)
 {
-	if (token.size() > 128)
+	return {(const char*) digest.data(), digest.size()};
+}
+
+static std::string pseudonym(std::string_view subject)
+{
+	const auto digest = (*subscriber_hmac)({"subscriber\n", subject});
+	std::string out(ID_CHARS, '\0');
+	base64url_encode(digest.data(), ID_BYTES, out.data());
+	return out;
+}
+
+static bool is_revoked(std::string_view id)
+{
+	return std::binary_search(revoked.begin(), revoked.end(), id, std::less<> {});
+}
+
+static const Key* find_key(const std::vector<Key>& ring, std::string_view id)
+{
+	for (const auto& key : ring)
+		if (key.id == id)
+			return &key;
+	return nullptr;
+}
+
+static bool parse_ipv4(std::string_view s, uint8_t* out)
+{
+	for (int i = 0; i < 4; i++) {
+		const size_t dot = (i < 3) ? s.find('.') : s.size();
+		if (dot == s.npos || dot == 0 || dot > 3)
+			return false;
+		long v;
+		if (!parse_number(s.substr(0, dot), v) || v > 255 || (dot > 1 && s[0] == '0'))
+			return false;
+		out[i] = v;
+		s.remove_prefix(i < 3 ? dot + 1 : dot);
+	}
+	return s.empty();
+}
+
+static int hex_value(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
+static bool parse_ipv6(std::string_view s, uint8_t* out)
+{
+	std::array<uint16_t, 8> groups {};
+	int n = 0, gap = -1;
+	if (s.starts_with("::")) {
+		gap = 0;
+		s.remove_prefix(2);
+	}
+	while (!s.empty()) {
+		const size_t colon = s.find(':');
+		const std::string_view group = s.substr(0, colon);
+		if (colon == s.npos && group.find('.') != group.npos) {
+			uint8_t v4[4];
+			if (n > 6 || !parse_ipv4(group, v4))
+				return false;
+			groups[n++] = (v4[0] << 8) | v4[1];
+			groups[n++] = (v4[2] << 8) | v4[3];
+			break;
+		}
+		if (n == 8 || group.empty() || group.size() > 4)
+			return false;
+		uint16_t v = 0;
+		for (const char c : group) {
+			const int h = hex_value(c);
+			if (h < 0)
+				return false;
+			v = (v << 4) | h;
+		}
+		groups[n++] = v;
+		if (colon == s.npos)
+			break;
+		s.remove_prefix(colon + 1);
+		if (s.starts_with(":")) {
+			if (gap >= 0)
+				return false;
+			gap = n;
+			s.remove_prefix(1);
+		} else if (s.empty()) {
+			return false;
+		}
+	}
+	if (gap < 0 ? n != 8 : n > 7)
+		return false;
+	std::array<uint16_t, 8> full {};
+	const int head = gap < 0 ? n : gap;
+	for (int i = 0; i < head; i++)
+		full[i] = groups[i];
+	for (int i = head; i < n; i++)
+		full[8 - (n - i)] = groups[i];
+	for (int i = 0; i < 8; i++) {
+		out[2 * i] = full[i] >> 8;
+		out[2 * i + 1] = full[i] & 0xFF;
+	}
+	return true;
+}
+
+static constexpr size_t TAIL_MAX = 48;
+
+static std::optional<std::string_view> network_tail(char* buf)
+{
+	if (bind_ipv4 == 0 && bind_ipv6 == 0)
+		return std::string_view("\n\n");
+	const auto field = varnish::Request(varnish::HDR_REQ).find("X-Client-IP");
+	if (!field)
 		return std::nullopt;
-	std::array<std::string_view, 5> part;
+	const std::string address = field.value();
+	uint8_t bytes[16];
+	int bits;
+	char family;
+	if (parse_ipv4(address, bytes)) {
+		bits = bind_ipv4;
+		family = '4';
+	} else if (parse_ipv6(address, bytes)) {
+		bits = bind_ipv6;
+		family = '6';
+	} else {
+		return std::nullopt;
+	}
+	if (bits == 0)
+		return std::string_view("\n\n");
+	char* p = buf;
+	*p++ = '\n';
+	*p++ = family;
+	*p++ = '/';
+	if (bits >= 100)
+		*p++ = '0' + bits / 100;
+	if (bits >= 10)
+		*p++ = '0' + bits / 10 % 10;
+	*p++ = '0' + bits % 10;
+	*p++ = '/';
+	for (int i = 0; 8 * i < bits; i++) {
+		const int keep = std::min(8, bits - 8 * i);
+		const uint8_t b = bytes[i] & uint8_t(0xFF << (8 - keep));
+		*p++ = "0123456789abcdef"[b >> 4];
+		*p++ = "0123456789abcdef"[b & 15];
+	}
+	*p++ = '\n';
+	return std::string_view(buf, p - buf);
+}
+
+struct Session {
+	std::string_view subscriber;
+	std::string_view id;
+	long expires;
+};
+
+static std::optional<Session> verify(std::string_view token, std::string_view path,
+	long now, std::string_view tail)
+{
+	if (token.size() > MAX_TOKEN)
+		return std::nullopt;
+	std::array<std::string_view, 7> part;
 	size_t n = 0, p = 0;
 	while (true) {
 		if (n == part.size())
@@ -165,34 +400,110 @@ static std::optional<std::string_view> verify(std::string_view token, std::strin
 		p = dot + 1;
 	}
 	long expires;
-	if ((n != 3 && n != 5) || part[0].empty() || !parse_number(part[1], expires) || now >= expires)
+	if ((n != 5 && n != 7) || !parse_number(part[3], expires) || now >= expires)
 		return std::nullopt;
-	if (!std::all_of(part[0].begin(), part[0].end(), viewer_char))
+	if (!valid_id(part[1], ID_CHARS, ID_CHARS) || !valid_id(part[2], ID_CHARS, ID_CHARS))
+		return std::nullopt;
+	const Key* key = find_key(keys, part[0]);
+	if (key == nullptr)
 		return std::nullopt;
 
 	const std::string_view mac = part[n - 1];
 	const std::string_view signed_part = token.substr(0, token.size() - mac.size() - 1);
 	std::array<uint8_t, 32> digest;
-	if (n == 3) {
-		digest = hmac({signed_part, "\n", path});
+	if (n == 5) {
+		digest = key->hmac({signed_part, tail, padding(signed_part.size() + tail.size()), path});
 	} else {
 		long prefix, suffix;
-		if (is_manifest(path) || !parse_number(part[2], prefix) || !parse_number(part[3], suffix)
+		if (is_manifest(path) || !parse_number(part[4], prefix) || !parse_number(part[5], suffix)
 			|| size_t(prefix) > path.size() || size_t(suffix) > path.size() - prefix)
 			return std::nullopt;
 		const std::string slashes = slashes_in(path.substr(prefix, path.size() - prefix - suffix));
-		digest = hmac({signed_part, "\n", path.substr(0, prefix), slashes,
-			path.substr(path.size() - suffix)});
+		digest = key->hmac({signed_part, tail, padding(signed_part.size() + tail.size()),
+			path.substr(0, prefix), slashes, path.substr(path.size() - suffix)});
 	}
 	char expected[MAC_CHARS];
 	encode_mac(digest, expected);
 	if (!varnish::equal_constant_time(mac, {expected, MAC_CHARS}))
 		return std::nullopt;
-	return part[0];
+	return Session {part[1], part[2], expires};
 }
 
-/* Return a new or renewed token for a manifest, the verified token for
-   anything else, or nullptr if authorization fails. */
+static const json* member(const json& obj, const char* key)
+{
+	const auto it = obj.find(key);
+	return it != obj.end() ? &*it : nullptr;
+}
+
+static bool header_safe(std::string_view text)
+{
+	if (text.empty() || text.size() > 256)
+		return false;
+	for (const unsigned char c : text)
+		if (c < 0x20 || c == 0x7f)
+			return false;
+	return true;
+}
+
+static std::optional<std::string> entitlement(std::string_view jwt, std::string_view path, long now)
+{
+	if (jwt.size() > 4096)
+		return std::nullopt;
+	const size_t dot1 = jwt.find('.');
+	if (dot1 == jwt.npos)
+		return std::nullopt;
+	const size_t dot2 = jwt.find('.', dot1 + 1);
+	if (dot2 == jwt.npos || jwt.find('.', dot2 + 1) != jwt.npos)
+		return std::nullopt;
+
+	const auto signature = varnish::base64_decode(jwt.substr(dot2 + 1), B64URL);
+	if (!signature)
+		return std::nullopt;
+	const Key* key = nullptr;
+	for (const auto& candidate : entitlement_keys) {
+		if (varnish::equal_constant_time(*signature, as_view(candidate.hmac(jwt.substr(0, dot2))))) {
+			key = &candidate;
+			break;
+		}
+	}
+	if (key == nullptr)
+		return std::nullopt;
+
+	const auto header = varnish::base64_decode(jwt.substr(0, dot1), B64URL);
+	const auto payload = varnish::base64_decode(jwt.substr(dot1 + 1, dot2 - dot1 - 1), B64URL);
+	if (!header || !payload)
+		return std::nullopt;
+	const json hdr = json::parse(*header, nullptr, false);
+	if (!hdr.is_object())
+		return std::nullopt;
+	const json* alg = member(hdr, "alg");
+	if (!alg || !alg->is_string() || alg->get_ref<const std::string&>() != "HS256")
+		return std::nullopt;
+	const json* kid = member(hdr, "kid");
+	if (kid ? (!kid->is_string() || kid->get_ref<const std::string&>() != key->id)
+		: entitlement_keys.size() != 1)
+		return std::nullopt;
+
+	const json claims = json::parse(*payload, nullptr, false);
+	if (!claims.is_object())
+		return std::nullopt;
+	const json* exp = member(claims, "exp");
+	if (!exp || !exp->is_number() || now >= exp->get<double>())
+		return std::nullopt;
+	const json* nbf = member(claims, "nbf");
+	if (nbf && (!nbf->is_number() || now < nbf->get<double>()))
+		return std::nullopt;
+	const json* scope = member(claims, "path");
+	if (scope && (!scope->is_string() || !path.starts_with(scope->get_ref<const std::string&>())))
+		return std::nullopt;
+	const json* sub = member(claims, "sub");
+	if (!sub || !sub->is_string() || !header_safe(sub->get_ref<const std::string&>()))
+		return std::nullopt;
+	return sub->get<std::string>();
+}
+
+/* Return the existing token if it is valid, or issue a new token for a
+   manifest request with a valid entitlement. Return nullptr on failure. */
 static const char* authorize(const char* arg, size_t len)
 {
 	static std::string result;
@@ -201,39 +512,66 @@ static const char* authorize(const char* arg, size_t len)
 	const std::string_view path = url.substr(0, q);
 	if (!path_safe(path))
 		return nullptr;
-	const std::string_view token =
-		(q != url.npos) ? query_param(url.substr(q + 1), "token") : std::string_view{};
-	const bool manifest = is_manifest(path);
+	const std::string_view query = (q != url.npos) ? url.substr(q + 1) : std::string_view{};
+	const std::string_view token = query_param(query, "token");
 	const long now = std::time(nullptr);
+	char network[TAIL_MAX];
+	const auto tail = network_tail(network);
+	if (!tail)
+		return nullptr;
 
-	char id[base64url_size(VIEWER_ID_BYTES)];
-	std::string_view viewer;
-	if (token.empty()) {
-		if (!manifest)
+	if (!token.empty()) {
+		const auto session = verify(token, path, now, *tail);
+		if (!session || is_revoked(session->subscriber) || is_revoked(session->id))
 			return nullptr;
-		std::array<uint8_t, VIEWER_ID_BYTES> bytes;
-		if (getrandom(bytes.data(), bytes.size(), 0) != (ssize_t) bytes.size())
-			return nullptr;
-		base64url_encode(bytes.data(), bytes.size(), id);
-		viewer = {id, sizeof(id)};
-	} else {
-		const auto verified = verify(token, path, now);
-		if (!verified)
-			return nullptr;
-		if (!manifest) {
-			result = token;
-			return result.c_str();
-		}
-		viewer = *verified;
+		result = token;
+		return result.c_str();
 	}
-	result = viewer;
+	if (!is_manifest(path))
+		return nullptr;
+	const auto subject = entitlement(query_param(query, "auth"), path, now);
+	if (!subject)
+		return nullptr;
+	const std::string subscriber = pseudonym(*subject);
+	if (is_revoked(subscriber))
+		return nullptr;
+	std::array<uint8_t, ID_BYTES> bytes;
+	if (getrandom(bytes.data(), bytes.size(), 0) != (ssize_t) bytes.size())
+		return nullptr;
+	char id[ID_CHARS];
+	base64url_encode(bytes.data(), bytes.size(), id);
+
+	result = signing->id;
 	result += '.';
-	result += std::to_string(now + lifetime);
+	result += subscriber;
+	result += '.';
+	result.append(id, ID_CHARS);
+	result += '.';
+	result += std::to_string(now + session_lifetime);
 	char mac[MAC_CHARS];
-	encode_mac(hmac({result, "\n", path}), mac);
+	encode_mac(signing->hmac({result, *tail, padding(result.size() + tail->size()), path}), mac);
 	result += '.';
 	result.append(mac, MAC_CHARS);
+	varnish::log("Session {} for subscriber {}", std::string_view(id, ID_CHARS), *subject);
 	return result.c_str();
+}
+
+static const char* watermark(const char* arg, size_t len)
+{
+	if (!watermark_hmac)
+		return nullptr;
+	const std::string_view token(arg, len);
+	const size_t a = token.find('.');
+	const size_t b = (a == token.npos) ? a : token.find('.', a + 1);
+	const size_t c = (b == token.npos) ? b : token.find('.', b + 1);
+	if (c == token.npos || c - b - 1 != ID_CHARS)
+		return nullptr;
+	const std::string_view session = token.substr(b + 1, ID_CHARS);
+	const std::string url = varnish::Request(varnish::HDR_REQ).url();
+	const auto d = (*watermark_hmac)(std::string_view(url).substr(0, url.find('?')));
+	const uint32_t index = ((uint32_t(d[0]) << 24) | (d[1] << 16) | (d[2] << 8) | d[3]) % (8 * ID_BYTES);
+	const int bit = ((base64url_value(session[index / 6]) >> (index % 6)) ^ d[4]) & 1;
+	return bit ? "B" : "A";
 }
 
 using word_t = uintptr_t;
@@ -362,10 +700,27 @@ struct Insert {
 	}
 };
 
-struct Inserts {
+struct TokenInserts {
 	Insert query;   /* ?token=... */
 	Insert bare;    /* token=... */
 	Insert param;   /* &token=... (or &amp;token=...) */
+
+	void assign(std::string_view session, bool hls)
+	{
+		std::string q = "?token=";
+		q.append(session);
+		q += '.';
+		std::string p = hls ? "&" : "&amp;";
+		p.append(q, 1);
+		query.assign(q);
+		bare.assign(std::string_view(q).substr(1));
+		param.assign(p);
+	}
+};
+
+struct Inserts {
+	TokenInserts segment;
+	TokenInserts manifest;
 	std::string_view viewer;
 };
 
@@ -459,19 +814,22 @@ static size_t remove_dot_segments(char* p, size_t n)
 }
 
 struct Signer {
+	const varnish::HmacSha256* hmac;
+	varnish::HmacSha256 segment_hmac;
 	std::string_view session;
+	std::string_view manifest;
+	std::string_view tail;
 	std::string_view doc;
 	std::string_view dir;
 	Output msg;
-	size_t head;
+	size_t head = 0;
 	char token[64];
 	size_t token_len;
 
-	explicit Signer(std::string_view s) : session(s)
+	Signer(const varnish::HmacSha256& h, std::string_view padded_session,
+		std::string_view s, std::string_view m, std::string_view t)
+		: hmac(&h), segment_hmac(h.with_prefix(padded_session)), session(s), manifest(m), tail(t)
 	{
-		msg.put(session);
-		msg.push('\n');
-		head = msg.len;
 	}
 
 	void set_base(std::string_view path)
@@ -496,13 +854,16 @@ struct Signer {
 		}
 	}
 
-	void sign(std::string_view ref, bool authority, bool templ)
+	void sign(std::string_view ref, bool authority, bool templ, bool for_manifest)
 	{
 		resolve(ref, authority);
 		const std::string_view path = this->path();
 		const size_t first = templ ? path.find('$') : path.npos;
 		if (first == path.npos) {
-			encode_mac(hmac({msg.view()}), token);
+			if (for_manifest)
+				encode_mac((*hmac)({manifest, tail, padding(manifest.size() + tail.size()), path}), token);
+			else
+				encode_mac(segment_hmac({path}), token);
 			token_len = MAC_CHARS;
 			return;
 		}
@@ -512,8 +873,9 @@ struct Signer {
 		fields += '.';
 		fields += std::to_string(suffix);
 		const std::string slashes = slashes_in(path.substr(first, last + 1 - first));
-		encode_mac(hmac({session, ".", fields, "\n", path.substr(0, first), slashes,
-			path.substr(last + 1)}), token + fields.size() + 1);
+		encode_mac((*hmac)({session, ".", fields, tail,
+			padding(session.size() + 1 + fields.size() + tail.size()),
+			path.substr(0, first), slashes, path.substr(last + 1)}), token + fields.size() + 1);
 		std::memcpy(token, fields.data(), fields.size());
 		token[fields.size()] = '.';
 		token_len = fields.size() + 1 + MAC_CHARS;
@@ -591,23 +953,26 @@ struct Rewriter {
 	/* Sign the URI in the input range [start, end) for the viewer, leaving
 	   its resolved path in the signer. Only HTTP(S) and relative URIs
 	   receive tokens; other schemes, such as skd: and data:, remain unchanged. */
-	[[gnu::always_inline]] bool tokenize(size_t start, size_t end, bool templ = false)
+	[[gnu::always_inline]] bool tokenize(size_t start, size_t end, bool templ = false,
+		bool for_manifest = false)
 	{
 		const auto uri = parse(start, end);
 		if (!uri)
 			return false;
-		signer->sign({base + uri->path_start, uri->path_end - uri->path_start}, uri->authority, templ);
+		signer->sign({base + uri->path_start, uri->path_end - uri->path_start}, uri->authority,
+			templ, for_manifest);
+		const TokenInserts& ins = for_manifest ? inserts->manifest : inserts->segment;
 		size_t pos = uri->path_end;
 		const bool has_query = pos < end && base[pos] == '?';
 		if (has_query)
 			pos = scan(base, pos + 1, end, Bytes<'#'> {});
 		copy_to(pos);
 		if (!has_query)
-			put(inserts->query);
+			put(ins.query);
 		else if (base[pos - 1] == '?' || base[pos - 1] == '&')
-			put(inserts->bare);
+			put(ins.bare);
 		else
-			put(inserts->param);
+			put(ins.param);
 		put(signer->token, signer->token_len);
 		return true;
 	}
@@ -631,8 +996,8 @@ struct Rewriter {
 			ve = line.find('"', eq + 2);
 			if (ve == line.npos)
 				return;
-			if (name == "URI")
-				r.tokenize(base + eq + 2, base + ve);
+			if (name == "URI" && r.resolve(base + eq + 2, base + ve))
+				r.tokenize(base + eq + 2, base + ve, false, is_manifest(r.signer->path()));
 			ve = line.find(',', ve);
 		} else {
 			ve = line.find(',', eq + 1);
@@ -641,6 +1006,11 @@ struct Rewriter {
 			return;
 		a = ve + 1;
 	}
+}
+
+[[gnu::noinline]] static bool tokenize_playlist(Rewriter& r, size_t ts, size_t te)
+{
+	return r.tokenize(ts, te, false, true);
 }
 
 [[gnu::noinline]] static void insert_session_data(Rewriter& r, size_t pos, bool crlf)
@@ -665,6 +1035,7 @@ static bool is_blank(char c)
 	const char* const base = r.base;
 	const size_t size = in.size();
 	bool session_data = false;
+	bool playlist_next = false;
 	size_t p = starts_with_at(in, 0, "\xEF\xBB\xBF") ? 3 : 0;
 	while (p < size) {
 		const size_t e = scan(base, p, size, Bytes<'\n'> {});
@@ -678,9 +1049,11 @@ static bool is_blank(char c)
 				while (te > ts && is_blank(base[te - 1]))
 					te--;
 				Rewriter cold = r;
-				if (!session_data && starts_with_at(in, ts, "#EXT-X-STREAM-INF:")) {
-					insert_session_data(cold, p, n < e);
+				if (starts_with_at(in, ts, "#EXT-X-STREAM-INF:")) {
+					if (!session_data)
+						insert_session_data(cold, p, n < e);
 					session_data = true;
+					playlist_next = true;
 				}
 				tokenize_uri_attributes(cold, ts, in.substr(ts, te - ts));
 				r = cold;
@@ -689,7 +1062,14 @@ static bool is_blank(char c)
 			size_t te = (base[e - 1] == '\r') ? e - 1 : e;
 			while (te > ts && is_blank(base[te - 1]))
 				te--;
-			r.tokenize(ts, te);
+			if (playlist_next) [[unlikely]] {
+				Rewriter cold = r;
+				tokenize_playlist(cold, ts, te);
+				r = cold;
+				playlist_next = false;
+			} else {
+				r.tokenize(ts, te);
+			}
 		}
 		p = e + 1;
 	}
@@ -817,7 +1197,11 @@ static bool is_uri_attribute(UriAttributes kind, std::string_view attr)
 				const size_t ve = find_byte(tag, vq + 1, tag[vq]);
 				if (ve == tag.npos)
 					break;
-				if (is_uri_attribute(kind, attr))
+				if (!is_uri_attribute(kind, attr))
+					;
+				else if (kind == UriAttributes::XLink)
+					tokenize_playlist(r, start + 1 + vq + 1, start + 1 + ve);
+				else
 					r.tokenize(start + 1 + vq + 1, start + 1 + ve,
 						kind == UriAttributes::SegmentTemplate);
 				a = ve + 1;
@@ -831,7 +1215,8 @@ static bool is_uri_attribute(UriAttributes kind, std::string_view attr)
 			/* A BaseURL ending in / is a directory against which segment
 			   URIs are resolved. Its query string would be discarded. */
 			const bool directory = name == "BaseURL" && te > ts && in[te - 1] == '/';
-			const bool resolved = directory ? r.resolve(ts, te) : r.tokenize(ts, te);
+			const bool resolved = directory ? r.resolve(ts, te)
+				: name == "BaseURL" ? r.tokenize(ts, te) : tokenize_playlist(r, ts, te);
 			if (name == "BaseURL" && resolved) {
 				const std::string_view path = r.signer->path();
 				if (bases.back().level < depth) {
@@ -859,16 +1244,79 @@ static bool is_uri_attribute(UriAttributes kind, std::string_view attr)
 	return r.out;
 }
 
+static bool hls_ended(std::string_view in)
+{
+	size_t e = in.size();
+	while (e > 0 && is_space(in[e - 1]))
+		e--;
+	const size_t nl = (e > 0) ? in.rfind('\n', e - 1) : in.npos;
+	size_t b = (nl == in.npos) ? 0 : nl + 1;
+	while (b < e && is_blank(in[b]))
+		b++;
+	return in.substr(b, e - b).starts_with("#EXT-X-ENDLIST");
+}
+
+static bool dash_dynamic(std::string_view in)
+{
+	size_t p = 0;
+	while ((p = in.find('<', p)) != in.npos) {
+		if (starts_with_at(in, p, "<!--")) {
+			p = in.find("-->", p + 4);
+			continue;
+		}
+		const size_t end = in.find('>', p);
+		if (end == in.npos)
+			return false;
+		if (p + 1 < in.size() && (in[p + 1] == '?' || in[p + 1] == '!')) {
+			p = end;
+			continue;
+		}
+		const std::string_view tag = in.substr(p, end - p);
+		for (size_t t = tag.find("type"); t != tag.npos; t = tag.find("type", t + 4)) {
+			if (!is_space(tag[t - 1]))
+				continue;
+			size_t v = t + 4;
+			while (v < tag.size() && is_space(tag[v]))
+				v++;
+			if (v >= tag.size() || tag[v] != '=')
+				continue;
+			v++;
+			while (v < tag.size() && is_space(tag[v]))
+				v++;
+			const std::string_view value = tag.substr(v);
+			return value.starts_with("\"dynamic\"") || value.starts_with("'dynamic'");
+		}
+		return false;
+	}
+	return false;
+}
+
+static std::string session_prefix(const Session& session, long expires)
+{
+	std::string prefix = signing->id;
+	prefix += '.';
+	prefix += session.subscriber;
+	prefix += '.';
+	prefix += session.id;
+	prefix += '.';
+	prefix += std::to_string(expires);
+	return prefix;
+}
+
 static void personalize(const char* arg, const char* data, size_t len)
 {
 	const std::string url = varnish::Request(varnish::HDR_REQ).url();
 	const std::string_view path = std::string_view(url).substr(0, url.find('?'));
 	const std::string_view token(arg);
-	if (!path_safe(path) || !is_manifest(path) || !verify(token, path, std::time(nullptr))) {
+	const long now = std::time(nullptr);
+	char network[TAIL_MAX];
+	const auto tail = network_tail(network);
+	const auto session = (tail && path_safe(path) && is_manifest(path))
+		? verify(token, path, now, *tail) : std::nullopt;
+	if (!session) {
 		static constexpr std::string_view denied = "Missing or invalid viewer token";
 		varnish::forge_response(403, "text/plain", 10, denied.data(), denied.size());
 	}
-	const std::string_view session = token.substr(0, token.rfind('.'));
 
 	const std::string_view in(data, len);
 	size_t s = 0;
@@ -880,17 +1328,19 @@ static void personalize(const char* arg, const char* data, size_t len)
 	if (!hls && !starts_with_at(in, s, "<"))
 		varnish::forge_response(200, "", 0, data, len);
 
-	std::string query = "?token=";
-	query.append(session);
-	query += '.';
-	std::string param = hls ? "&" : "&amp;";
-	param.append(query, 1);
+	const bool vod = hls ? hls_ended(in) : !dash_dynamic(in);
+	const long segment_expires = vod ? session->expires
+		: std::min(now + segment_lifetime, session->expires);
+	const std::string manifest = session_prefix(*session, session->expires);
+	const std::string segment = session_prefix(*session, segment_expires);
 	Inserts inserts;
-	inserts.query.assign(query);
-	inserts.bare.assign(std::string_view(query).substr(1));
-	inserts.param.assign(param);
-	inserts.viewer = session.substr(0, session.find('.'));
-	Signer signer {session};
+	inserts.segment.assign(segment, hls);
+	inserts.manifest.assign(manifest, hls);
+	inserts.viewer = session->id;
+	std::string padded = segment;
+	padded += *tail;
+	padded += padding(padded.size());
+	Signer signer {signing->hmac, padded, segment, manifest, *tail};
 	signer.set_base(path);
 
 	const size_t initial = len + std::min(len, size_t(1) << 20) + 4096;
@@ -900,20 +1350,118 @@ static void personalize(const char* arg, const char* data, size_t len)
 	varnish::forge_response(200, "", 0, out.buf, out.len);
 }
 
+[[noreturn]] static void invalid(std::string_view what)
+{
+	varnish::log("Invalid manifest settings: {}", what);
+	std::exit(1);
+}
+
+static long lifetime_setting(const json& settings, const char* name, long fallback)
+{
+	const json* value = member(settings, name);
+	if (value == nullptr)
+		return fallback;
+	if (!value->is_number_integer() || value->get<long>() <= 0)
+		invalid(std::string(name) + " must be a positive integer");
+	return std::min(value->get<long>(), MAX_LIFETIME);
+}
+
+static std::string secret_setting(const json& value, std::string_view name)
+{
+	if (!value.is_string() || value.get_ref<const std::string&>().empty())
+		invalid(std::string(name) + " must be a non-empty string");
+	return value.get<std::string>();
+}
+
+static std::vector<Key> key_ring(const json& settings, const char* name)
+{
+	const json* ring = member(settings, name);
+	if (ring == nullptr || !ring->is_object() || ring->empty())
+		invalid(std::string(name) + " must map key IDs to secrets");
+	std::vector<Key> result;
+	for (const auto& [id, secret] : ring->items()) {
+		if (!valid_id(id, 1, MAX_KEY_ID))
+			invalid("key IDs must be 1 to 16 base64url characters");
+		result.push_back({id, varnish::HmacSha256(secret_setting(secret, id))});
+	}
+	return result;
+}
+
+static void load_settings()
+{
+	const auto text = varnish::config_file("settings");
+	if (!text)
+		invalid("the tenant has no settings config file");
+	const json settings = json::parse(*text, nullptr, false);
+	if (!settings.is_object())
+		invalid("settings must be a JSON object");
+
+	keys = key_ring(settings, "keys");
+	const json* signing_id = member(settings, "signing_key");
+	if (signing_id == nullptr || !signing_id->is_string()
+		|| (signing = find_key(keys, signing_id->get_ref<const std::string&>())) == nullptr)
+		invalid("signing_key must name one of the keys");
+	entitlement_keys = key_ring(settings, "entitlement_keys");
+	const json* subscriber = member(settings, "subscriber_key");
+	if (subscriber == nullptr)
+		invalid("subscriber_key is required");
+	subscriber_hmac.emplace(secret_setting(*subscriber, "subscriber_key"));
+	if (const json* wm = member(settings, "watermark_key"))
+		watermark_hmac.emplace(secret_setting(*wm, "watermark_key"));
+
+	session_lifetime = lifetime_setting(settings, "session_lifetime", session_lifetime);
+	segment_lifetime = std::min(session_lifetime,
+		lifetime_setting(settings, "segment_lifetime", segment_lifetime));
+
+	if (const json* bind = member(settings, "bind_network")) {
+		if (!bind->is_object())
+			invalid("bind_network must be an object");
+		const auto prefix = [&] (const char* family, int max) {
+			const json* bits = member(*bind, family);
+			if (bits == nullptr)
+				return 0;
+			if (!bits->is_number_integer() || bits->get<int>() < 0 || bits->get<int>() > max)
+				invalid(std::string("bind_network.") + family + " is out of range");
+			return bits->get<int>();
+		};
+		bind_ipv4 = prefix("ipv4", 32);
+		bind_ipv6 = prefix("ipv6", 128);
+	}
+}
+
+static void load_revocations()
+{
+	const auto text = varnish::config_file("revocations");
+	if (!text)
+		return;
+	std::string_view rest = *text;
+	while (!rest.empty()) {
+		const size_t nl = rest.find('\n');
+		std::string_view line = rest.substr(0, nl);
+		rest.remove_prefix(nl == rest.npos ? rest.size() : nl + 1);
+		while (!line.empty() && (is_space(line.front())))
+			line.remove_prefix(1);
+		while (!line.empty() && (is_space(line.back())))
+			line.remove_suffix(1);
+		if (line.empty() || line[0] == '#')
+			continue;
+		revoked.emplace_back(line);
+		revoked.push_back(pseudonym(line));
+	}
+	std::sort(revoked.begin(), revoked.end());
+	revoked.erase(std::unique(revoked.begin(), revoked.end()), revoked.end());
+}
+
 static void on_recv(varnish::Request)
 {
 }
 
-int main(int argc, char** argv)
+int main()
 {
-	if (argc > 1 && argv[1][0] != '\0')
-		hmac = varnish::HmacSha256(argv[1]);
-	if (argc > 2) {
-		const long secs = std::strtol(argv[2], nullptr, 10);
-		if (secs > 0)
-			lifetime = std::min(secs, MAX_LIFETIME);
-	}
+	load_settings();
+	load_revocations();
 	varnish::register_function("authorize", authorize);
+	varnish::register_function("watermark", watermark);
 	varnish::register_transform("personalize", personalize);
 	varnish::wait_for_requests(on_recv);
 }

@@ -4,6 +4,12 @@ feature cmd "varnishd -V 2>&1 | grep -q varnish-plus"
 feature cmd "ls /usr/bin/riscv64-linux-gnu-g++* >/dev/null 2>&1"
 feature cmd "command -v curl >/dev/null && command -v openssl >/dev/null"
 
+shell {
+	mkdir -p ${tmpdir}/conf
+	printf '{"keys": {"k1": "test-secret"}, "signing_key": "k1", "entitlement_keys": {"auth": "entitlement-secret"}, "subscriber_key": "subscriber-secret", "watermark_key": "watermark-secret", "session_lifetime": 3600, "segment_lifetime": 60}' > ${tmpdir}/conf/settings.json
+	printf '# Revoked subscribers and sessions\n' > ${tmpdir}/conf/revoked.txt
+}
+
 shell {printf '\357\273\277#EXTM3U\n  \n\t\nseg1.ts \n#EXT-X-SESSION-DATA:DATA-ID="x",X-URI="a.json",VALUE="b,URI=c",URI="data.json"\n#EXT-X-DATERANGE:ID="ad",X-ASSET-URI="ad.m3u8"\n' > ${tmpdir}/bom.m3u8}
 
 server s1 {
@@ -68,9 +74,19 @@ server s1 {
 	txresp -body "segment-100"
 } -start
 
-server s2 -repeat 8 {
+server s2 -repeat 20 {
 	rxreq
 	txresp -body "#EXTM3U\nseg.ts\n"
+} -start
+
+server s3 -repeat 4 {
+	rxreq
+	txresp -body "#EXTM3U\n#EXTINF:6.0,\nseg.ts\n#EXT-X-ENDLIST\n"
+} -start
+
+server s4 -repeat 4 {
+	rxreq
+	txresp -body {<MPD type="dynamic"><Location>live.mpd</Location><Period><AdaptationSet><SegmentTemplate media="$Number$.m4s"/></AdaptationSet></Period></MPD>}
 } -start
 
 varnish v1 -vcl+backend {
@@ -81,37 +97,43 @@ varnish v1 -vcl+backend {
 		riscv.embed_tenants("""{
 			"streaming": {
 				"filename": "${testdir}/../program/cpp/manifest.cpp",
-				"arguments": ["test-secret", "600"],
-				"group": "test"
-			},
-			"long": {
-				"filename": "${testdir}/../program/cpp/manifest.cpp",
-				"arguments": ["test-secret", "10000000000000"],
-				"group": "test"
+				"group": "test",
+				"config_files": {
+					"settings": "${tmpdir}/conf/settings.json",
+					"revocations": "${tmpdir}/conf/revoked.txt"
+				}
 			}
 		}""");
 		riscv.finalize_tenants();
 	}
 
 	sub vcl_recv {
-		if (req.url ~ "^/(long/|live/ch1/high/|vod/shared/|vod/movie/(video|subs)/)") {
+		if (req.url ~ "^/(live/ch1/high/|vod/shared/|vod/movie/(video|subs)/|wm/)") {
 			set req.backend_hint = s2;
+		} else if (req.url ~ "^/ended/") {
+			set req.backend_hint = s3;
+		} else if (req.url ~ "^/dyn/") {
+			set req.backend_hint = s4;
 		}
-		if (req.url ~ "^/long/") {
-			if (!riscv.fork("long")) {
-				return (synth(503));
-			}
-		} else if (!riscv.fork("streaming")) {
+		if (!riscv.fork("streaming")) {
 			return (synth(503));
 		}
 		if (req.http.X-Call) {
 			set req.http.X-Result = riscv.call(req.http.X-Call, req.url);
 		}
+		if (req.http.X-Test-IP) {
+			set req.http.X-Client-IP = req.http.X-Test-IP;
+		} else {
+			set req.http.X-Client-IP = client.ip;
+		}
 		set req.http.X-Token = riscv.call("authorize", req.url);
 		if (req.http.X-Token !~ "^[A-Za-z0-9_.-]+$") {
 			return (synth(403));
 		}
-		set req.url = regsuball(req.url, "(?<=[?&])token=[^&#]*&?", "");
+		if (req.url ~ "^/wm/") {
+			set req.http.X-Variant = riscv.call("watermark", req.http.X-Token);
+		}
+		set req.url = regsuball(req.url, "(?<=[?&])(token|auth)=[^&#]*&?", "");
 		set req.url = regsub(req.url, "[?&]$", "");
 		return (hash);
 	}
@@ -127,6 +149,9 @@ varnish v1 -vcl+backend {
 	}
 
 	sub vcl_deliver {
+		if (req.http.X-Variant) {
+			set resp.http.X-Variant = req.http.X-Variant;
+		}
 		if (req.url ~ "(?i)\.(m3u8|mpd)(\?|$)" && resp.status == 200) {
 			if (!req.http.X-Transform) {
 				set req.http.X-Transform = "personalize";
@@ -138,110 +163,156 @@ varnish v1 -vcl+backend {
 				return (synth(503));
 			}
 			set resp.http.Cache-Control = "private, no-store";
-			set resp.http.X-Viewer-ID = regsub(req.http.X-Token, "\..*$", "");
+			set resp.http.X-Viewer-ID = regsub(req.http.X-Token, "^[^.]*\.[^.]*\.([^.]*)\..*$", "\1");
 		}
 	}
 } -start
 
 client c1 {
-	txreq -url "/live/ch1/master.m3u8" -hdr "Accept-Encoding: gzip"
+	txreq -url "/live/ch1/master.m3u8?auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2aWV3ZXIiLCJleHAiOjQxMDI0NDQ4MDB9.yOeG81C0KlAaRCB06Brg0xcSZRgfUpoTAMYCEgoSTi4" -hdr "Accept-Encoding: gzip"
 	rxresp
 	expect resp.status == 200
 	expect resp.http.Content-Encoding == <undef>
 	expect resp.http.Cache-Control == "private, no-store"
 	expect resp.http.X-Viewer-ID ~ "^[A-Za-z0-9_-]{16}$"
-	expect resp.body ~ "^#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",URI=\"audio/en\\.m3u8\\?token=[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\"\n#EXT-X-SESSION-DATA:DATA-ID=\"com\\.varnish\\.viewer-id\",VALUE=\"[A-Za-z0-9_-]{16}\"\n#EXT-X-STREAM-INF:BANDWIDTH=800000,AUDIO=\"aud\"\nlow/index\\.m3u8\\?token=[^\n]+\n#EXT-X-STREAM-INF:BANDWIDTH=3000000,AUDIO=\"aud\"\r\nhttps://cdn\\.example\\.com/live/ch1/high/index\\.m3u8\\?v=2&token=[^\r]+\r\n$"
+	expect resp.body ~ "^#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"en\",URI=\"audio/en\\.m3u8\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\"\n#EXT-X-SESSION-DATA:DATA-ID=\"com\\.varnish\\.viewer-id\",VALUE=\"[A-Za-z0-9_-]{16}\"\n#EXT-X-STREAM-INF:BANDWIDTH=800000,AUDIO=\"aud\"\nlow/index\\.m3u8\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\n#EXT-X-STREAM-INF:BANDWIDTH=3000000,AUDIO=\"aud\"\r\nhttps://cdn\\.example\\.com/live/ch1/high/index\\.m3u8\\?v=2&token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\r\n$"
 
-	txreq -url "/live/ch1/low/index.m3u8"
+	txreq -url "/live/ch1/low/index.m3u8?auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2aWV3ZXIiLCJleHAiOjQxMDI0NDQ4MDB9.yOeG81C0KlAaRCB06Brg0xcSZRgfUpoTAMYCEgoSTi4"
 	rxresp
 	expect resp.status == 200
 	expect resp.http.Content-Type == "application/vnd.apple.mpegurl"
 	expect resp.body ~ "URI=\"skd://key-42\",KEYFORMAT"
-	expect resp.body ~ "#EXT-X-MAP:URI=\"init\\.mp4\\?token=[^\"]+\"\n"
-	expect resp.body ~ "#EXT-X-RENDITION-REPORT:URI=\"\\.\\./high/index\\.m3u8\\?token=[A-Za-z0-9_.-]+\",LAST-MSN=101\n"
-	expect resp.body ~ "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"\\?_HLS_part=3&token=[A-Za-z0-9_.-]+\"\n"
-	expect resp.body ~ "\nseg100\\.ts\\?token=[A-Za-z0-9_.-]+\n"
-	expect resp.body ~ "\nseg101\\.ts\\?token=[A-Za-z0-9_.-]+#t=1\n$"
+	expect resp.body ~ "#EXT-X-MAP:URI=\"init\\.mp4\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\"\n"
+	expect resp.body ~ "#EXT-X-RENDITION-REPORT:URI=\"\\.\\./high/index\\.m3u8\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\",LAST-MSN=101\n"
+	expect resp.body ~ "#EXT-X-PRELOAD-HINT:TYPE=PART,URI=\"\\?_HLS_part=3&token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\"\n"
+	expect resp.body ~ "\nseg100\\.ts\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\n"
+	expect resp.body ~ "\nseg101\\.ts\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}#t=1\n$"
 	expect resp.body !~ "SESSION-DATA"
 
-	txreq -url "/vod/movie/manifest.mpd"
+	txreq -url "/vod/movie/manifest.mpd?auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2aWV3ZXIiLCJleHAiOjQxMDI0NDQ4MDB9.yOeG81C0KlAaRCB06Brg0xcSZRgfUpoTAMYCEgoSTi4"
 	rxresp
 	expect resp.status == 200
 	expect resp.http.Content-Type == "application/dash+xml"
-	expect resp.body ~ "<Location>https://cdn\\.example\\.com/vod/movie/manifest\\.mpd\\?token=[^<]+</Location>"
+	expect resp.body ~ "<Location>https://cdn\\.example\\.com/vod/movie/manifest\\.mpd\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}</Location>"
 	expect resp.body ~ "<BaseURL>https://cdn\\.example\\.com/vod/movie/</BaseURL>\n  <BaseURL>https://backup\\.example\\.com/vod/movie/</BaseURL>\n  <!-- "
 	expect resp.body !~ "mirror"
 	expect resp.body ~ "<!-- <BaseURL>commented\\.mp4</BaseURL> -->"
-	expect resp.body ~ "media=\"video/seg_\\$Number\\$\\.m4s\\?token=[A-Za-z0-9_-]{16}\\.[0-9]+\\.21\\.4\\.[A-Za-z0-9_-]{22}\" initialization='video/init\\.m4s\\?token=[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}' startNumber=\"1\"/>"
+	expect resp.body ~ "media=\"video/seg_\\$Number\\$\\.m4s\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.21\\.4\\.[A-Za-z0-9_-]{22}\" initialization='video/init\\.m4s\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}' startNumber=\"1\"/>"
 	expect resp.body ~ "<BaseURL>\\.\\./shared/</BaseURL>"
-	expect resp.body ~ "<Initialization sourceURL=\"audio/init\\.mp4\\?token=[^\"]+\"/>"
-	expect resp.body ~ "<SegmentURL media=\"audio/1\\.m4s\\?v=3&amp;token=[^\"]+\"/>"
-	expect resp.body ~ "<BaseURL> subs/en\\.vtt\\?token=[A-Za-z0-9_.-]+ </BaseURL>"
-	expect resp.body ~ "token=[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\"/>"
+	expect resp.body ~ "<Initialization sourceURL=\"audio/init\\.mp4\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\"/>"
+	expect resp.body ~ "<SegmentURL media=\"audio/1\\.m4s\\?v=3&amp;token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\"/>"
+	expect resp.body ~ "<BaseURL> subs/en\\.vtt\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22} </BaseURL>"
 
-	txreq -url "/live/ch1/bom.m3u8"
+	txreq -url "/live/ch1/bom.m3u8?auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2aWV3ZXIiLCJleHAiOjQxMDI0NDQ4MDB9.yOeG81C0KlAaRCB06Brg0xcSZRgfUpoTAMYCEgoSTi4"
 	rxresp
 	expect resp.status == 200
-	expect resp.body ~ "^\\xEF\\xBB\\xBF#EXTM3U\n  \n\\t\nseg1\\.ts\\?token=[A-Za-z0-9_.-]+ \n"
-	expect resp.body ~ "DATA-ID=\"x\",X-URI=\"a\\.json\",VALUE=\"b,URI=c\",URI=\"data\\.json\\?token=[A-Za-z0-9_.-]+\"\n"
+	expect resp.body ~ "^\\xEF\\xBB\\xBF#EXTM3U\n  \n\\t\nseg1\\.ts\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22} \n"
+	expect resp.body ~ "DATA-ID=\"x\",X-URI=\"a\\.json\",VALUE=\"b,URI=c\",URI=\"data\\.json\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\"\n"
 	expect resp.body ~ "X-ASSET-URI=\"ad\\.m3u8\"\n$"
 
-	txreq -url "/vod/live.mpd"
+	txreq -url "/vod/live.mpd?auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2aWV3ZXIiLCJleHAiOjQxMDI0NDQ4MDB9.yOeG81C0KlAaRCB06Brg0xcSZRgfUpoTAMYCEgoSTi4"
 	rxresp
 	expect resp.status == 200
-	expect resp.body ~ "<PatchLocation ttl=\"60\">patch\\.mpp\\?token=[A-Za-z0-9_.-]+</PatchLocation>"
-	expect resp.body ~ "<ContentSteering defaultServiceLocation=\"a\">steering\\.dcsm\\?token=[A-Za-z0-9_.-]+</ContentSteering>"
-	expect resp.body ~ "<Period xlink:href=\"period2\\.xml\\?token=[A-Za-z0-9_.-]+\" xlink:actuate=\"onLoad\"/>"
+	expect resp.body ~ "<PatchLocation ttl=\"60\">patch\\.mpp\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}</PatchLocation>"
+	expect resp.body ~ "<ContentSteering defaultServiceLocation=\"a\">steering\\.dcsm\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}</ContentSteering>"
+	expect resp.body ~ "<Period xlink:href=\"period2\\.xml\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\" xlink:actuate=\"onLoad\"/>"
 	expect resp.body ~ "xlink:href=\"urn:mpeg:dash:resolve-to-zero:2013\"/>"
-	expect resp.body ~ "<AdaptationSet bitstreamSwitching=\"true\"><SegmentList><BitstreamSwitching sourceURL=\"bs\\.mp4\\?token=[A-Za-z0-9_.-]+\"/>"
+	expect resp.body ~ "<AdaptationSet bitstreamSwitching=\"true\"><SegmentList><BitstreamSwitching sourceURL=\"bs\\.mp4\\?token=k1\\.[A-Za-z0-9_-]{16}\\.[A-Za-z0-9_-]{16}\\.[0-9]+\\.[A-Za-z0-9_-]{22}\"/>"
+
+	# Reject a manifest request without an entitlement.
+	txreq -url "/live/ch1/master.m3u8"
+	rxresp
+	expect resp.status == 403
 
 	# Function used as a transform
-	txreq -url "/live/ch1/master.m3u8" -hdr "X-Transform: authorize"
+	txreq -url "/live/ch1/master.m3u8?auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2aWV3ZXIiLCJleHAiOjQxMDI0NDQ4MDB9.yOeG81C0KlAaRCB06Brg0xcSZRgfUpoTAMYCEgoSTi4" -hdr "X-Transform: authorize"
 	rxresp
 	expect resp.status == 503
 
 	# Transform called as a function
-	txreq -url "/live/ch1/master.m3u8" -hdr "X-Call: personalize"
+	txreq -url "/live/ch1/master.m3u8?auth=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2aWV3ZXIiLCJleHAiOjQxMDI0NDQ4MDB9.yOeG81C0KlAaRCB06Brg0xcSZRgfUpoTAMYCEgoSTi4" -hdr "X-Call: personalize"
 	rxresp
 	expect resp.status == 503
 } -run
 
 shell -exit 0 -expect "flow ok" {
-	set -ex
+	set -e
 	base=http://${v1_addr}:${v1_port}
+	conf=${tmpdir}/conf
+	J=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ2aWV3ZXIiLCJleHAiOjQxMDI0NDQ4MDB9.yOeG81C0KlAaRCB06Brg0xcSZRgfUpoTAMYCEgoSTi4
 	get() { curl -s --path-as-is -H "Host: ${localhost}" "$@"; }
 	code() { get -o /dev/null -w '%{http_code}' "$@"; }
 	field() { echo "$1" | cut -d. -f"$2"; }
+	b64u() { base64 -w0 | tr '+/' '-_' | tr -d '='; }
+	hmac() { openssl dgst -sha256 -hmac "$1" -binary; }
 	mac() {
-		printf '%s\n%s' "$1" "$2" | openssl dgst -sha256 -hmac test-secret -binary \
-			| head -c 16 | base64 | tr '+/' '-_' | tr -d '='
+		n=$(printf '%s\n%s\n' "$2" "$3" | wc -c)
+		{
+			printf '%s\n%s\n' "$2" "$3"
+			head -c $(( (64 - n % 64) % 64 )) /dev/zero | tr '\0' '\n'
+			printf '%s' "$4"
+		} | hmac "$1" | head -c 16 | b64u
 	}
+	jwt() {
+		h=$(printf '%s' "$2" | b64u)
+		p=$(printf '%s' "$3" | b64u)
+		echo "$h.$p.$(printf '%s.%s' "$h" "$p" | hmac "$1" | b64u)"
+	}
+	HS='{"alg":"HS256","typ":"JWT"}'
+	entitle() { jwt entitlement-secret "$HS" "{\"sub\":\"$1\",\"exp\":$(( $(date +%s) + 60 ))$2}"; }
+	retry() {
+		n=0
+		until "$@"; do
+			n=$((n + 1))
+			[ $n -lt 100 ] || return 1
+			sleep 0.1
+		done
+	}
+	is_code() { want=$1; shift; [ "$(code "$@")" = "$want" ]; }
+	settings() {
+		life=$3
+		[ -n "$life" ] || life=3600
+		printf '{"keys": {%s}, "signing_key": "%s", "entitlement_keys": {"auth": "entitlement-secret"}, "subscriber_key": "subscriber-secret", "watermark_key": "watermark-secret", "segment_lifetime": 60, "session_lifetime": %s%s}' "$1" "$2" "$life" "$4" > $conf/.settings
+		mv $conf/.settings $conf/settings.json
+	}
+	variant_token() { sed -n 's/^low\/index\.m3u8?token=//p' "$1"; }
 
-	get -f -D ${tmpdir}/h1 -o ${tmpdir}/master1 "$base/live/ch1/master.m3u8"
-	token=$(sed -n 's/^low\/index\.m3u8?token=//p' ${tmpdir}/master1)
-	viewer=$(field "$token" 1)
-	grep -qi "^X-Viewer-ID: $viewer" ${tmpdir}/h1
-	grep -q "VALUE=\"$viewer\"" ${tmpdir}/master1
+	get -f -D ${tmpdir}/h1 -o ${tmpdir}/master1 "$base/live/ch1/master.m3u8?auth=$J"
+	token=$(variant_token ${tmpdir}/master1)
+	sub=$(field "$token" 2)
+	sid=$(field "$token" 3)
+	sexp=$(field "$token" 4)
+	now=$(date +%s)
+	test $((sexp - now)) -ge 3590 -a $((sexp - now)) -le 3600
+	grep -qi "^X-Viewer-ID: $sid" ${tmpdir}/h1
+	grep -q "VALUE=\"$sid\"" ${tmpdir}/master1
 
-	get -f -o ${tmpdir}/master2 "$base/live/ch1/master.m3u8"
-	token2=$(sed -n 's/^low\/index\.m3u8?token=//p' ${tmpdir}/master2)
-	test "$(field "$token2" 1)" != "$viewer"
+	get -f -o ${tmpdir}/master2 "$base/live/ch1/master.m3u8?auth=$J"
+	token2=$(variant_token ${tmpdir}/master2)
+	test "$(field "$token2" 2)" = "$sub"
+	test "$(field "$token2" 3)" != "$sid"
 
 	get -f -o ${tmpdir}/variant "$base/live/ch1/low/index.m3u8?token=$token"
 	seg=$(sed -n 's/^seg100\.ts?token=//p' ${tmpdir}/variant)
-	test "$(field "$seg" 1)" = "$viewer"
+	test "$(field "$seg" 2)" = "$sub"
+	test "$(field "$seg" 3)" = "$sid"
+	exp=$(field "$seg" 4)
+	sig=$(field "$seg" 5)
+	test $((exp - now)) -ge 55 -a $((exp - now)) -le 60
 	test "$(get -f "$base/live/ch1/low/seg100.ts?token=$seg")" = "segment-100"
 
-	exp=$(field "$seg" 2)
-	sig=$(field "$seg" 3)
 	test $(code "$base/live/ch1/low/seg100.ts") = 403
 	test $(code "$base/live/ch1/low/seg100.ts?token=x$seg") = 403
 	# Extended expiry
-	test $(code "$base/live/ch1/low/seg100.ts?token=$viewer.$((exp + 1)).$sig") = 403
+	test $(code "$base/live/ch1/low/seg100.ts?token=k1.$sub.$sid.$((exp + 1)).$sig") = 403
 	# Session without a signature
-	test $(code "$base/live/ch1/low/seg100.ts?token=$viewer.$exp") = 403
+	test $(code "$base/live/ch1/low/seg100.ts?token=k1.$sub.$sid.$exp") = 403
 	# Exact signature as a template token
-	test $(code "$base/live/ch1/low/seg100.ts?token=$viewer.$exp.0.0.$sig") = 403
+	test $(code "$base/live/ch1/low/seg100.ts?token=k1.$sub.$sid.$exp.0.0.$sig") = 403
+	# Reject tokens with an unknown key, a different session, or a different subscriber.
+	test $(code "$base/live/ch1/low/seg100.ts?token=k2.$sub.$sid.$exp.$sig") = 403
+	test $(code "$base/live/ch1/low/seg100.ts?token=k1.$sub.$(field "$token2" 3).$exp.$sig") = 403
+	test $(code "$base/live/ch1/low/seg100.ts?token=k1.$(field "$token2" 3).$sid.$exp.$sig") = 403
 	# Other segment, rendition, channel, and manifest
 	test $(code "$base/live/ch1/low/seg101.ts?token=$seg") = 403
 	test $(code "$base/live/ch1/high/seg100.ts?token=$seg") = 403
@@ -251,15 +322,17 @@ shell -exit 0 -expect "flow ok" {
 	test $(code "$base/live/ch1/low/../low/seg100.ts?token=$seg") = 403
 	test $(code "$base/live/ch1/low/%73eg100.ts?token=$seg") = 403
 
-	now=$(date +%s)
-	past="$viewer.$((now - 1))"
-	test $(code "$base/live/ch1/low/seg100.ts?token=$past.$(mac "$past" /live/ch1/low/seg100.ts)") = 403
-	good="$viewer.$((now + 60))"
-	test $(code "$base/live/ch1/low/seg100.ts?token=$good.$(mac "$good" /live/ch1/low/seg100.ts)") = 200
+	past="k1.$sub.$sid.$((now - 1))"
+	test $(code "$base/live/ch1/low/seg100.ts?token=$past.$(mac test-secret "$past" "" /live/ch1/low/seg100.ts)") = 403
+	good="k1.$sub.$sid.$((now + 60))"
+	test $(code "$base/live/ch1/low/seg100.ts?token=$good.$(mac test-secret "$good" "" /live/ch1/low/seg100.ts)") = 200
+	test $(code "$base/live/ch1/low/seg100.ts?token=$good.$(mac test-secret "$good" "4/24/7f0000" /live/ch1/low/seg100.ts)") = 403
 
 	high=$(sed -n 's/^https:\/\/cdn\.example\.com\/live\/ch1\/high\/index\.m3u8?v=2&token=//p' ${tmpdir}/master1 | tr -d '\r')
+	test "$(field "$high" 4)" = "$sexp"
 	test $(code "$base/live/ch1/high/index.m3u8?v=2&token=$high") = 200
 	report=$(sed -n 's/.*URI="\.\.\/high\/index\.m3u8?token=\([^"]*\)".*/\1/p' ${tmpdir}/variant)
+	test "$(field "$report" 4)" = "$sexp"
 	test $(code "$base/live/ch1/high/index.m3u8?token=$report") = 200
 	hint=$(sed -n 's/.*URI="?_HLS_part=3&token=\([^"]*\)".*/\1/p' ${tmpdir}/variant)
 	test $(code "$base/live/ch1/low/index.m3u8?token=$hint") = 200
@@ -267,14 +340,17 @@ shell -exit 0 -expect "flow ok" {
 	# Transform argument that is not a token for the manifest
 	test $(code -H "X-Arg: $seg" "$base/live/ch1/low/index.m3u8?token=$token") = 403
 	test $(code -H "X-Arg: $high" "$base/live/ch1/low/index.m3u8?token=$token") = 403
-	test $(code -H "X-Arg: $viewer.$((now + 60))" "$base/live/ch1/low/index.m3u8?token=$token") = 403
+	test $(code -H "X-Arg: $good" "$base/live/ch1/low/index.m3u8?token=$token") = 403
 	test $(code -H "X-Arg: $token" "$base/live/ch1/low/index.m3u8?token=$token") = 200
 
-	get -f -o ${tmpdir}/mpd "$base/vod/movie/manifest.mpd"
+	get -f -o ${tmpdir}/mpd "$base/vod/movie/manifest.mpd?auth=$J"
 	media=$(grep -o 'seg_[$]Number[$][.]m4s?token=[^"]*' ${tmpdir}/mpd | cut -d= -f2)
-	viewer=$(field "$media" 1)
-	exp=$(field "$media" 2)
-	sig=$(field "$media" 5)
+	msub=$(field "$media" 2)
+	msid=$(field "$media" 3)
+	mexp=$(field "$media" 4)
+	sig=$(field "$media" 7)
+	location=$(grep -o 'manifest[.]mpd?token=[^<]*' ${tmpdir}/mpd | cut -d= -f2)
+	test "$(field "$location" 4)" = "$mexp"
 	test $(code "$base/vod/movie/video/seg_7.m4s?token=$media") = 200
 	test $(code "$base/vod/movie/video/seg_12.m4s?token=$media") = 200
 	# Outside the template prefix or suffix
@@ -282,16 +358,16 @@ shell -exit 0 -expect "flow ok" {
 	test $(code "$base/vod/movie/video/seg_7.mp4?token=$media") = 403
 	test $(code "$base/vod/other/video/seg_7.m4s?token=$media") = 403
 	# Widened template prefix
-	test $(code "$base/vod/movie/video/seg_7.m4s?token=$viewer.$exp.17.4.$sig") = 403
-	test $(code "$base/vod/movie/video/seg_7.m4s?token=$viewer.$exp.$sig") = 403
-	tmpl="$viewer.$((now + 60)).21.4"
-	test $(code "$base/vod/movie/video/seg_7.m4s?token=$tmpl.$(mac "$tmpl" /vod/movie/video/seg_.m4s)") = 200
-	tmpl="$viewer.$((now + 60)).11.0"
-	test $(code "$base/vod/movie/video/seg_7.m4s?token=$tmpl.$(mac "$tmpl" /vod/movie//)") = 200
+	test $(code "$base/vod/movie/video/seg_7.m4s?token=k1.$msub.$msid.$mexp.17.4.$sig") = 403
+	test $(code "$base/vod/movie/video/seg_7.m4s?token=k1.$msub.$msid.$mexp.$sig") = 403
+	tmpl="k1.$msub.$msid.$((now + 60)).21.4"
+	test $(code "$base/vod/movie/video/seg_7.m4s?token=$tmpl.$(mac test-secret "$tmpl" "" /vod/movie/video/seg_.m4s)") = 200
+	tmpl="k1.$msub.$msid.$((now + 60)).11.0"
+	test $(code "$base/vod/movie/video/seg_7.m4s?token=$tmpl.$(mac test-secret "$tmpl" "" /vod/movie//)") = 200
 	# Template token on a manifest, deeper path
-	test $(code "$base/vod/movie/manifest.mpd?token=$tmpl.$(mac "$tmpl" /vod/movie/)") = 403
-	test $(code "$base/vod/movie/video/seg_7.m4s?token=$tmpl.$(mac "$tmpl" /vod/movie/)") = 403
-	test $(code "$base/vod/movie/video/a/seg_7.m4s?token=$tmpl.$(mac "$tmpl" /vod/movie//)") = 403
+	test $(code "$base/vod/movie/manifest.mpd?token=$tmpl.$(mac test-secret "$tmpl" "" /vod/movie/)") = 403
+	test $(code "$base/vod/movie/video/seg_7.m4s?token=$tmpl.$(mac test-secret "$tmpl" "" /vod/movie/)") = 403
+	test $(code "$base/vod/movie/video/a/seg_7.m4s?token=$tmpl.$(mac test-secret "$tmpl" "" /vod/movie//)") = 403
 
 	init=$(grep -o 'audio/init[.]mp4?token=[^"]*' ${tmpdir}/mpd | cut -d= -f2)
 	test $(code "$base/vod/shared/audio/init.mp4?token=$init") = 200
@@ -299,16 +375,111 @@ shell -exit 0 -expect "flow ok" {
 	subs=$(grep -o 'subs/en[.]vtt?token=[^ ]*' ${tmpdir}/mpd | cut -d= -f2)
 	test $(code "$base/vod/movie/subs/en.vtt?token=$subs") = 200
 
-	token=$(get -f "$base/long/a/index.m3u8" | sed -n 's/^seg\.ts?token=//p')
-	test $(( $(field "$token" 2) - $(date +%s) <= 10 * 365 * 24 * 3600 ))  = 1
-	test $(code "$base/long/a/seg.ts?token=$token") = 200
+	# Segment URLs in VOD playlists and static MPDs expire with the session.
+	ended=$(get -f "$base/ended/a/index.m3u8?auth=$J" | sed -n 's/^seg\.ts?token=//p')
+	test $(( $(field "$ended" 4) - now )) -ge 3590
+	test $(code "$base/ended/a/seg.ts?token=$ended") = 200
+	get -f -o ${tmpdir}/dyn "$base/dyn/live.mpd?auth=$J"
+	dynseg=$(grep -o '[$]Number[$][.]m4s?token=[^"]*' ${tmpdir}/dyn | cut -d= -f2)
+	dynloc=$(grep -o 'live[.]mpd?token=[^<]*' ${tmpdir}/dyn | cut -d= -f2)
+	test $(( $(field "$dynseg" 4) - now )) -le 60
+	test $(( $(field "$dynloc" 4) - now )) -ge 3590
+	test $(code "$base/dyn/7.m4s?token=$dynseg") = 200
+
+	# Reject an entitlement signed with the wrong secret.
+	test $(code "$base/live/ch1/master.m3u8?auth=$(jwt other-secret "$HS" '{"sub":"viewer","exp":4102444800}')") = 403
+	# Reject an expired entitlement.
+	test $(code "$base/live/ch1/master.m3u8?auth=$(jwt entitlement-secret "$HS" "{\"sub\":\"viewer\",\"exp\":$((now - 1))}")") = 403
+	# Reject an entitlement that is not yet valid.
+	test $(code "$base/live/ch1/master.m3u8?auth=$(entitle viewer ",\"nbf\":$((now + 600))")") = 403
+	# Reject the "none" algorithm.
+	test $(code "$base/live/ch1/master.m3u8?auth=$(jwt entitlement-secret '{"alg":"none"}' '{"sub":"viewer","exp":4102444800}')") = 403
+	# Reject an unknown key ID and accept the configured key ID.
+	test $(code "$base/live/ch1/master.m3u8?auth=$(jwt entitlement-secret '{"alg":"HS256","kid":"other"}' '{"sub":"viewer","exp":4102444800}')") = 403
+	test $(code "$base/live/ch1/master.m3u8?auth=$(jwt entitlement-secret '{"alg":"HS256","kid":"auth"}' '{"sub":"viewer","exp":4102444800}')") = 200
+	# Reject an entitlement without a subject.
+	test $(code "$base/live/ch1/master.m3u8?auth=$(jwt entitlement-secret "$HS" '{"exp":4102444800}')") = 403
+	# Enforce the entitlement's path prefix.
+	test $(code "$base/live/ch1/master.m3u8?auth=$(entitle viewer ',"path":"/live/ch2/"')") = 403
+	test $(code "$base/live/ch1/master.m3u8?auth=$(entitle viewer ',"path":"/live/ch1/"')") = 200
+	# Reject a segment request that supplies an entitlement instead of a token.
+	test $(code "$base/live/ch1/low/seg100.ts?auth=$J") = 403
+
+	# Verify the watermark variant for this path and session.
+	wtok=$(get -f "$base/wm/index.m3u8?auth=$J" | sed -n 's/^seg\.ts?token=//p')
+	wsid=$(field "$wtok" 3)
+	variant=$(get -f -D - -o /dev/null "$base/wm/seg.ts?token=$wtok" | tr -d '\r' | sed -n 's/^X-Variant: //ip')
+	set -- $(printf '%s' /wm/seg.ts | hmac watermark-secret | od -An -tu1 -N5)
+	i=$(( (($1 << 24) | ($2 << 16) | ($3 << 8) | $4) % 96 ))
+	c=$(printf '%s' "$wsid" | cut -c $((i / 6 + 1)))
+	alpha=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_
+	v=$(awk -v a="$alpha" -v c="$c" 'BEGIN { print index(a, c) - 1 }')
+	if [ $(( ((v >> (i % 6)) ^ $5) & 1 )) = 1 ]; then want=B; else want=A; fi
+	test "$variant" = "$want"
+
+	# Revoke one session while allowing another session to continue.
+	printf '%s\n' "$sid" >> $conf/revoked.txt
+	retry is_code 403 "$base/live/ch1/low/seg100.ts?token=$seg"
+	test $(code "$base/live/ch1/low/index.m3u8?token=$token") = 403
+	test $(code "$base/live/ch1/low/index.m3u8?token=$token2") = 200
+	# Revoke all sessions for a subscriber and prevent new sessions.
+	printf '  viewer \n' >> $conf/revoked.txt
+	retry is_code 403 "$base/live/ch1/low/index.m3u8?token=$token2"
+	test $(code "$base/live/ch1/master.m3u8?auth=$J") = 403
+	test $(code "$base/live/ch1/master.m3u8?auth=$(entitle bob)") = 200
+	printf '# No revocations\n' > $conf/revoked.txt
+	retry is_code 200 "$base/live/ch1/low/index.m3u8?token=$token2"
+
+	# Key rotation
+	settings '"k1": "test-secret", "k2": "next-secret"' k2
+	signed_by() { get -f "$base/live/ch1/master.m3u8?auth=$J" | grep -q "^low/index\.m3u8?token=$1\."; }
+	retry signed_by k2
+	test $(code "$base/live/ch1/low/index.m3u8?token=$token2") = 200
+	token3=$(get -f "$base/live/ch1/master.m3u8?auth=$J" | sed -n 's/^low\/index\.m3u8?token=//p')
+	test $(code "$base/live/ch1/low/index.m3u8?token=$token3") = 200
+	get -f "$base/live/ch1/low/index.m3u8?token=$token3" | grep -q '^seg100\.ts?token=k2\.'
+	settings '"k2": "next-secret"' k2
+	retry is_code 403 "$base/live/ch1/low/index.m3u8?token=$token2"
+	test $(code "$base/live/ch1/low/index.m3u8?token=$token3") = 200
+
+	# Network binding
+	settings '"k2": "next-secret"' k2 3600 ', "bind_network": {"ipv4": 24, "ipv6": 48}'
+	retry is_code 403 "$base/live/ch1/low/index.m3u8?token=$token3"
+	v4=$(get -f -H "X-Test-IP: 192.0.2.10" "$base/live/ch1/master.m3u8?auth=$J" | sed -n 's/^low\/index\.m3u8?token=//p')
+	test $(code -H "X-Test-IP: 192.0.2.99" "$base/live/ch1/low/index.m3u8?token=$v4") = 200
+	test $(code -H "X-Test-IP: 192.0.3.10" "$base/live/ch1/low/index.m3u8?token=$v4") = 403
+	test $(code "$base/live/ch1/low/index.m3u8?token=$v4") = 403
+	test $(code -H "X-Test-IP: garbage" "$base/live/ch1/low/index.m3u8?token=$v4") = 403
+	bound="k2.$(field "$v4" 2).$(field "$v4" 3).$((now + 60))"
+	test $(code -H "X-Test-IP: 192.0.2.1" "$base/live/ch1/low/seg100.ts?token=$bound.$(mac next-secret "$bound" 4/24/c00002 /live/ch1/low/seg100.ts)") = 200
+	v6=$(get -f -H "X-Test-IP: 2001:db8:1:2::1" "$base/live/ch1/master.m3u8?auth=$J" | sed -n 's/^low\/index\.m3u8?token=//p')
+	test $(code -H "X-Test-IP: 2001:db8:1:ffff::5" "$base/live/ch1/low/index.m3u8?token=$v6") = 200
+	test $(code -H "X-Test-IP: 2001:0db8:0001::" "$base/live/ch1/low/index.m3u8?token=$v6") = 200
+	test $(code -H "X-Test-IP: 2001:db8:2::1" "$base/live/ch1/low/index.m3u8?token=$v6") = 403
+	test $(code -H "X-Test-IP: 192.0.2.10" "$base/live/ch1/low/index.m3u8?token=$v6") = 403
+	test $(code -H "X-Test-IP: 2001:db8:1:2::1" "$base/live/ch1/low/seg100.ts?token=$bound.$(mac next-secret "$bound" 6/48/20010db80001 /live/ch1/low/seg100.ts)") = 200
+
+	# Keep the current program if the updated settings are invalid.
+	printf 'nope' > $conf/settings.json
+	sleep 1
+	test $(code -H "X-Test-IP: 192.0.2.99" "$base/live/ch1/low/index.m3u8?token=$v4") = 200
+
+	# Cap the session lifetime at 10 years.
+	settings '"k2": "next-secret"' k2 10000000000000
+	long_session() { [ $(( $(field "$(get -f "$base/live/ch1/master.m3u8?auth=$J" | sed -n 's/^low\/index\.m3u8?token=//p')" 4) - $(date +%s) )) -gt 3600 ]; }
+	retry long_session
+	long=$(get -f "$base/live/ch1/master.m3u8?auth=$J" | sed -n 's/^low\/index\.m3u8?token=//p')
+	test $(( $(field "$long" 4) - $(date +%s) <= 10 * 365 * 24 * 3600 )) = 1
+	test $(code "$base/live/ch1/low/index.m3u8?token=$long") = 200
 
 	echo "flow ok"
 }
 
 logexpect l1 -v v1 -d 1 -g raw {
+	expect * * VCL_Log "Session [A-Za-z0-9_-]{16} for subscriber viewer"
 	expect * * Error "function 'authorize' is registered for riscv.call.., not as a transform"
 	expect * * VCL_Error "'personalize' is a transform, use riscv.deliver_transform"
+	expect * * VCL_Log "riscv: tenant 'streaming' reloaded after a config file changed"
+	expect * * VCL_Log "Invalid manifest settings: settings must be a JSON object"
+	expect * * Error "riscv: tenant 'streaming' reload failed; keeping the current program"
 } -run
-
-varnish v1 -expect backend_req == 14

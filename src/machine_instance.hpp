@@ -1,5 +1,6 @@
 #pragma once
 #include "script.hpp"
+#include "tenant.hpp"
 #include "vcl/vcl_program.hpp"
 #include <atomic>
 #include <mutex>
@@ -36,6 +37,7 @@ struct MachineInstance
 	/* A program compiled from VCL (vcl/compiler.hpp) rather than a tenant
 	   program that registers its own callbacks. */
 	const bool is_vcl;
+	const std::map<std::string, ConfigFile> config_files;
 	Script   script;
 	std::array<Script::gaddr_t, 13> callback_entries;
 	std::unordered_map<std::string, Script::gaddr_t> function_map;
@@ -59,5 +61,8 @@ struct MachineInstance
 		if (inst != nullptr) inst->retired.store(true, std::memory_order_relaxed);
 	}
 };
+
+enum class StateTransfer { Done, NoSerializer, NoResume };
+StateTransfer transfer_state(MachineInstance& old, MachineInstance& inst, const vrt_ctx*);
 
 } // rvs

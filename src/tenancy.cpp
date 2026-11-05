@@ -137,9 +137,10 @@ find_reusable(const SandboxTenant& fresh, const FileStamp& stamp)
 			continue;
 		/* A live update may be swapping its program, argv and stamp */
 		std::scoped_lock ulock(candidate->update_mtx);
+		const auto program = rvs::atomic_load(&candidate->program);
 		if (candidate->file_stamp == stamp
 			&& candidate->config.same_as(fresh.config)
-			&& rvs::atomic_load(&candidate->program) != nullptr)
+			&& program != nullptr && config_files_current(*program))
 			found = std::move(candidate);
 	}
 	return found;
@@ -297,6 +298,10 @@ static void configure_tenant(TenantGroup& group, const T& obj)
 	if (obj.contains("arguments")) {
 		group.argv = std::make_shared<std::vector<std::string>>(
 			obj["arguments"].template get<std::vector<std::string>>());
+	}
+	if (obj.contains("config_files")) {
+		group.config_files =
+			obj["config_files"].template get<std::map<std::string, std::string>>();
 	}
 }
 
@@ -462,12 +467,14 @@ void finalize_tenants_impl(VRT_CTX, struct vmod_priv* priv)
 				VSL(SLT_Debug, RISCV_NO_VXID, "Tenant '%s' is unchanged, keeping its program",
 					tenant->config.name.c_str());
 				tenant = std::move(shared);
+				watch_config_files(tenant);
 				continue;
 			}
 			/* Not yet published, so nothing else can see it */
 			tenant->file_stamp = stamp;
 			tenant->load(ctx);
 			publish(tenant);
+			watch_config_files(tenant);
 		}
 	} catch (const std::exception& e) {
 		VRT_fail(ctx, "finalize_tenants: %s", e.what());

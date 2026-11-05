@@ -98,10 +98,20 @@ struct HmacSha256 {
 	explicit HmacSha256(std::string_view key);
 	std::array<uint8_t, 32> operator()(std::initializer_list<std::string_view> parts) const;
 	std::array<uint8_t, 32> operator()(std::string_view msg) const { return (*this)({msg}); }
+	/* Return an HMAC instance with the prefix already hashed. Subsequent
+	   calls hash only the message suffix. The prefix length must be a
+	   multiple of 64 bytes. */
+	HmacSha256 with_prefix(std::string_view prefix) const;
 private:
 	std::array<uint32_t, 16> state;
+	uint32_t blocks = 1;
 };
 bool equal_constant_time(std::string_view a, std::string_view b);
+
+/* Return the contents of a file named in the tenant's "config_files",
+   or std::nullopt if no file is configured under that name. Available
+   only during initialization. A file change triggers reinitialization. */
+std::optional<std::string> config_file(std::string_view name);
 
 /* Regular expressions */
 struct Regex {

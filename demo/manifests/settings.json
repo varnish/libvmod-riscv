@@ -1,0 +1,9 @@
+{
+	"keys": {"2026-11": "change-me-varnish-manifest-secret"},
+	"signing_key": "2026-11",
+	"entitlement_keys": {"auth": "change-me-entitlement-secret"},
+	"subscriber_key": "change-me-subscriber-secret",
+	"watermark_key": "change-me-watermark-secret",
+	"session_lifetime": 21600,
+	"segment_lifetime": 120
+}

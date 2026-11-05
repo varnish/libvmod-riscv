@@ -1,4 +1,5 @@
 #include "machine_instance.hpp"
+#include "sandbox_tenant.hpp"
 #include <libriscv/rsp_server.hpp>
 
 namespace rvs {
@@ -9,6 +10,7 @@ MachineInstance::MachineInstance(
 	bool debug, bool vcl)
 	: binary{std::move(elf)},
 	  is_vcl{vcl},
+	  config_files{read_config_files(*ten)},
 	  script{binary, ctx, ten, *this, false, debug},
 	  storage{binary, ctx, ten, *this, true, debug},
 	  rspclient{nullptr},

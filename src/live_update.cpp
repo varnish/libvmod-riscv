@@ -19,6 +19,35 @@ dynamic_result(const char* text, unsigned status) {
 		[] (update_result* res) { free((void*) res->output); }, status };
 }
 
+StateTransfer transfer_state(MachineInstance& old, MachineInstance& inst, const vrt_ctx* ctx)
+{
+	const auto luaddr = old.callback_entries.at(10); // on_live_update
+	if (luaddr == 0x0)
+		return StateTransfer::NoSerializer;
+	const auto resaddr = inst.callback_entries.at(11); // on_resume_update
+	if (resaddr == 0x0)
+		return StateTransfer::NoResume;
+	/* Lock both machines' storage during state transfer because requests
+	   using either program may access that storage concurrently. */
+	std::scoped_lock lock(old.storage_mtx, inst.storage_mtx);
+	auto& old_machine = old.storage;
+	StorageCtx old_lease(old_machine, ctx);
+	StorageCtx new_lease(inst.storage, ctx);
+	old_machine.call(luaddr);
+	/* Get serialized data */
+	auto [data_addr, data_len] =
+		old_machine.machine().sysargs<Script::gaddr_t, unsigned> ();
+	/* Allocate space for the serialized data in the new machine */
+	auto& new_machine = inst.storage;
+	auto dst_data = new_machine.guest_alloc(data_len);
+	new_machine.machine().memory.memcpy(
+		dst_data,
+		old_machine.machine(), data_addr, data_len);
+	/* Deserialize data in the new machine */
+	new_machine.call(resaddr, dst_data, data_len);
+	return StateTransfer::Done;
+}
+
 static bool file_writer(const std::string& filename, const std::vector<uint8_t>& binary)
 {
     FILE* f = fopen(filename.c_str(), "wb");
@@ -70,40 +99,20 @@ riscv_update(VRT_CTX, rvs::SandboxTenant* vrm, struct update_params *params)
 		}
 		MachineInstance::retire(old);
 
-		if (old != nullptr) { // 10 == on_live_update
-			const auto luaddr = old->callback_entries.at(10);
-			if (luaddr != 0x0) { // 11 == on_resume_update
-				const auto resaddr = inst->callback_entries.at(11);
-				if (resaddr != 0x0)
-				{
-				/* Serialize data in the old machine. Requests holding
-				   either program may be calling into its storage, so
-				   the handover is serialized with them. */
-				std::scoped_lock lock(old->storage_mtx, inst->storage_mtx);
-				auto& old_machine = old->storage;
-				StorageCtx old_lease(old_machine, ctx);
-				StorageCtx new_lease(inst->storage, ctx);
-				old_machine.call(luaddr);
-				/* Get serialized data */
-				auto [data_addr, data_len] =
-					old_machine.machine().sysargs<Script::gaddr_t, unsigned> ();
-				/* Allocate room for serialized data in new machine */
-				auto& new_machine = inst->storage;
-				auto dst_data = new_machine.guest_alloc(data_len);
-				new_machine.machine().memory.memcpy(
-					dst_data,
-					old_machine.machine(), data_addr, data_len);
-				/* Deserialize data in the new machine */
-				new_machine.call(resaddr, dst_data, data_len);
-				} else {
-					VSLb(ctx->vsl, SLT_Debug,
-						"Live-update deserialization skipped (new binary lacks resume)");
-				}
-			} else {
+		if (old != nullptr) {
+			switch (transfer_state(*old, *inst, ctx)) {
+			case StateTransfer::NoResume:
+				VSLb(ctx->vsl, SLT_Debug,
+					"Live-update deserialization skipped (new binary lacks resume)");
+				break;
+			case StateTransfer::NoSerializer:
 				VSLb(ctx->vsl, SLT_Debug,
 					"Live-update skipped (old binary lacks serializer)");
+				break;
+			case StateTransfer::Done:
+				break;
 			}
-		} // old != null
+		}
 
 	#ifdef ENABLE_TIMING
 		TIMING_LOCATION(t1);
@@ -192,31 +201,18 @@ int riscv_update_file(VRT_CTX, rvs::SandboxTenant* vrm,
 		MachineInstance::retire(old);
 
 		/* Transfer serialized state if both machines support it */
-		if (old != nullptr) { // 10 == on_live_update
-			const auto luaddr = old->callback_entries.at(10);
-			if (luaddr != 0x0) { // 11 == on_resume_update
-				const auto resaddr = inst->callback_entries.at(11);
-				if (resaddr != 0x0)
-				{
-				std::scoped_lock lock(old->storage_mtx, inst->storage_mtx);
-				auto& old_machine = old->storage;
-				StorageCtx old_lease(old_machine, ctx);
-				StorageCtx new_lease(inst->storage, ctx);
-				old_machine.call(luaddr);
-				auto [data_addr, data_len] =
-					old_machine.machine().sysargs<Script::gaddr_t, unsigned>();
-				auto& new_machine = inst->storage;
-				auto dst_data = new_machine.guest_alloc(data_len);
-				new_machine.machine().memory.memcpy(
-					dst_data, old_machine.machine(), data_addr, data_len);
-				new_machine.call(resaddr, dst_data, data_len);
-				} else {
-					VSLb(ctx->vsl, SLT_Debug,
-						"live_update_file: deserialization skipped (new binary lacks resume)");
-				}
-			} else {
+		if (old != nullptr) {
+			switch (transfer_state(*old, *inst, ctx)) {
+			case StateTransfer::NoResume:
+				VSLb(ctx->vsl, SLT_Debug,
+					"live_update_file: deserialization skipped (new binary lacks resume)");
+				break;
+			case StateTransfer::NoSerializer:
 				VSLb(ctx->vsl, SLT_Debug,
 					"live_update_file: state transfer skipped (old binary lacks serializer)");
+				break;
+			case StateTransfer::Done:
+				break;
 			}
 		}
 		return 1;

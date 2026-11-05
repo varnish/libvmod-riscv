@@ -69,6 +69,26 @@ Note: If you have a RISC-V compiler installed, you can use source files directly
 
 The same is true for Rust projects. Point `"filename"` to your Rust project and make sure you have a 64-bit RISC-V compiler installed. It will build and load the rust program automatically.
 
+### Config files
+
+A tenant's `config_files` setting maps logical names to files that the program can read during initialization:
+
+```json
+"customer1.com": {
+    "filename": "/path/to/tenant_program",
+    "config_files": {
+        "settings": "/etc/varnish/customer1/settings.json",
+        "denylist": "/etc/varnish/customer1/denylist.txt"
+    }
+}
+```
+
+In `main()`, `api::config_file("settings")` returns the file's contents, or `std::nullopt` if no file is configured under that name. This API is available only during initialization.
+
+The VMOD watches the files' parent directories with inotify. When a file changes, it reloads the tenant as it would for a live update: a new instance runs `main()` with the updated contents, then replaces the running instance. Requests already in progress finish on the old instance. If a file cannot be read or `main()` fails, the tenant keeps its current program and logs the error.
+
+Files can be updated in place or replaced by renaming a new file over the existing one. A VCL reload reuses a tenant if its program and config files are unchanged.
+
 ## Rust example program
 
 Have a look at [the Rust main.rs](/program/rust/src/main.rs). You will need a full Linux-compatible RISC-V cross compiler, which is usually provided by your distro package repositories. For example, on Ubuntu the package is called `gcc-14-riscv64-linux-gnu` and the correct `linker` value for [the Rust cargo config](/program/rust/.cargo/config) is `riscv64-linux-gnu-gcc-14`.
@@ -194,19 +214,26 @@ if (r[0].ok() && r[0].status() == 200)
 The whole response is handed over when a request finishes: the system call allocates its body and headers on the program's native heap, with the exact sizes, and `FetchResponse` frees them. See `ECALL_FETCH` in [syscalls.h](/src/machine/syscalls.h) for the system call itself.
 ## Per-viewer streaming manifests
 
-[manifest.cpp](/program/cpp/manifest.cpp) personalizes HLS and DASH manifests for each viewer while Varnish caches a single copy of each manifest and segment. A manifest request without a token starts a session with a random viewer ID. `riscv.deliver_transform()` signs every supported URI in the manifest for that viewer before delivery, so the only way to fetch a segment is through a URL from that viewer's manifest:
+[manifest.cpp](/program/cpp/manifest.cpp) personalizes HLS and DASH manifests for each viewer while Varnish caches a single copy of each manifest and segment. A session starts with a manifest request that carries an entitlement from the subscriber's authentication service. `riscv.deliver_transform()` signs every supported URI in the manifest for that session before delivery, so the only way to fetch a segment is through a URL from that viewer's manifest:
 
 ```vcl
 sub vcl_recv {
 	if (!riscv.fork("streaming")) {
 		return (synth(503));
 	}
+	set req.http.X-Client-IP = client.ip;
 	set req.http.X-Token = riscv.call("authorize", req.url);
 	if (req.http.X-Token !~ "^[A-Za-z0-9_.-]+$") {
 		return (synth(403));
 	}
-	set req.url = regsuball(req.url, "(?<=[?&])token=[^&#]*&?", "");
+	if (req.url ~ "^/live/[^/]+/(low|high)/seg[0-9]+\.m4s") {
+		set req.http.X-Variant = riscv.call("watermark", req.http.X-Token);
+	}
+	set req.url = regsuball(req.url, "(?<=[?&])(token|auth)=[^&#]*&?", "");
 	set req.url = regsub(req.url, "[?&]$", "");
+	if (req.http.X-Variant ~ "^[AB]$") {
+		set req.url = regsub(req.url, "^(.*/)([^/?]+)", "\1" + req.http.X-Variant + "/\2");
+	}
 }
 sub vcl_backend_fetch {
 	unset bereq.http.X-Token;
@@ -221,14 +248,45 @@ sub vcl_deliver {
 }
 ```
 
-- Tokens use the format `<viewer id>.<expires>.<HMAC>`, where the HMAC covers `<viewer id>.<expires>\n<path>`. Each URI is resolved against the manifest URL (and DASH `BaseURL` elements) and signed for that exact path, so a token works for one segment, rendition, and channel only. Absolute URLs are signed for their path. `vcl_recv` verifies tokens, rejecting invalid signatures, expired tokens, and other paths. Paths with dot segments, empty segments, percent escapes, or backslashes are rejected because origin normalization could map them to a different file. Each authorized manifest request renews the session, preserving the viewer ID during continued playback. For manifests, `authorize` returns a token for the manifest path, and `personalize` verifies it against `req.url` before signing with it.
-- DASH `SegmentTemplate` URIs are expanded by the player, so they cannot be signed per URL. They use `<viewer id>.<expires>.<P>.<S>.<HMAC>`, which signs the `P` bytes before the first `$`, the `S` bytes after the last `$`, and the number of `/` between them in the resolved path. For `video/$RepresentationID$/seg_$Number$.m4s` the token is valid for `/vod/movie/video/` + one directory + anything + `.m4s`. Template tokens are never valid for manifests.
-- HLS: A token is added to URI lines and `URI="..."` attributes (not `X-ASSET-URI` and other attributes ending in `URI`) in tags such as `EXT-X-MAP`, `EXT-X-MEDIA`, `EXT-X-KEY`, and `EXT-X-PART`. `skd:` and `data:` URIs remain unchanged. Master playlists include the viewer ID in a `#EXT-X-SESSION-DATA` tag with `DATA-ID="com.varnish.viewer-id"`.
-- DASH: A token is added to URI attributes in `SegmentTemplate`, `SegmentURL`, `Initialization`, `RepresentationIndex`, and `BitstreamSwitching`, to `xlink:href` on `Period`, `AdaptationSet`, `SegmentList`, and `EventStream`, as well as to `Location`, `PatchLocation`, and `ContentSteering` values and `BaseURL` values that refer to files. Directory `BaseURL` values remain unchanged because their query strings are discarded when relative URIs are resolved against them. URIs are signed for the first `BaseURL` of an element, so alternative directory `BaseURL` elements with a different path are removed; alternatives that differ only in host are kept. The token is appended to existing query strings with `&amp;`.
-- The tenant arguments specify the signing secret and session lifetime in seconds (at most 10 years). Any service with the secret can issue tokens using HMAC-SHA256 truncated to 128 bits and base64url-encoded (see `mac()` in the test).
-- Signing costs one HMAC per URI. On a Varnish Enterprise test host (Ryzen 9 7950X, asmjit), personalizing a small master or variant playlist takes about 30 µs per request at one connection (28 µs with the earlier per-session token), and a 49 KB VOD playlist with 1,800 segments takes about 0.9 ms. Each HMAC is a single host call (`api::HmacSha256`, using OpenSSL SHA-256).
+The tenant reads two [config files](#config-files) and reloads when either changes:
 
-The runnable demo in [demo/manifests.vcl](/demo/manifests.vcl) uses the included sample streams. Integration tests are in [tests/manifest_cpp.vtc](/tests/manifest_cpp.vtc). This example requires Varnish Enterprise.
+```json
+"streaming": {
+    "filename": "/path/to/program/cpp/manifest.cpp",
+    "config_files": {
+        "settings": "/etc/varnish/streaming/settings.json",
+        "revocations": "/etc/varnish/streaming/revoked.txt"
+    }
+}
+```
+
+```json
+{
+    "keys": {"2026-11": "url-signing-secret", "2026-10": "previous-secret"},
+    "signing_key": "2026-11",
+    "entitlement_keys": {"auth": "entitlement-secret"},
+    "subscriber_key": "subscriber-pseudonym-secret",
+    "watermark_key": "watermark-secret",
+    "session_lifetime": 21600,
+    "segment_lifetime": 120,
+    "bind_network": {"ipv4": 24, "ipv6": 48}
+}
+```
+
+- **Entitlements.** A manifest request without a token requires an HS256 JWT in the `auth` parameter, signed with one of the `entitlement_keys`. If multiple entitlement keys are configured, the JWT's `kid` header must identify the signing key. The `sub` and `exp` claims are required; `nbf` is checked if present. An optional `path` claim restricts access to manifest paths that start with that prefix. The tenant logs `Session <id> for subscriber <sub>` (`VCL_Log`) for each new session.
+- **Tokens.** The format is `<key id>.<subscriber>.<session>.<expires>.<HMAC>`. The subscriber pseudonym is the first 12 bytes of an HMAC of `sub` using `subscriber_key`. The session ID consists of 12 random bytes. Both are base64url-encoded. The HMAC covers `<key id>.<subscriber>.<session>.<expires>\n<network>\n`, padded with `\n` to a multiple of 64 bytes, followed by the path. This padding allows the token prefix to be hashed once per manifest. Each URI is resolved against the manifest URL (and DASH `BaseURL` elements) and signed for that exact path, so a token works for only that segment, rendition, and channel. Absolute URLs are signed for their path. Paths with dot segments, empty segments, percent escapes, or backslashes are rejected because origin normalization could map them to a different file. For manifests, `authorize` returns the token, and `personalize` verifies it against `req.url` before using it to sign URIs.
+- **Lifetimes.** Manifest URIs (variant playlists, `Location`, `PatchLocation`, `xlink:href`, and similar references) expire with the session (`session_lifetime`, at most 10 years). Segment URIs in live playlists expire after `segment_lifetime` or when the session expires, whichever comes first. Each playlist refresh signs them again. Segment URIs in VOD playlists (ending in `#EXT-X-ENDLIST`) and static MPDs remain valid until the session expires, allowing playback to resume after a pause within that period.
+- **Key rotation.** Each token identifies the key used to sign it and is verified with the matching key in `keys`. To rotate keys, add a new key and set it as the `signing_key`. Remove the old key once `session_lifetime` has elapsed since the switch.
+- **Revocation.** `revocations` lists subscriber IDs (the `sub` claim) and session IDs, one per line. Blank lines and lines starting with `#` are ignored. Revoked subscribers cannot start new sessions. Every request associated with a revoked subscriber or session receives a 403 response, including requests from existing sessions.
+- **Network binding.** With `bind_network`, tokens are valid only from the client network that started the session: the address in `X-Client-IP`, masked to the configured prefix length. The HMAC includes the network in a form such as `4/24/c00002` (address family, prefix length, and masked address bytes in hex). Shorter prefixes allow a wider range of addresses; longer prefixes may interrupt playback for mobile clients whose addresses change.
+- **Watermarking.** `watermark` returns `A` or `B` for the requested path and the token's session, allowing VCL to serve one of two forensically watermarked copies of each segment. Each session has its own sequence of variants, and both variants remain cached. The sequence in a restream can identify the session so it can be revoked. To compute the variant, let `d = HMAC-SHA256(watermark_key, path)` and `i = big-endian(d[0..3]) % 96`. Using zero-based indices, take bit `i % 6` of the numeric base64url value of session character `i / 6`, then XOR it with the low bit of `d[4]`. A result of 0 selects A; 1 selects B. The client cannot choose the variant because the token is signed for the path without the variant.
+- DASH `SegmentTemplate` URIs are expanded by the player, so they can't be signed per URL. They use `<key id>.<subscriber>.<session>.<expires>.<P>.<S>.<HMAC>`, which signs the `P` bytes before the first `$`, the `S` bytes after the last `$`, and the number of `/` between them in the resolved path. For `video/$RepresentationID$/seg_$Number$.m4s` the token is valid for `/vod/movie/video/` + one directory + anything + `.m4s`. Template tokens are never valid for manifests.
+- HLS: A token is added to URI lines and `URI="..."` attributes (not `X-ASSET-URI` and other attributes ending in `URI`) in tags such as `EXT-X-MAP`, `EXT-X-MEDIA`, `EXT-X-KEY`, and `EXT-X-PART`. `skd:` and `data:` URIs remain unchanged. Master playlists include the session ID in a `#EXT-X-SESSION-DATA` tag with `DATA-ID="com.varnish.viewer-id"`.
+- DASH: A token is added to URI attributes in `SegmentTemplate`, `SegmentURL`, `Initialization`, `RepresentationIndex`, and `BitstreamSwitching`, to `xlink:href` on `Period`, `AdaptationSet`, `SegmentList`, and `EventStream`, as well as to `Location`, `PatchLocation`, and `ContentSteering` values and `BaseURL` values that refer to files. Directory `BaseURL` values remain unchanged because their query strings are discarded when relative URIs are resolved against them. URIs are signed for the first `BaseURL` of an element, so alternative directory `BaseURL` elements with a different path are removed; alternatives that differ only in host are kept. The token is appended to existing query strings with `&amp;`.
+- Any service with a key can issue tokens with HMAC-SHA256 truncated to 128 bits and base64url-encoded (see `mac()` in the test).
+- Signing costs one HMAC per URI. On a Varnish Enterprise test host (Ryzen 9 7950X, asmjit), personalizing a 49 KB VOD playlist with 1,800 segments takes about 0.9 ms, about 2.6% longer than with the previous version's shorter tokens. Verifying a segment token takes about 1 µs longer. Each HMAC is a single host call (`api::HmacSha256`, using OpenSSL SHA-256).
+
+The runnable demo in [demo/manifests.vcl](/demo/manifests.vcl) uses the included sample streams and A/B segment variants. It uses `vsthrottle` to limit new sessions per subscriber and requests per session, and logs `viewer <subscriber> <session>` for each request. Integration tests are in [tests/manifest_cpp.vtc](/tests/manifest_cpp.vtc). This example requires Varnish Enterprise.
 
 ## JavaScript example program
 

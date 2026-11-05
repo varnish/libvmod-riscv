@@ -1212,6 +1212,8 @@ APICALL(regex_delete)
 void sha256(machine_t&);
 void hmac_sha256(machine_t&);
 void hmac_sha256_key(machine_t&);
+void hmac_sha256_absorb(machine_t&);
+void hmac_sha256_resume(machine_t&);
 void base64(machine_t&);
 void fetch(machine_t&);
 
@@ -1254,6 +1256,25 @@ APICALL(base64_decode)
 			(const uint8_t *) src_buffer.data(),
 			src_buffer.size());
 	machine.set_result(len);
+}
+
+APICALL(config_file)
+{
+	if (machine.is_forked())
+		throw std::runtime_error("config_file() is only available during program initialization");
+	auto [name, dst, dstlen] = machine.sysargs<riscv::Buffer, gaddr_t, gaddr_t> ();
+	if (name.size() > 256)
+		throw std::runtime_error("Config file name too long");
+	const auto& files = get_script(machine).program().config_files;
+	const auto it = files.find(name.to_string());
+	if (it == files.end()) {
+		machine.set_result(-1);
+		return;
+	}
+	const auto& contents = it->second.contents;
+	if (dstlen >= contents.size())
+		machine.copy_to_guest(dst, contents.data(), contents.size());
+	machine.set_result(contents.size());
 }
 
 void Script::setup_syscall_interface()
@@ -1317,6 +1338,9 @@ void Script::setup_syscall_interface()
 	machine_t::install_syscall_handler(ECALL_REGISTER_TRANSFORM, register_transform);
 	machine_t::install_syscall_handler(ECALL_HMAC_SHA256, hmac_sha256);
 	machine_t::install_syscall_handler(ECALL_HMAC_SHA256_KEY, hmac_sha256_key);
+	machine_t::install_syscall_handler(ECALL_CONFIG_FILE, config_file);
+	machine_t::install_syscall_handler(ECALL_HMAC_SHA256_ABSORB, hmac_sha256_absorb);
+	machine_t::install_syscall_handler(ECALL_HMAC_SHA256_RESUME, hmac_sha256_resume);
 
 	// A custom intruction used to handle indexed dynamic calls.
 	using namespace riscv;

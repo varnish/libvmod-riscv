@@ -74,6 +74,7 @@ bool TenantConfig::same_as(const TenantConfig& other) const
 		&& a.verbose == b.verbose
 		&& (a.fetch == b.fetch || (a.fetch && b.fetch && *a.fetch == *b.fetch))
 		&& a.backends == b.backends
+		&& a.config_files == b.config_files
 		&& *rvs::atomic_load(&a.argv) == *rvs::atomic_load(&b.argv);
 }
 
@@ -82,6 +83,30 @@ std::string SandboxTenant::program_path() const
 	if (config.filename.starts_with("rust:"))
 		return apply_dollar_vars(config.filename.substr(5));
 	return apply_dollar_vars(config.filename);
+}
+
+std::map<std::string, ConfigFile> read_config_files(const SandboxTenant& tenant)
+{
+	std::map<std::string, ConfigFile> files;
+	for (const auto& [name, path] : tenant.config.group.config_files) {
+		ConfigFile file;
+		file.path = apply_dollar_vars(path);
+		file.stamp = FileStamp::of(file.path);
+		const auto data = file_loader(file.path);
+		if (data.size() > tenant.config.max_memory())
+			throw std::runtime_error("Config file '" + name + "' exceeds the tenant's memory limit");
+		file.contents.assign(data.begin(), data.end());
+		files.emplace(name, std::move(file));
+	}
+	return files;
+}
+
+bool config_files_current(const MachineInstance& inst)
+{
+	for (const auto& [name, file] : inst.config_files)
+		if (FileStamp::of(file.path) != file.stamp)
+			return false;
+	return true;
 }
 
 bool SandboxTenant::reusable_source() const
