@@ -39,6 +39,7 @@ struct MachineInstance
 	Script   script;
 	std::array<Script::gaddr_t, 13> callback_entries;
 	std::unordered_map<std::string, Script::gaddr_t> function_map;
+	std::unordered_map<std::string, Script::gaddr_t> transform_map;
 
 	Script   storage;
 	std::mutex storage_mtx;

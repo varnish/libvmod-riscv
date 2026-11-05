@@ -162,9 +162,13 @@ int riscv_deliver_call(VRT_CTX, const char* func, const char* arg,
 	auto* old_ctx = script->ctx();
 	try {
 		Script::gaddr_t addr = 0;
-		const auto it = script->program().function_map.find(func);
-		if (it != script->program().function_map.end())
+		const auto& program = script->program();
+		const auto it = program.transform_map.find(func);
+		if (it != program.transform_map.end())
 			addr = it->second;
+		else if (program.function_map.count(func))
+			throw std::runtime_error("function '" + std::string(func)
+				+ "' is registered for riscv.call(), not as a transform");
 		else
 			addr = script->resolve_address(func);
 		if (addr == 0)

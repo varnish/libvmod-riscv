@@ -192,6 +192,42 @@ if (r[0].ok() && r[0].status() == 200)
 	use(r[0].body(), r[0].header("Content-Type"));
 ```
 The whole response is handed over when a request finishes: the system call allocates its body and headers on the program's native heap, with the exact sizes, and `FetchResponse` frees them. See `ECALL_FETCH` in [syscalls.h](/src/machine/syscalls.h) for the system call itself.
+## Per-viewer streaming manifests
+
+[manifest.cpp](/program/cpp/manifest.cpp) personalizes HLS and DASH manifests for each viewer while Varnish caches a single copy of each manifest and segment. A manifest request without a token starts a session with a random viewer ID and an HMAC-SHA256 token scoped to the manifest's directory. `riscv.deliver_transform()` adds the viewer's token to the supported URIs in the manifest before delivery:
+
+```vcl
+sub vcl_recv {
+	if (!riscv.fork("streaming")) {
+		return (synth(503));
+	}
+	set req.http.X-Token = riscv.call("authorize", req.url);
+	if (req.http.X-Token !~ "^[A-Za-z0-9_.-]+$") {
+		return (synth(403));
+	}
+	set req.url = regsuball(req.url, "(?<=[?&])token=[^&#]*&?", "");
+	set req.url = regsub(req.url, "[?&]$", "");
+}
+sub vcl_backend_fetch {
+	unset bereq.http.X-Token;
+}
+sub vcl_deliver {
+	if (req.url ~ "(?i)\.(m3u8|mpd)(\?|$)" && resp.status == 200) {
+		if (!riscv.deliver_transform("personalize", req.http.X-Token)) {
+			return (synth(503));
+		}
+		set resp.http.Cache-Control = "private, no-store";
+	}
+}
+```
+
+- Tokens use the format `<viewer id>.<expires>.<scope depth>.<HMAC>`. `vcl_recv` verifies tokens on segment requests, rejecting invalid signatures, expired tokens, and requests outside the signed directory scope. Paths with dot segments, empty segments, percent escapes, or backslashes are rejected because origin normalization could move them outside that scope. Each authorized manifest request renews the session, preserving the viewer ID during continued playback.
+- HLS: The token is added to URI lines and `URI="..."` attributes (not `X-ASSET-URI` and other attributes ending in `URI`) in tags such as `EXT-X-MAP`, `EXT-X-MEDIA`, `EXT-X-KEY`, and `EXT-X-PART`. `skd:` and `data:` URIs remain unchanged. Master playlists include the viewer ID in a `#EXT-X-SESSION-DATA` tag with `DATA-ID="com.varnish.viewer-id"`.
+- DASH: The token is added to URI attributes in `SegmentTemplate`, `SegmentURL`, `Initialization`, `RepresentationIndex`, and `BitstreamSwitching`, to `xlink:href` on `Period`, `AdaptationSet`, `SegmentList`, and `EventStream`, as well as to `Location`, `PatchLocation`, and `ContentSteering` values and `BaseURL` values that refer to files. Directory `BaseURL` values remain unchanged because their query strings are discarded when relative URIs are resolved against them. The token is appended to existing query strings with `&amp;`.
+- The tenant arguments specify the signing secret and session lifetime in seconds (at most 10 years). Any service with the secret can issue tokens using HMAC-SHA256 truncated to 128 bits (see `mac()` in the test).
+- On a Varnish Enterprise test host, starting a session (generating a random ID, computing an HMAC, and rewriting the master playlist) adds about 6 µs to a cache hit. Rewriting a 60 KB VOD playlist with 1,800 segments takes about 0.5 ms, with most of the time spent in two guest `memcpy` calls per segment.
+
+The runnable demo in [demo/manifests.vcl](/demo/manifests.vcl) uses the included sample streams. Integration tests are in [tests/manifest_cpp.vtc](/tests/manifest_cpp.vtc). This example requires Varnish Enterprise.
 
 ## JavaScript example program
 

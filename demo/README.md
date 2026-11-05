@@ -40,3 +40,13 @@ You can test Common Access Token in Rust like so:
 ```sh
 ./verify_token.sh
 ```
+
+## Per-viewer streaming manifests
+
+`manifests.vcl` personalizes HLS and DASH manifests for each viewer using signed session tokens while Varnish caches a single copy of each object. This demo requires Varnish Enterprise. Serve the sample streams from a local origin server, start Varnish, and run the session walkthrough:
+
+```sh
+(cd streams && python3 -m http.server 8081) &
+varnishd -f $PWD/manifests.vcl -a :8000 -n /tmp/varnishd-manifests -F
+./manifests.sh
+```

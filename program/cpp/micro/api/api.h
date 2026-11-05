@@ -5,6 +5,8 @@
 #pragma once
 #include <engine.hpp>
 #include <array>
+#include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <span>
@@ -90,6 +92,17 @@ long fetch_wait(std::span<int32_t> handles, std::span<FetchResponse> responses,
 void fetch_free(int handle);
 /* One GET, waited for */
 FetchResponse fetch(std::string_view url, std::string_view headers = {}, unsigned flags = 0);
+/* HMAC-SHA256 (RFC 2104) with a fixed key. The message is the
+   concatenation of the parts. */
+struct HmacSha256 {
+	explicit HmacSha256(std::string_view key);
+	std::array<uint8_t, 32> operator()(std::initializer_list<std::string_view> parts) const;
+	std::array<uint8_t, 32> operator()(std::string_view msg) const { return (*this)({msg}); }
+private:
+	std::array<char, 64> ipad;
+	std::array<char, 64> opad;
+};
+bool equal_constant_time(std::string_view a, std::string_view b);
 
 /* Regular expressions */
 struct Regex {
@@ -212,6 +225,12 @@ void set_on_deliver(void (*func)(Request, Response, const char*));
 /* Make a function callable from VCL with riscv.call(name, arg) */
 using function_t = const char* (*)(const char* arg, size_t len);
 void register_function(std::string_view name, function_t func);
+
+/* Register a function for use with riscv.deliver_transform(name, arg).
+   The function must produce a response with
+   forge_response(status, content_type, ..., body, ...). */
+using transform_t = void (*)(const char* arg, const char* data, size_t len);
+void register_transform(std::string_view name, transform_t func);
 
 /*  */
 inline bool is_storage() {

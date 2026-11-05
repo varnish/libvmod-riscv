@@ -121,7 +121,11 @@ const char* riscv_current_call(VRT_CTX,
 	try {
 		const auto it = script->program().function_map.find(func);
 		if (it == script->program().function_map.end()) {
-			VRT_fail(ctx, "VM call failed: function '%s' not registered", func);
+			if (script->program().transform_map.count(func))
+				VRT_fail(ctx, "VM call failed: '%s' is a transform, "
+					"use riscv.deliver_transform()", func);
+			else
+				VRT_fail(ctx, "VM call failed: function '%s' not registered", func);
 			return nullptr;
 		}
 		const auto addr = it->second;

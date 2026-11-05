@@ -412,17 +412,31 @@ APICALL(register_callback)
 	script.program().callback_entries.at(idx) = addr;
 	machine.set_result(0);
 }
-APICALL(register_func)
+static std::string registered_name(machine_t& machine, const char* what)
 {
-	const auto [nameptr, namelen, addr] =
-		machine.sysargs<gaddr_t, uint32_t, gaddr_t>();
+	const auto [nameptr, namelen] = machine.sysargs<gaddr_t, uint32_t>();
 	if (namelen > 256) {
-		throw std::runtime_error("Function name too long in register_func");
+		throw std::runtime_error(std::string("Function name too long in ") + what);
 	}
 	std::string name(namelen, '\0');
 	machine.memory.memcpy_out(name.data(), nameptr, namelen);
-	auto& script = get_script(machine);
-	script.program().function_map.insert_or_assign(name, addr);
+	return name;
+}
+APICALL(register_func)
+{
+	std::string name = registered_name(machine, "register_func");
+	const auto addr = machine.sysarg<gaddr_t>(2);
+	auto& program = get_script(machine).program();
+	program.transform_map.erase(name);
+	program.function_map.insert_or_assign(std::move(name), addr);
+}
+APICALL(register_transform)
+{
+	std::string name = registered_name(machine, "register_transform");
+	const auto addr = machine.sysarg<gaddr_t>(2);
+	auto& program = get_script(machine).program();
+	program.function_map.erase(name);
+	program.transform_map.insert_or_assign(std::move(name), addr);
 }
 APICALL(set_decision)
 {
@@ -1298,6 +1312,7 @@ void Script::setup_syscall_interface()
 	machine_t::install_syscall_handler(ECALL_BASE64, base64);
 	machine_t::install_syscall_handler(ECALL_FETCH, fetch);
 	machine_t::install_syscall_handler(ECALL_FIND_BACKEND, find_backend);
+	machine_t::install_syscall_handler(ECALL_REGISTER_TRANSFORM, register_transform);
 
 	// A custom intruction used to handle indexed dynamic calls.
 	using namespace riscv;

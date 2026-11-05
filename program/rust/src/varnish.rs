@@ -214,7 +214,7 @@ pub fn register_deliver_transform(name: &str, func: extern "C" fn(*const c_char,
 {
 	unsafe {
 		asm!("ecall",
-			in("a7") 539,
+			in("a7") 573,
 			in("a0") name.as_ptr(),
 			in("a1") name.len(),
 			in("a2") func as *const ()

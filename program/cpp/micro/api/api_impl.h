@@ -209,6 +209,11 @@ inline void register_function(std::string_view name, function_t func)
 	asm ("" ::: "memory");
 	syscall(ECALL_REGISTER_FUNC, (long) name.data(), name.size(), (long) func);
 }
+inline void register_transform(std::string_view name, transform_t func)
+{
+	asm ("" ::: "memory");
+	syscall(ECALL_REGISTER_TRANSFORM, (long) name.data(), name.size(), (long) func);
+}
 
 inline std::array<uint8_t, 32> sha256(std::string_view data)
 {
@@ -298,6 +303,55 @@ inline FetchResponse fetch(std::string_view url, std::string_view headers, unsig
 	if (n < 0)
 		return FetchResponse(int(n));
 	return response;
+}
+
+inline HmacSha256::HmacSha256(std::string_view key)
+{
+	std::array<uint8_t, 64> k {};
+	if (key.size() > k.size()) {
+		const auto digest = sha256(key);
+		std::memcpy(k.data(), digest.data(), digest.size());
+	} else {
+		std::memcpy(k.data(), key.data(), key.size());
+	}
+	for (size_t i = 0; i < k.size(); i++) {
+		ipad[i] = k[i] ^ 0x36;
+		opad[i] = k[i] ^ 0x5c;
+	}
+}
+inline std::array<uint8_t, 32> HmacSha256::operator()(std::initializer_list<std::string_view> parts) const
+{
+	size_t total = ipad.size();
+	for (const auto part : parts)
+		total += part.size();
+	std::array<char, 512> stack;
+	std::string heap;
+	char* inner = stack.data();
+	if (total > stack.size()) {
+		heap.resize(total);
+		inner = heap.data();
+	}
+	std::memcpy(inner, ipad.data(), ipad.size());
+	size_t len = ipad.size();
+	for (const auto part : parts) {
+		std::memcpy(inner + len, part.data(), part.size());
+		len += part.size();
+	}
+	const auto inner_hash = sha256({inner, len});
+
+	std::array<char, 64 + 32> outer;
+	std::memcpy(outer.data(), opad.data(), opad.size());
+	std::memcpy(outer.data() + opad.size(), inner_hash.data(), inner_hash.size());
+	return sha256({outer.data(), outer.size()});
+}
+inline bool equal_constant_time(std::string_view a, std::string_view b)
+{
+	if (a.size() != b.size())
+		return false;
+	unsigned char diff = 0;
+	for (size_t i = 0; i < a.size(); i++)
+		diff |= a[i] ^ b[i];
+	return diff == 0;
 }
 
 inline HeaderField::HeaderField(gethdr_e wh, size_t idx)

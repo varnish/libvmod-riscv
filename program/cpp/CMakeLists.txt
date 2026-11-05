@@ -10,3 +10,5 @@ add_micro_binary(basic basic.cpp)
 add_micro_binary(js js.cpp)
 
 add_micro_binary(jwt jwt.cpp)
+
+add_micro_binary(manifest manifest.cpp)
