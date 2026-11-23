@@ -102,10 +102,21 @@ static constexpr void *computed_opcode[] = {
 	[RV32C_BC_ADD]  = &&rv32c_add,
 	[RV32C_BC_XOR]  = &&rv32c_xor,
 	[RV32C_BC_OR]   = &&rv32c_or,
+	[RV32C_BC_LUI]  = &&rv32c_lui,
+	[RV32C_BC_FLD]  = &&rv32c_fld,
+	[RV32C_BC_FSD]  = &&rv32c_fsd,
+	[RV32C_BC_FLW]  = &&rv32c_flw,
+	[RV32C_BC_FSW]  = &&rv32c_fsw,
+	[RV32C_BC_SRAI] = &&rv32c_srai,
+	[RV32C_BC_SUB]  = &&rv32c_sub,
+	[RV32C_BC_AND]  = &&rv32c_and,
+	[RV32C_BC_SUBW] = &&rv32c_subw,
+	[RV32C_BC_ADDW] = &&rv32c_addw,
 	[RV32C_BC_FUNCTION] = &&rv32c_func,
 #endif
 
 	[RV32I_BC_SYSCALL] = &&rv32i_syscall,
+	[RV32I_BC_DYNCALL] = &&rv32i_dyncall,
 	[RV32I_BC_STOP] = &&rv32i_stop,
 
 	[RV32F_BC_FLW] = &&rv32i_flw,
@@ -127,4 +138,7 @@ static constexpr void *computed_opcode[] = {
 #endif
 	[RV32I_BC_LIVEPATCH]  = &&execute_livepatch,
 	[RV32I_BC_SYSTEM] = &&rv32i_system,
+#define FUSED_PAIR(name, a, b, A, B, G) RISCV_FUSED_IF_ ## G([RV32I_BC_F_ ## name] = &&rv_fused_ ## name,)
+#include "fused_pairs.inc"
+#undef FUSED_PAIR
 };

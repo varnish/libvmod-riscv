@@ -93,7 +93,6 @@ TEST_CASE("Counted integer calls preserve live FP values", "[Dyncall]") {
 #if !defined(RISCV_ASMJIT) && !defined(RISCV_BINARY_TRANSLATION)
 				if (translated) continue;
 #endif
-				if (!translated && (scenario == 1 || scenario == 2)) continue;
 				MachineOptions<RISCV64> options;
 				options.memory_max = 8u << 20;
 				options.use_shared_execute_segments = false;
@@ -154,6 +153,207 @@ TEST_CASE("Counted integer calls preserve live FP values", "[Dyncall]") {
 					REQUIRE(state.calls == expected_calls);
 					REQUIRE(exception == expected_exception);
 				}
+			}
+		}
+	}
+}
+
+namespace {
+struct CountState {
+	std::vector<uint64_t> seen;
+	unsigned penalize_at = ~0u, stop_at = ~0u;
+};
+const Instruction<RISCV64> count_handler {
+	[](CPU<RISCV64>& cpu, rv32i_instruction) {
+		auto& machine = cpu.machine();
+		auto& state = *machine.get_userdata<CountState>();
+		const unsigned call = state.seen.size();
+		state.seen.push_back(machine.instruction_counter());
+		cpu.reg(REG_ARG1) += 1;
+		if (call == state.penalize_at) machine.penalize(1000);
+		if (call == state.stop_at) machine.stop();
+	},
+	[](char* buffer, size_t len, const CPU<RISCV64>&, rv32i_instruction) {
+		return snprintf(buffer, len, "Count dyncall");
+	}
+};
+}
+
+TEST_CASE("Dyncalls see and update the instruction counter in every backend", "[Dyncall]") {
+	const auto previous = CPU<RISCV64>::on_unimplemented_instruction;
+	struct Restore {
+		decltype(previous) callback;
+		~Restore() { CPU<RISCV64>::on_unimplemented_instruction = callback; }
+	} restore{previous};
+	CPU<RISCV64>::on_unimplemented_instruction = [](rv32i_instruction i) -> const Instruction<RISCV64>& {
+		if (Dyncall::valid(i.whole) && i.Itype.imm == 600) return count_handler;
+		return CPU<RISCV64>::get_unimplemented_instruction();
+	};
+	const uint32_t word = Dyncall::encode(600, 0, 0, false);
+	std::string body = "li t0, 3\n1:\naddi a0, a0, 1\naddi a0, a0, 1\n";
+	body += ".word " + std::to_string(word) + "\n";
+	body += "addi a0, a0, 1\naddi t0, t0, -1\nbnez t0, 1b\n.word 0x7ff00073\n";
+	std::string source = "__attribute__((naked)) void _start(void) { __asm__ volatile(\"";
+	for (char c : body) source += c == '\n' ? "\\n" : std::string(1, c);
+	source += "\"); }";
+	const char* cc = getenv("RVVCC");
+	setenv("RCC", cc ? cc : "riscv64-linux-gnu-gcc-14", 1);
+
+	std::vector<std::string> marches { "rv64g" };
+	if constexpr (compressed_enabled)
+		marches.push_back("rv64gc");
+	for (const auto& march : marches) {
+		const auto binary = build_and_load(source,
+			"-nostdlib -static -march=" + march + " -mabi=lp64d -Wl,-e,_start", false);
+		for (unsigned scenario = 0; scenario < 3; scenario++)
+		for (bool translated : {false, true}) {
+#if !defined(RISCV_ASMJIT) && !defined(RISCV_BINARY_TRANSLATION)
+			if (translated) continue;
+#endif
+			MachineOptions<RISCV64> options;
+			options.memory_max = 8u << 20;
+			options.use_shared_execute_segments = false;
+#ifdef RISCV_BINARY_TRANSLATION
+			options.translate_enabled = translated;
+			options.translation_cache = false;
+			options.translate_enable_embedded = false;
+#endif
+#ifdef RISCV_ASMJIT
+			options.asmjit_enabled = translated;
+#endif
+			Machine<RISCV64> machine(binary, options);
+			CountState state;
+			if (scenario == 1) state.penalize_at = 1;
+			if (scenario == 2) state.stop_at = 1;
+			machine.set_userdata(&state);
+			const bool stopped = machine.simulate<false>(10000);
+			CAPTURE(march, scenario, translated, state.seen);
+
+			const uint64_t dyncall_pc = machine.address_of("_start")
+				+ (march == "rv64gc" ? 6 : 12);
+			const std::vector<uint64_t> exact { 4, 10, 16 };
+			const auto near = [&] (unsigned call, uint64_t penalty = 0) {
+				const uint64_t want = exact.at(call) + penalty;
+				return state.seen.at(call) + 7 >= want && state.seen.at(call) <= want + 7;
+			};
+			switch (scenario) {
+			case 0:
+				REQUIRE(state.seen.size() == 3);
+				REQUIRE((near(0) && near(1) && near(2)));
+				REQUIRE(stopped);
+				REQUIRE(machine.instruction_counter() == 20);
+				REQUIRE(machine.cpu.reg(REG_ARG0) == 9);
+				break;
+			case 1:
+				REQUIRE(state.seen.size() == 3);
+				REQUIRE((near(0) && near(1) && near(2, 1000)));
+				REQUIRE(stopped);
+				REQUIRE(machine.instruction_counter() == 1020);
+				REQUIRE(machine.cpu.reg(REG_ARG0) == 9);
+				break;
+			case 2:
+				REQUIRE(state.seen.size() == 2);
+				REQUIRE((near(0) && near(1)));
+				REQUIRE(stopped);
+				REQUIRE(machine.instruction_counter() >= 10);
+				REQUIRE(machine.instruction_counter() <= 13);
+				REQUIRE(machine.cpu.pc() == dyncall_pc + 4);
+				REQUIRE(machine.cpu.reg(REG_ARG0) == 5);
+				break;
+			}
+			REQUIRE(machine.cpu.reg(REG_ARG1) == state.seen.size());
+		}
+	}
+}
+
+namespace {
+struct PassState { unsigned calls = 0, throw_at = ~0u; };
+// Touches no registers: every output keeps whatever the guest had in it.
+const Instruction<RISCV64> pass_handler {
+	[](CPU<RISCV64>& cpu, rv32i_instruction) {
+		auto& state = *cpu.machine().get_userdata<PassState>();
+		if (state.calls++ == state.throw_at)
+			cpu.trigger_exception(ILLEGAL_OPERATION);
+	},
+	[](char* buffer, size_t len, const CPU<RISCV64>&, rv32i_instruction) {
+		return snprintf(buffer, len, "Pass dyncall");
+	}
+};
+}
+
+TEST_CASE("Dyncall outputs the handler leaves alone keep their guest values", "[Dyncall]") {
+	const auto previous = CPU<RISCV64>::on_unimplemented_instruction;
+	struct Restore {
+		decltype(previous) callback;
+		~Restore() { CPU<RISCV64>::on_unimplemented_instruction = callback; }
+	} restore{previous};
+	CPU<RISCV64>::on_unimplemented_instruction = [](rv32i_instruction i) -> const Instruction<RISCV64>& {
+		if (Dyncall::valid(i.whole) && i.Itype.imm == 700) return pass_handler;
+		return CPU<RISCV64>::get_unimplemented_instruction();
+	};
+	// a0 and a1 are made dirty right before calls that declare them as
+	// outputs but not (or not all) as inputs, and are then read back.
+	std::string body = "li t0, 5\n1:\n";
+	body += "slti a0, t0, 3\naddi a1, a1, 3\n";
+	body += ".word " + std::to_string(Dyncall::encode(700, 0, 2, false)) + "\n";
+	body += "add a2, a2, a0\nadd a3, a3, a1\n";
+	body += "addi a0, a0, 1\naddi a1, a1, 5\n";
+	body += ".word " + std::to_string(Dyncall::encode(700, 1, 2, false)) + "\n";
+	body += "add a2, a2, a0\nadd a3, a3, a1\n";
+	body += "addi a1, a1, 1\n";
+	body += ".word " + std::to_string(Dyncall::encode(700, 0, 1)) + "\n";
+	body += "add a3, a3, a1\n";
+	body += "addi t0, t0, -1\nbnez t0, 1b\n.word 0x7ff00073\n";
+	std::string source = "__attribute__((naked)) void _start(void) { __asm__ volatile(\"";
+	for (char c : body) source += c == '\n' ? "\\n" : std::string(1, c);
+	source += "\"); }";
+	const char* cc = getenv("RVVCC");
+	setenv("RCC", cc ? cc : "riscv64-linux-gnu-gcc-14", 1);
+	const auto binary = build_and_load(source,
+		"-nostdlib -static -march=rv64g -mabi=lp64d -Wl,-e,_start", false);
+
+	for (const unsigned throw_at : {~0u, 4u}) {
+		std::array<uint64_t, 32> expected{};
+		for (bool translated : {false, true}) {
+#if !defined(RISCV_ASMJIT) && !defined(RISCV_BINARY_TRANSLATION)
+			if (translated) continue;
+#endif
+			MachineOptions<RISCV64> options;
+			options.memory_max = 8u << 20;
+			options.use_shared_execute_segments = false;
+#ifdef RISCV_BINARY_TRANSLATION
+			options.translate_enabled = translated;
+			options.translation_cache = false;
+			options.translate_enable_embedded = false;
+#endif
+#ifdef RISCV_ASMJIT
+			options.asmjit_enabled = translated;
+#endif
+			Machine<RISCV64> machine(binary, options);
+			PassState state;
+			state.throw_at = throw_at;
+			machine.set_userdata(&state);
+			int exception = -1;
+			try { machine.simulate(10000); }
+			catch (const MachineException& e) { exception = e.type(); }
+			CAPTURE(throw_at, translated, state.calls, exception);
+			if (throw_at == ~0u) {
+				REQUIRE(exception == -1);
+				REQUIRE(state.calls == 15);
+				REQUIRE(machine.cpu.reg(REG_ARG2) == 9);
+				REQUIRE(machine.cpu.reg(REG_ARG3) == 370);
+			} else {
+				REQUIRE(exception == ILLEGAL_OPERATION);
+				REQUIRE(state.calls == throw_at + 1);
+				// The second iteration's (1, 2) call raised: its outputs are
+				// the values written right before it.
+				REQUIRE(machine.cpu.reg(REG_ARG0) == 1);
+				REQUIRE(machine.cpu.reg(REG_ARG1) == 17);
+			}
+			for (unsigned r = 1; r < 32; r++) {
+				CAPTURE(r);
+				if (!translated) expected[r] = machine.cpu.reg(r);
+				else REQUIRE(machine.cpu.reg(r) == expected[r]);
 			}
 		}
 	}

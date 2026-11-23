@@ -38,6 +38,7 @@ namespace riscv
 		  m_original_machine {true},
 		  m_binary {bin}
 	{
+		this->m_exec_memory_max = default_execute_segment_memory_max(options);
 #ifdef RISCV_VIRTUAL_PAGING
 		// Bound the page table, including attribute-only pages that are
 		// created outside of the page fault handler (eg. mmap, mprotect)
@@ -61,7 +62,7 @@ namespace riscv
 
 			if (options.use_memory_arena)
 			{
-#if defined(__linux__) || defined(__FreeBSD__)
+#if defined(__linux__) || (defined(__FreeBSD__) && !defined(__PROSPERO__))
 				if constexpr (encompassing_Nbit_arena != 0)
 				{
 					static_assert(flat_readwrite_arena || encompassing_Nbit_arena == 0,
@@ -198,6 +199,7 @@ namespace riscv
 #ifdef RISCV_EXT_ATOMICS
 		this->m_atomics = other.memory.m_atomics;
 #endif
+		this->m_exec_memory_max = default_execute_segment_memory_max(options);
 		this->machine_loader(other, options);
 	}
 
@@ -213,7 +215,7 @@ namespace riscv
 		this->evict_execute_segments();
 		// only the original machine owns arena
 		if (this->m_arena.data != nullptr && !is_forked()) {
-#if defined(__linux__) || defined(__FreeBSD__)
+#if defined(__linux__) || (defined(__FreeBSD__) && !defined(__PROSPERO__))
 			// Adjust back to the original base pointer (subtract OVERALLOCATE)
 			auto* base_ptr = (uint8_t *)this->m_arena.data - Memory::OVERALLOCATE;
 			if constexpr (riscv::encompassing_Nbit_arena != 0)
@@ -397,10 +399,9 @@ namespace riscv
 		}
 
 		// Create an *initial* execute segment
+		const bool is_execute_only = (hdr->p_flags & (Elf::PF_R | Elf::PF_W)) == 0;
 		auto& exec_segment =
-			this->create_execute_segment(options, data, vaddr, exlen, true);
-		// Set the segment as execute-only when R|W are not set
-		exec_segment.set_execute_only((hdr->p_flags & (Elf::PF_R | Elf::PF_W)) == 0);
+			this->create_execute_segment(options, data, vaddr, exlen, true, false, is_execute_only);
 		// Select the first execute segment
 		if (machine().cpu.current_execute_segment().empty())
 			machine().cpu.set_execute_segment(exec_segment);

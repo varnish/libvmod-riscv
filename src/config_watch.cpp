@@ -10,9 +10,22 @@
 #include <set>
 #include <thread>
 extern "C" {
+#ifdef VARNISH_PLUS
 	void VSL_Setup(struct vsl_log*, void*, size_t);
+#else
+	void VSL_Alloc(struct vsl_log*);
+	void VSL_Free(struct vsl_log*);
+#endif
 	void VSL_Flush(struct vsl_log*, int);
 }
+#ifndef VARNISH_PLUS
+struct wrk_vpi {
+	unsigned magic;
+	unsigned handling;
+	unsigned trace;
+	unsigned ref;
+};
+#endif
 
 namespace rvs {
 extern std::string apply_dollar_vars(std::string str);
@@ -28,7 +41,13 @@ struct BackgroundCtx {
 	{
 		INIT_OBJ(&ctx, VRT_CTX_MAGIC);
 		memset(&vsl, 0, sizeof(vsl));
+#ifdef VARNISH_PLUS
 		VSL_Setup(&vsl, nullptr, 0);
+#else
+		VSL_Alloc(&vsl);
+		vpi.magic = 0xaa3d3df3;
+		ctx.vpi = &vpi;
+#endif
 		WS_Init(&ws, "rvr", wsbuf.get(), RELOAD_WS_SIZE);
 		ctx.vsl = &vsl;
 		ctx.ws = &ws;
@@ -42,11 +61,18 @@ struct BackgroundCtx {
 			VSL(SLT_Error, RISCV_NO_VXID, "%s", VSB_data(ctx.msg));
 		VSB_destroy(&ctx.msg);
 		VSL_Flush(&vsl, 0);
+#ifdef VARNISH_PLUS
 		free(vsl.wlb);
+#else
+		VSL_Free(&vsl);
+#endif
 	}
 	struct vrt_ctx ctx;
 	struct vsl_log vsl;
 	struct ws ws;
+#ifndef VARNISH_PLUS
+	struct wrk_vpi vpi {};
+#endif
 	std::unique_ptr<char[]> wsbuf {new char[RELOAD_WS_SIZE]};
 };
 

@@ -54,6 +54,17 @@ endif()
 
 # TAILCALL_DISPATCH enables clang-based compilers to use musttail dispatch.
 option(RISCV_TAILCALL_DISPATCH   "Enable exp. tailcall dispatch" OFF)
+# WASM_DISPATCH replaces the RV64 C++ dispatch with one written in
+# WebAssembly (libriscv/wasm/dispatch_rv64.py), when building with
+# Emscripten for wasm32. RV32 and RV128 keep the C++ dispatch.
+if (EMSCRIPTEN AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+	option(RISCV_WASM_DISPATCH   "Enable WebAssembly dispatch (Emscripten, RV64)" ON)
+else()
+	option(RISCV_WASM_DISPATCH   "Enable WebAssembly dispatch (Emscripten, RV64)" OFF)
+endif()
+if (RISCV_WASM_DISPATCH AND NOT RISCV_64I)
+	set(RISCV_WASM_DISPATCH OFF)
+endif()
 
 if (RISCV_EXPERIMENTAL)
 	# RISCV_ENCOMPASSING_ARENA allows the memory arena to encompass
@@ -124,27 +135,140 @@ if (MINGW_TOOLCHAIN OR MINGW OR WIN32)
 	list(APPEND SOURCES
 		libriscv/win32/system_calls.cpp
 	)
-elseif(UNIX)
+elseif(UNIX OR NINTENDO_SWITCH)
 	list(APPEND SOURCES
 		libriscv/linux/system_calls.cpp
 	)
 endif()
 if (RISCV_EXPERIMENTAL AND RISCV_ASM_DISPATCH)
 	# ASM_DISPATCH uses assembly to dispatch instructions.
-	# It is currently only available on the AMD64 (x86_64) Linux platform.
-	if (CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64"
-	 OR CMAKE_SYSTEM_PROCESSOR STREQUAL "amd64")
+	# It is available on AMD64 (x86_64) Linux and 64-bit MinGW (Win64 ABI).
+	# The decoder cache layout differs with the C-extension (one entry per
+	# 2 bytes, and icount), and there are handlers for compressed bytecodes
+	if (RISCV_EXT_C)
+		set(RVASM_COMPRESSED 1)
+	else()
+		set(RVASM_COMPRESSED 0)
+	endif()
+	# The MinGW toolchain file does not set CMAKE_SYSTEM_NAME, so WIN32 is
+	# not always set when cross-compiling: MINGW_TOOLCHAIN is
+	if (MINGW_TOOLCHAIN OR MINGW OR WIN32)
+		if (MSVC)
+			message(FATAL_ERROR "libriscv: Assembly dispatch requires MinGW on Windows")
+		endif()
+		set(RVASM_FORMAT -f win64)
+	else()
+		set(RVASM_FORMAT -f elf64 -g -F dwarf)
+	endif()
+	if ((CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64"
+	  OR CMAKE_SYSTEM_PROCESSOR STREQUAL "amd64"
+	  OR CMAKE_SYSTEM_PROCESSOR STREQUAL "AMD64")
+	 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
 		message(STATUS "libriscv: Assembly dispatch enabled")
 		list(APPEND SOURCES
 			libriscv/amd64/asm_dispatch.cpp
 			libriscv/threaded_dispatch.cpp
 			libriscv/threaded_inaccurate_dispatch.cpp
-			#libriscv/amd64/accurate_dispatch_rv64gb.o
-			libriscv/amd64/inaccurate_dispatch_rv64gb.o
 		)
+		# One assembly source, assembled once per register width and mode:
+		# COUNTING=1 is CPU::simulate, COUNTING=0 CPU::simulate_inaccurate
+		find_program(NASM_EXECUTABLE nasm REQUIRED)
+		set(RVASM_SRC ${CMAKE_CURRENT_SOURCE_DIR}/libriscv/amd64/dispatch_rv.nasm)
+		# With an encompassing arena, loads and stores mask the address
+		# instead of bounds-checking it. The bits are in the object name,
+		# so that changing them can never link a stale dispatch.
+		# RISCV_ENCOMPASSING_ARENA_BITS=0 is the regular arena in C++ too.
+		if (RISCV_ENCOMPASSING_ARENA AND NOT RISCV_ENCOMPASSING_ARENA_BITS EQUAL 0)
+			set(RVASM_ARENA_BITS ${RISCV_ENCOMPASSING_ARENA_BITS})
+			set(RVASM_SUFFIX "_a${RVASM_ARENA_BITS}")
+		else()
+			set(RVASM_ARENA_BITS 0)
+			set(RVASM_SUFFIX "")
+		endif()
+		set(RVASM_XLENS)
+		if (RISCV_32I)
+			list(APPEND RVASM_XLENS 32)
+		endif()
+		if (RISCV_64I)
+			list(APPEND RVASM_XLENS 64)
+		endif()
+		foreach(XLEN ${RVASM_XLENS})
+			foreach(COUNTING 0 1)
+				set(RVASM_OBJ ${CMAKE_CURRENT_BINARY_DIR}/dispatch_rv${XLEN}_${COUNTING}${RVASM_SUFFIX}.o)
+				add_custom_command(
+					OUTPUT ${RVASM_OBJ}
+					COMMAND ${NASM_EXECUTABLE} ${RVASM_FORMAT} -DXLEN=${XLEN} -DCOUNTING=${COUNTING} -DCOMPRESSED=${RVASM_COMPRESSED} -DARENA_BITS=${RVASM_ARENA_BITS} -I${CMAKE_CURRENT_SOURCE_DIR}/libriscv/ ${RVASM_SRC} -o ${RVASM_OBJ}
+					DEPENDS ${RVASM_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/libriscv/fused_pairs.inc
+				)
+				set_source_files_properties(${RVASM_OBJ} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+				list(APPEND SOURCES ${RVASM_OBJ})
+			endforeach()
+		endforeach()
 	else()
 		message(FATAL_ERROR "libriscv: Assembly dispatch not supported on this platform")
 	endif()
+elseif (RISCV_WASM_DISPATCH)
+	# WASM_DISPATCH generates the RV64 dispatch in WebAssembly (see
+	# wasm/dispatch_rv64.py). RV32 and RV128 use the threaded C++ dispatch.
+	if (NOT EMSCRIPTEN OR NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+		message(FATAL_ERROR "libriscv: WebAssembly dispatch requires Emscripten and wasm32 (not MEMORY64)")
+	endif()
+	message(STATUS "libriscv: WebAssembly dispatch enabled")
+	find_package(Python3 REQUIRED COMPONENTS Interpreter)
+	set(RVWASM_GEN ${CMAKE_CURRENT_SOURCE_DIR}/libriscv/wasm/dispatch_rv64.py)
+	# The generated code depends on these settings: 1 or 0
+	macro(rvwasm_setting VAR)
+		if (${ARGN})
+			set(${VAR} 1)
+		else()
+			set(${VAR} 0)
+		endif()
+	endmacro()
+	rvwasm_setting(RVWASM_COMPRESSED RISCV_EXT_C)
+	rvwasm_setting(RVWASM_TRANSLATOR RISCV_BINARY_TRANSLATION)
+	rvwasm_setting(RVWASM_ASMJIT RISCV_ASMJIT)
+	rvwasm_setting(RVWASM_FCSR RISCV_FCSR)
+	# NaN-boxing rides along with FCSR emulation (see common.hpp)
+	rvwasm_setting(RVWASM_NANBOXING RISCV_FCSR OR RISCV_DEBUG)
+	# With an encompassing arena, loads and stores mask the address instead
+	# of bounds-checking it (see RVASM_ARENA_BITS). 0 = the regular arena.
+	if (RISCV_EXPERIMENTAL AND RISCV_ENCOMPASSING_ARENA AND NOT RISCV_ENCOMPASSING_ARENA_BITS EQUAL 0)
+		set(RVWASM_ARENA_BITS ${RISCV_ENCOMPASSING_ARENA_BITS})
+	else()
+		set(RVWASM_ARENA_BITS 0)
+	endif()
+	# The settings are part of the file names, so that changing one of them
+	# always generates the dispatch again
+	set(RVWASM_TAG c${RVWASM_COMPRESSED}t${RVWASM_TRANSLATOR}a${RVWASM_ASMJIT}f${RVWASM_FCSR}n${RVWASM_NANBOXING}b${RVWASM_ARENA_BITS})
+	set(RVWASM_ASM ${CMAKE_CURRENT_BINARY_DIR}/rv64wasm_dispatch_${RVWASM_TAG}.s)
+	set(RVWASM_OBJ ${CMAKE_CURRENT_BINARY_DIR}/rv64wasm_dispatch_${RVWASM_TAG}.o)
+	set(RVWASM_HDR_DIR ${CMAKE_CURRENT_BINARY_DIR}/rv64wasm_${RVWASM_TAG})
+	set(RVWASM_HDR ${RVWASM_HDR_DIR}/rv64wasm_layout.h)
+	file(MAKE_DIRECTORY ${RVWASM_HDR_DIR})
+	add_custom_command(
+		OUTPUT ${RVWASM_ASM} ${RVWASM_HDR}
+		COMMAND ${Python3_EXECUTABLE} ${RVWASM_GEN}
+			--compressed ${RVWASM_COMPRESSED} --translator ${RVWASM_TRANSLATOR}
+			--asmjit ${RVWASM_ASMJIT} --fcsr ${RVWASM_FCSR} --nanboxing ${RVWASM_NANBOXING}
+			--arena-bits ${RVWASM_ARENA_BITS}
+			--fused ${CMAKE_CURRENT_SOURCE_DIR}/libriscv/fused_pairs.inc
+			-o ${RVWASM_ASM} --header ${RVWASM_HDR}
+		DEPENDS ${RVWASM_GEN} ${CMAKE_CURRENT_SOURCE_DIR}/libriscv/fused_pairs.inc
+	)
+	add_custom_command(
+		OUTPUT ${RVWASM_OBJ}
+		COMMAND ${CMAKE_CXX_COMPILER} -c ${RVWASM_ASM} -o ${RVWASM_OBJ}
+		DEPENDS ${RVWASM_ASM}
+	)
+	set_source_files_properties(${RVWASM_OBJ} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+	set_source_files_properties(${RVWASM_HDR} PROPERTIES GENERATED TRUE)
+	list(APPEND SOURCES
+		libriscv/wasm/wasm_dispatch.cpp
+		libriscv/threaded_dispatch.cpp
+		libriscv/threaded_inaccurate_dispatch.cpp
+		${RVWASM_OBJ}
+		${RVWASM_HDR}
+	)
 elseif (RISCV_THREADED OR RISCV_TAILCALL_DISPATCH)
 	if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang"
 	 AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0
@@ -229,6 +353,13 @@ if (RISCV_EXPERIMENTAL AND RISCV_ASM_DISPATCH)
 		RISCV_ASM_DISPATCH=1
 	)
 endif()
+if (RISCV_WASM_DISPATCH AND NOT (RISCV_EXPERIMENTAL AND RISCV_ASM_DISPATCH))
+	target_compile_definitions(riscv PUBLIC
+		RISCV_WASM_DISPATCH=1
+	)
+	# rv64wasm_layout.h for wasm_dispatch.cpp
+	target_include_directories(riscv PRIVATE ${RVWASM_HDR_DIR})
+endif()
 if (RISCV_VERBOSE_SYSCALLS)
 	message(STATUS "libriscv: Verbose system calls enabled")
 	target_compile_definitions(riscv PUBLIC
@@ -248,7 +379,8 @@ if (WIN32 OR MINGW_TOOLCHAIN)
 	if (RISCV_BINARY_TRANSLATION)
 		target_sources(riscv PRIVATE libriscv/win32/dlfcn.cpp)
 	endif()
-elseif (RISCV_BINARY_TRANSLATION)
+elseif (RISCV_BINARY_TRANSLATION AND NOT NINTENDO_SWITCH)
+	# Switch homebrew has no dynamic loader (tr_dylib.hpp).
 	target_link_libraries(riscv PUBLIC dl)
 endif()
 
@@ -283,7 +415,15 @@ if (RISCV_BINARY_TRANSLATION AND RISCV_LIBTCC)
 		CONFIG_TCC_BCHECK=0
 	)
 	# We support: Windows, Linux, macOS and Android
-	if (ANDROID_TOOLCHAIN)
+	if (ANDROID_TOOLCHAIN AND ANDROID_ABI STREQUAL "armeabi-v7a")
+		# EABI with VFP instructions and the softfp calling convention Android uses
+		target_compile_definitions(riscv PRIVATE
+			TARGETOS_ANDROID=1
+			TCC_TARGET_ARM=1
+			TCC_ARM_EABI=1
+			TCC_ARM_VFP=1
+		)
+	elseif (ANDROID_TOOLCHAIN)
 		target_compile_definitions(riscv PRIVATE
 			TARGETOS_ANDROID=1
 			TCC_TARGET_ARM64=1

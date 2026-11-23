@@ -5,6 +5,7 @@
 #include "threaded_bytecodes.hpp"
 #include "rv32i_instr.hpp"
 #include "rvfd.hpp"
+#include "bytecode_bodies.hpp"
 #ifdef RISCV_EXT_COMPRESSED
 #include "rvc.hpp"
 #endif
@@ -34,6 +35,15 @@ namespace riscv
 #define NEXT_C_INSTR() \
 	decoder += 1;      \
 	EXECUTE_INSTR();
+#define NEXT_INSTR_TO(bc)             \
+	if constexpr (compressed_enabled) \
+		decoder += 2;                 \
+	else                              \
+		decoder += 1;                 \
+	EXECUTE_BYTECODE(bc);
+#define NEXT_C_INSTR_TO(bc) \
+	decoder += 1;           \
+	EXECUTE_BYTECODE(bc);
 
 #define NEXT_BLOCK(len, OF)                 \
 	pc += len;                              \
@@ -75,10 +85,16 @@ namespace riscv
 	goto check_jump
 
 
+#if defined(RISCV_ASM_DISPATCH) || defined(RISCV_WASM_DISPATCH)
+#define DISPATCH_FUNCNAME simulate_cpp
+#else
+#define DISPATCH_FUNCNAME simulate
+#endif
+
 template <int W> DISPATCH_ATTR
-bool CPU<W>::simulate(address_t pc, uint64_t inscounter, uint64_t maxcounter)
+bool CPU<W>::DISPATCH_FUNCNAME(address_t pc, uint64_t inscounter, uint64_t maxcounter)
 {
-	static constexpr uint32_t XLEN = W * 8;
+	[[maybe_unused]] static constexpr uint32_t XLEN = W * 8;
 	using addr_t  = address_type<W>;
 	using saddr_t = signed_address_type<W>;
 
@@ -141,6 +157,7 @@ while (true) {
 	/** Instruction handlers **/
 
 #include "bytecode_impl.cpp"
+
 
 INSTRUCTION(RV32I_BC_SYSTEM, rv32i_system) {
 	VIEW_INSTR();
@@ -248,6 +265,17 @@ INSTRUCTION(RV32I_BC_SYSCALL, rv32i_syscall) {
 	NEXT_BLOCK(4, false);
 }
 
+INSTRUCTION(RV32I_BC_DYNCALL, rv32i_dyncall) {
+	counter.apply(MACHINE());
+	CPU().execute(DECODER().m_handler, DECODER().instr);
+	counter.retrieve_counters(MACHINE());
+	if (UNLIKELY(counter.overflowed())) {
+		pc = RECONSTRUCT_PC() + 4;
+		goto check_jump;
+	}
+	NEXT_INSTR();
+}
+
 INSTRUCTION(RV32I_BC_STOP, rv32i_stop) {
 	REGISTERS().pc = pc + 4;
 	MACHINE().set_instruction_counter(counter.value());
@@ -292,6 +320,11 @@ new_execute_segment: {
 		current_begin = exec->exec_begin();
 		current_end   = exec->exec_end();
 		exec_decoder  = exec->decoder_cache();
+		if (UNLIKELY(new_values.penalty != 0)) {
+			counter.increment_counter(new_values.penalty);
+			if (counter.overflowed())
+				goto counter_overflow;
+		}
 	}
 	goto continue_segment;
 

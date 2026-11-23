@@ -3566,17 +3566,16 @@ void Emitter<W>::emit()
 			const unsigned outputs = Dyncall::outputs(instr.whole);
 			for (unsigned i = 10; i < 10 + inputs; i++)
 				this->load_register(i);
-			this->store_registers(this->dirty_registers() & Dyncall::arg_mask(inputs));
+			this->store_registers(this->dirty_registers()
+				& (Dyncall::arg_mask(inputs) | Dyncall::arg_mask(outputs)));
 			// Publish PC even without a budget: diagnostics attribute host calls
 			// to this instruction. Counters are synchronized only when enabled.
 			code += "cpu->pc = " + PCRELS(0) + ";\n";
 			if (!tinfo.ignore_instruction_limit) {
-				this->increment_counter_so_far();
 				code += "INS_COUNTER(cpu) = ic; MAX_COUNTER(cpu) = max_ic;\n";
 			}
 			if (tinfo.is_libtcc && this->uses_register_caching()) {
-				// A raising handler leaves the block: publish the cached registers
-				// it was not handed. Its outputs are what the handler wrote.
+				// A raising handler exits, publish remaining cached registers
 				this->invalidate_all_bounds_checks();
 				const uintptr_t handler = (uintptr_t)CPU<W>::decode(instr).handler;
 				code += "if (api.execute_handler(cpu, " + std::to_string(instr.whole) + ", " + std::to_string(handler) + ")) {\n";
@@ -3594,6 +3593,8 @@ void Emitter<W>::emit()
 			if (!tinfo.ignore_instruction_limit) {
 				code += "ic = INS_COUNTER(cpu); max_ic = MAX_COUNTER(cpu);\n";
 				code += "if (UNLIKELY(ic >= max_ic)) {\n";
+				if (this->m_instr_counter > 0)
+					code += "ic += " + std::to_string(this->m_instr_counter) + ";\n";
 				this->exit_function(PCRELS(4), true);
 			}
 			break;
