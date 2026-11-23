@@ -10,7 +10,6 @@
 
 ENGINE_SRC   = $(abs_top_srcdir)/src/libriscv
 ENGINE_BUILD = $(abs_builddir)/build
-ENGINE_LIB   = $(ENGINE_BUILD)/libriscv.a
 ## asmjit is vendored in ext/asmjit (fwsGonzo/asmjit), so the build never fetches it.
 ASMJIT_SRC   = $(abs_top_srcdir)/ext/asmjit
 
@@ -28,17 +27,22 @@ RISCV_CMAKE_FLAGS = \
 	-DRISCV_FLAT_RW_ARENA=OFF \
 	-DCMAKE_CXX_FLAGS="-DRISCV_SYSCALLS_MAX=601"
 
-all-local: $(ENGINE_LIB)
+ENGINE_STAMP = $(ENGINE_BUILD)/configure.stamp
 
-## Rebuilt when this Makefile changes, so a changed RISCV_CMAKE_FLAGS (such
-## as RISCV_SYSCALLS_MAX) never leaves a stale archive that disagrees with
-## the VMOD about the system call table's size. cmake --build is incremental.
-$(ENGINE_LIB): Makefile
+## cmake --build runs on every make: it is incremental and tracks the engine
+## sources, so updated sources are never left behind a stale archive.
+all-local: $(ENGINE_STAMP)
+	cmake --build $(ENGINE_BUILD) --target riscv -j
+
+## Reconfigured when this Makefile changes, so a changed RISCV_CMAKE_FLAGS
+## (such as RISCV_SYSCALLS_MAX) never leaves a stale archive that disagrees
+## with the VMOD about the system call table's size.
+$(ENGINE_STAMP): Makefile
 	@test -f $(ENGINE_SRC)/CMakeLists.txt || { \
 		echo "error: src/libriscv is empty -- run 'git submodule update --init --recursive'"; \
 		exit 1; }
 	cmake -S $(ENGINE_SRC) -B $(ENGINE_BUILD) $(RISCV_CMAKE_FLAGS)
-	cmake --build $(ENGINE_BUILD) --target riscv -j
+	touch $@
 
 clean-local:
 	rm -rf $(ENGINE_BUILD)
