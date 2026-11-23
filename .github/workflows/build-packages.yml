@@ -3,8 +3,8 @@ name: Packages (Varnish Enterprise)
 # Builds native libvmod-riscv packages for every distro/architecture where
 # Varnish Enterprise (varnish-plus) is published, in the same naming format as
 # the enterprise sledge packages, e.g.
-#   libvmod-riscv_1.1~6.0.18r2-1~noble_amd64.deb
-#   libvmod-riscv-1.1~6.0.18r2-1.el9.x86_64.rpm
+#   libvmod-riscv_1.2~6.0.18r8-1~noble_amd64.deb
+#   libvmod-riscv-1.2~6.0.18r8-1.el9.x86_64.rpm
 #
 # Manual-only: this builds against Varnish Enterprise (varnish-plus) and is not
 # meant to run on every push/PR. Trigger it from the Actions tab ("Run
@@ -12,7 +12,7 @@ name: Packages (Varnish Enterprise)
 #
 # The inputs mirror the CI workflows of the other enterprise VMODs (sledge,
 # WAF), so a release is triggered the same way: tag the release commit
-# v<vmod-version>-<VE-version> (e.g. v1.1-6.0.18r3), push the tag, and build it
+# v<vmod-version>-<VE-version> (e.g. v1.2-6.0.18r8), push the tag, and build it
 # with install-from=staging, src-commit=<tag>, pkg-revision=1 and
 # vcp-version=<VE-version>.
 #

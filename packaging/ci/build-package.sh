@@ -3,8 +3,8 @@
 # Build a native libvmod-riscv package (.deb or .rpm) for Varnish Enterprise,
 # matching the enterprise package naming used by e.g. libvmod-sledge:
 #
-#   libvmod-riscv_1.1~6.0.18r2-1~noble_amd64.deb
-#   libvmod-riscv-1.1~6.0.18r2-1.el9.x86_64.rpm
+#   libvmod-riscv_1.2~6.0.18r8-1~noble_amd64.deb
+#   libvmod-riscv-1.2~6.0.18r8-1.el9.x86_64.rpm
 #
 # The version embeds the *installed* Varnish Enterprise version (varnish-plus),
 # so the package always tracks the ABI it was linked against. The 60-enterprise
