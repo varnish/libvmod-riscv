@@ -10,6 +10,8 @@
 			abort();         \
 	}                        \
 	goto *computed_opcode[decoder->get_bytecode()];
+#define EXECUTE_BYTECODE(bc) \
+	goto *computed_opcode[bc];
 #define EXECUTE_CURRENT() \
 	EXECUTE_INSTR()
 #define UNUSED_FUNCTION() \
@@ -29,8 +31,8 @@ namespace riscv
 
 namespace riscv
 {
-	INSTANTIATE_32_IF_ENABLED(CPU);
 #ifndef RISCV_ASM_DISPATCH
+	INSTANTIATE_32_IF_ENABLED(CPU);
 	INSTANTIATE_64_IF_ENABLED(CPU);
 #endif
 	INSTANTIATE_128_IF_ENABLED(CPU);

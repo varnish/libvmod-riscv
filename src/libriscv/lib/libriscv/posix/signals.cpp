@@ -12,7 +12,8 @@ namespace riscv {
 /// an SA_SIGINFO handler. Runtimes that inspect the siginfo (eg. the Go
 /// runtime reads si_code before anything else) fault immediately without it.
 template <int W>
-struct SignalFrameLayout {
+struct SignalFrameLayout
+{
 	using address_t = address_type<W>;
 	static constexpr size_t siginfo_size = 128;
 	/// siginfo_t: si_signo, si_errno, si_code, then a union that begins on
@@ -45,10 +46,13 @@ template <int W>
 Signals<W>::~Signals() {}
 
 template <int W>
-SignalAction<W>& Signals<W>::get(int sig) {
-	if (sig > 0)
-		return signals.at(sig-1);
-	throw MachineException(ILLEGAL_OPERATION, "Signal 0 invoked");
+SignalAction<W>& Signals<W>::get(int sig)
+{
+	if (sig > 0 && unsigned(sig) <= signals.size())
+		return signals[sig-1];
+	if (sig == 0)
+		throw MachineException(ILLEGAL_OPERATION, "Signal 0 invoked");
+	throw MachineException(ILLEGAL_OPERATION, "Invalid signal number", uint32_t(sig));
 }
 
 template <int W>
@@ -133,7 +137,9 @@ void Signals<W>::leave(Machine<W>& machine)
 	using address_t = address_type<W>;
 	using Layout = SignalFrameLayout<W>;
 	auto* thread = machine.threads().get_thread();
-	auto& pt = per_thread(thread->tid);
+	// A sigreturn without a delivered signal has no saved state, and
+	// must not create any: the guest could repeat it on every thread.
+	const auto* pt = find_per_thread(thread->tid);
 
 	// Linux restores from the ucontext the handler was given, which the
 	// handler is allowed to have modified. The frame sits right above the
@@ -146,10 +152,13 @@ void Signals<W>::leave(Machine<W>& machine)
 			uctx_addr + Layout::mcontext, gregs.size());
 		std::memcpy(&pc, &gregs[0], sizeof(pc));
 	} catch (...) {
+		// Without a delivered signal there is nothing to fall back to
+		if (pt == nullptr)
+			throw;
 		// A handler that lost its stack cannot be resumed from the ucontext,
 		// so fall back to the state we saved when entering the handler.
 		machine.cpu.registers().copy_from(
-			machine.register_copy_options(), pt.sigret.regs);
+			machine.register_copy_options(), pt->sigret.regs);
 		THPRINT(machine, "<<< sigreturn: unreadable ucontext, restored saved state\n");
 		return;
 	}
@@ -159,8 +168,10 @@ void Signals<W>::leave(Machine<W>& machine)
 	// way in stands in for that part of the frame, so that a handler running
 	// vector or FP code does not clobber the interrupted thread. The integer
 	// registers then come from the ucontext, which the handler may have edited.
-	machine.cpu.registers().copy_from(
-		machine.register_copy_options(), pt.sigret.regs);
+	// Without a delivered signal, the current FP and vector state is kept.
+	if (pt != nullptr)
+		machine.cpu.registers().copy_from(
+			machine.register_copy_options(), pt->sigret.regs);
 
 	auto& regs = machine.cpu.registers();
 	for (unsigned i = 1; i < 32; i++) {

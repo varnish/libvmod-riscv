@@ -4,6 +4,7 @@
 #include "threaded_bytecodes.hpp"
 #include "rv32i_instr.hpp"
 #include "rvfd.hpp"
+#include "bytecode_bodies.hpp"
 #ifdef RISCV_EXT_COMPRESSED
 #include "rvc.hpp"
 #endif
@@ -24,6 +25,8 @@ namespace riscv
 #undef VIEW_INSTR_AS
 #undef NEXT_INSTR
 #undef NEXT_C_INSTR
+#undef NEXT_INSTR_TO
+#undef NEXT_C_INSTR_TO
 #undef NEXT_BLOCK
 #undef SAFE_INSTR_NEXT
 #undef NEXT_SEGMENT
@@ -45,6 +48,15 @@ namespace riscv
 #define NEXT_C_INSTR() \
 	decoder += 1;      \
 	EXECUTE_INSTR();
+#define NEXT_INSTR_TO(bc)             \
+	if constexpr (compressed_enabled) \
+		decoder += 2;                 \
+	else                              \
+		decoder += 1;                 \
+	EXECUTE_BYTECODE(bc);
+#define NEXT_C_INSTR_TO(bc) \
+	decoder += 1;           \
+	EXECUTE_BYTECODE(bc);
 
 #define NEXT_BLOCK(len, OF)                                    \
 	pc += len;                                                 \
@@ -76,10 +88,15 @@ namespace riscv
 	else                                                          \
 		goto new_execute_segment;
 
+#ifdef RISCV_WASM_DISPATCH
+#define INACCURATE_FUNCNAME simulate_inaccurate_cpp
+#else
+#define INACCURATE_FUNCNAME simulate_inaccurate
+#endif
 	template <int W>
-	DISPATCH_ATTR void CPU<W>::simulate_inaccurate(address_t pc)
+	DISPATCH_ATTR void CPU<W>::INACCURATE_FUNCNAME(address_t pc)
 	{
-		static constexpr uint32_t XLEN = W * 8;
+		[[maybe_unused]] static constexpr uint32_t XLEN = W * 8;
 		using addr_t = address_type<W>;
 		using saddr_t = signed_address_type<W>;
 
@@ -142,6 +159,7 @@ namespace riscv
 /** Instruction handlers **/
 
 #include "bytecode_impl.cpp"
+
 
 INSTRUCTION(RV32I_BC_SYSTEM, rv32i_system)
 {
@@ -240,6 +258,12 @@ INSTRUCTION(RV32I_BC_SYSCALL, rv32i_syscall)
 		goto check_jump;
 	}
 	NEXT_BLOCK(4, false);
+}
+
+INSTRUCTION(RV32I_BC_DYNCALL, rv32i_dyncall)
+{
+	CPU().execute(DECODER().m_handler, DECODER().instr);
+	NEXT_INSTR();
 }
 
 INSTRUCTION(RV32I_BC_STOP, rv32i_stop)

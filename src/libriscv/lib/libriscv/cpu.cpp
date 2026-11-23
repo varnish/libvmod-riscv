@@ -4,6 +4,7 @@
 #include "internal_common.hpp"
 #include "riscvbase.hpp"
 #include "rv32i_instr.hpp"
+#include "fused_bytecodes.hpp"
 #include "threaded_bytecodes.hpp"
 //#define TIME_EXECUTION
 
@@ -204,6 +205,8 @@ restart_next_execute_segment:
 		const bool sequential = end_page_data == base_page_data + n_pages * Page::size();
 		// Check if it's likely a JIT-compiled area
 		const bool is_likely_jit = current_page.attr.exec && current_page.attr.write;
+		machine().memory.check_execute_segment_memory(base_pageno * Page::size(), n_pages * Page::size());
+		const uint64_t penalty = machine().memory.penalize_execute_segment_decode(n_pages * Page::size());
 
 		// Allocate full execute area
 		if (!sequential) {
@@ -222,13 +225,13 @@ restart_next_execute_segment:
 			// The rebuild produced a usable segment, so re-arm the guard
 			if (!seg.is_stale())
 				this->m_stale_restart_pc = ~address_t(0);
-			return {&seg, pc};
+			return {&seg, pc, penalty};
 		} else {
 			// We can use the sequential execute segment directly
 			auto& seg = this->init_execute_area(base_page_data, base_pageno * Page::size(), n_pages * Page::size(), is_likely_jit);
 			if (!seg.is_stale())
 				this->m_stale_restart_pc = ~address_t(0);
-			return {&seg, pc};
+			return {&seg, pc, penalty};
 		}
 #endif // RISCV_VIRTUAL_PAGING
 	} // CPU::next_execute_segment
@@ -308,7 +311,7 @@ restart_next_execute_segment:
 		// Decoded segments are always faster
 		// So, always have at least the current segment
 		if (!is_executable(this->pc())) {
-			this->next_execute_segment(this->pc());
+			machine().penalize(this->next_execute_segment(this->pc()).penalty);
 		}
 
 		auto* exec = this->m_exec;
@@ -327,6 +330,7 @@ restart_precise_sim:
 				auto new_values = this->next_execute_segment(pc);
 				exec = new_values.exec;
 				pc   = new_values.pc;
+				machine().penalize(new_values.penalty);
 				goto restart_precise_sim;
 			}
 
@@ -400,6 +404,8 @@ restart_precise_sim:
 	{
 		auto& m = machine();
 		const auto prev_max = m.max_instructions();
+		auto& exec = *this->m_exec;
+		exec.preemptive_executors_inc();
 		try {
 			// execute by extending the max instruction counter (resuming)
 			// WARNING: Do not change this, as resumption is required in
@@ -409,12 +415,18 @@ restart_precise_sim:
 				m.instruction_counter() + max_instr, m.instruction_counter(), pc);
 		} catch (...) {
 			m.set_max_instructions(prev_max);
+			exec.preemptive_executors_dec();
+			this->m_exec = &exec;
 			if (store_regs) {
 				this->registers() = old_regs;
 			}
 			if (Throw)
 				throw; // Only rethrow if we're supposed to forward exceptions
+			return this->reg(REG_ARG0);
 		}
+		// restore current execute segment
+		exec.preemptive_executors_dec();
+		this->m_exec = &exec;
 		// restore registers and return value
 		m.set_max_instructions(prev_max);
 		const auto retval = this->reg(REG_ARG0);
@@ -436,6 +448,8 @@ restart_precise_sim:
 		auto* decoder_begin = &exec_decoder[exec.exec_begin() / DecoderData<W>::DIVISOR];
 
 		auto& cache_entry = exec_decoder[addr / DecoderData<W>::DIVISOR];
+		// Make sure that if this entry is part of a fused pair, the pair is unfused before modification
+		unfuse_entry_before(exec_decoder, exec.exec_begin(), addr);
 
 		// The last instruction will be the current entry
 		// Later instructions will work as normal
@@ -443,8 +457,15 @@ restart_precise_sim:
 		auto* last    = &cache_entry;
 		auto* current = &cache_entry;
 		auto last_block_bytes = cache_entry.block_bytes();
-		while (current > decoder_begin && (current-1)->block_bytes() > last_block_bytes) {
-			current--;
+		while (current > decoder_begin) {
+			auto* prev = current - 1;
+			// The middle of a compressed 4-byte instruction is an invalid no-length entry
+			if (compressed_enabled && prev->block_bytes() == 0 && prev > decoder_begin
+				&& (prev-1)->block_bytes() == last_block_bytes + 4)
+				prev--;
+			if (prev->block_bytes() <= last_block_bytes)
+				break; // The end of a previous block
+			current = prev;
 			last_block_bytes = current->block_bytes();
 		}
 
@@ -460,11 +481,15 @@ restart_precise_sim:
 		for (auto* dd = current; dd < last; dd++) {
 			// Get the patched decoder entry
 			auto& p = exec_decoder[patched_addr / DecoderData<W>::DIVISOR];
+			patched_addr += (compressed_enabled) ? 2 : 4;
+			// The middle of a 4-byte instruction stays invalid: every real
+			// entry before the last one in the block has a block length
+			if (compressed_enabled && p.idxend == 0)
+				continue;
 			p.idxend = last - dd;
 		#ifdef RISCV_EXT_C
 			p.icount = 0; // TODO: Implement C-ext icount for breakpoints
 		#endif
-			patched_addr += (compressed_enabled) ? 2 : 4;
 		}
 		// Check if the last address matches the breakpoint address
 		if (patched_addr != addr) {

@@ -14,24 +14,102 @@ static constexpr bool verbose_syscalls = true;
 static constexpr bool verbose_syscalls = false;
 #endif
 
+#include <chrono>
 #include <fcntl.h>
 #include <signal.h>
 #undef sa_handler
 #include <unistd.h>
+#if __has_include(<sys/mman.h>)
 #include <sys/mman.h>
+#endif
 #include <sys/ioctl.h>
-#if !defined(__OpenBSD__) && !defined(TARGET_OS_IPHONE)
+#if !defined(__OpenBSD__) && !defined(TARGET_OS_IPHONE) && __has_include(<sys/random.h>)
+#define HAVE_SYS_RANDOM
 #include <sys/random.h>
 #endif
 extern "C" int dup3(int oldfd, int newfd, int flags);
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#if __has_include(<sys/uio.h>)
 #include <sys/uio.h>
-#if __has_include(<termios.h>)
+#else
+// No vectored I/O on this host (Nintendo Switch): one call per buffer.
+#include <sys/_iovec.h>
+static ssize_t readv(int fd, const struct iovec* iov, int count)
+{
+	ssize_t total = 0;
+	for (int i = 0; i < count; i++) {
+		const ssize_t res = read(fd, iov[i].iov_base, iov[i].iov_len);
+		if (res < 0) return total > 0 ? total : res;
+		total += res;
+		if ((size_t)res < iov[i].iov_len) break;
+	}
+	return total;
+}
+static ssize_t writev(int fd, const struct iovec* iov, int count)
+{
+	ssize_t total = 0;
+	for (int i = 0; i < count; i++) {
+		const ssize_t res = write(fd, iov[i].iov_base, iov[i].iov_len);
+		if (res < 0) return total > 0 ? total : res;
+		total += res;
+		if ((size_t)res < iov[i].iov_len) break;
+	}
+	return total;
+}
+#endif
+#ifdef __SWITCH__
+// newlib declares these, libnx implements none of them. Paths resolve against the
+// working directory only; everything else fails with ENOSYS.
+extern "C" {
+#include <switch/kernel/random.h>
+}
+#include <cstring>
+static bool host_cwd_path(int dirfd, const char* path)
+{
+	if (dirfd == AT_FDCWD || path[0] == '/' || std::strchr(path, ':') != nullptr)
+		return true;
+	errno = ENOSYS;
+	return false;
+}
+static int host_openat(int dirfd, const char* path, int flags, mode_t mode)
+{
+	return host_cwd_path(dirfd, path) ? open(path, flags, mode) : -1;
+}
+static int host_fstatat(int dirfd, const char* path, struct stat* st, int flags)
+{
+#ifdef AT_EMPTY_PATH
+	if (path[0] == '\0' && (flags & AT_EMPTY_PATH)) return fstat(dirfd, st);
+#endif
+	(void)flags;
+	return host_cwd_path(dirfd, path) ? stat(path, st) : -1;
+}
+static int host_faccessat(int dirfd, const char* path, int mode, int)
+{
+	return host_cwd_path(dirfd, path) ? access(path, mode) : -1;
+}
+static ssize_t host_readlinkat(int, const char*, char*, size_t) { errno = ENOSYS; return -1; }
+static int host_pipe2(int*, int) { errno = ENOSYS; return -1; }
+static ssize_t host_pread(int fd, void* buf, size_t len, off_t offset)
+{
+	if (lseek(fd, offset, SEEK_SET) == (off_t)-1) return -1;
+	return read(fd, buf, len);
+}
+#define openat host_openat
+#define fstatat host_fstatat
+#define faccessat host_faccessat
+#define readlinkat host_readlinkat
+#define pipe2 host_pipe2
+#define pread host_pread
+#endif
+// newlib (Nintendo Switch) ships a termios.h whose sys/termios.h is missing.
+#if __has_include(<termios.h>) && !defined(__SWITCH__)
 #include <termios.h>
 #endif
+#if __has_include(<sys/syscall.h>)
 #include <sys/syscall.h>
+#endif
 #ifndef EBADFD
 #define EBADFD EBADF  // OpenBSD, FreeBSD
 #endif
@@ -124,6 +202,7 @@ static void syscall_getrusage(Machine<W>& machine)
 		return;
 	}
 
+#ifndef __SWITCH__ // no getrusage()
 	if (machine.has_file_descriptors() && machine.fds().proxy_mode) {
 		struct rusage host_usage {};
 		const int res = getrusage(
@@ -137,7 +216,9 @@ static void syscall_getrusage(Machine<W>& machine)
 		usage.ru_stime_sec  = host_usage.ru_stime.tv_sec;
 		usage.ru_stime_usec = host_usage.ru_stime.tv_usec;
 		usage.ru_maxrss     = host_usage.ru_maxrss;
-	} else {
+	} else
+#endif
+	{
 		// Report some deterministic progress, sandbox-safe/sanitized
 		const uint64_t micros = machine.instruction_counter() / 1000;
 		usage.ru_utime_sec  = micros / 1000000;
@@ -217,12 +298,22 @@ static void syscall_sigaltstack(Machine<W>& machine)
 	SYSPRINT("SYSCALL sigaltstack, tid=%d ss: 0x%lX old_ss: 0x%lX\n",
 		machine.gettid(), (long)ss, (long)old_ss);
 
-	auto& stack = machine.signals().per_thread(machine.gettid()).stack;
-
+	// Only setting a new stack creates per-thread signal state
 	if (old_ss != 0x0) {
-		machine.copy_to_guest(old_ss, &stack, sizeof(stack));
+		const auto* pt = machine.has_signals()
+			? machine.signals().find_per_thread(machine.gettid()) : nullptr;
+		// Zeroed, so that the padding does not leak host stack bytes
+		SignalStack<W> old_stack;
+		std::memset(&old_stack, 0, sizeof(old_stack));
+		if (pt != nullptr) {
+			old_stack.ss_sp    = pt->stack.ss_sp;
+			old_stack.ss_flags = pt->stack.ss_flags;
+			old_stack.ss_size  = pt->stack.ss_size;
+		}
+		machine.copy_to_guest(old_ss, &old_stack, sizeof(old_stack));
 	}
 	if (ss != 0x0) {
+		auto& stack = machine.signals().per_thread(machine.gettid()).stack;
 		machine.copy_from_guest(&stack, ss, sizeof(stack));
 
 		SYSPRINT("<<< sigaltstack sp: 0x%lX flags: 0x%X size: 0x%lX\n",
@@ -572,6 +663,35 @@ static void syscall_writev(Machine<W>& machine)
 } // writev
 
 template <int W>
+static int guest_full_path(Machine<W>& machine, int dir_vfd, const std::string& path, std::string& result)
+{
+	if (path.empty())
+		return -ENOENT;
+	if (path[0] == '/') {
+		result = FileDescriptors::normalize_path(path);
+		return 0;
+	}
+	auto it = machine.fds().guest_paths.find(dir_vfd);
+	if (it == machine.fds().guest_paths.end())
+		return -EBADF;
+	result = FileDescriptors::normalize_path(it->second + "/" + path);
+	return 0;
+}
+
+template <int W>
+static bool admit_path(Machine<W>& machine, std::string& path)
+{
+	if (machine.fds().filter_open != nullptr)
+		return machine.fds().filter_open(machine.template get_userdata<void>(), path);
+	return machine.fds().proxy_mode;
+}
+
+static bool is_plain_file(const struct stat& st)
+{
+	return S_ISREG(st.st_mode) || S_ISDIR(st.st_mode);
+}
+
+template <int W>
 static void syscall_openat(Machine<W>& machine)
 {
 	const int dir_fd = machine.template sysarg<int>(0);
@@ -580,30 +700,66 @@ static void syscall_openat(Machine<W>& machine)
 	// The mode is only used with O_CREAT and O_TMPFILE, and ignored otherwise
 	const unsigned mode = machine.template sysarg<unsigned>(3);
 	// We do it this way to prevent accessing memory out of bounds
-	std::string path = machine.memory.memstring(g_path);
+	const std::string path = machine.memory.memstring(g_path);
 
 	SYSPRINT("SYSCALL openat, dir_fd: %d path: %s flags: %X mode: %o\n",
 		dir_fd, path.c_str(), flags, mode);
 
 	if (machine.has_file_descriptors() && machine.fds().permit_filesystem) {
+		auto& fds = machine.fds();
+		std::string guest_path;
+		const int err = guest_full_path(machine, dir_fd, path, guest_path);
+		if (err < 0) {
+			machine.set_result(err);
+			return;
+		}
+		// filter_open() can modify the path
+		std::string host_path = guest_path;
+		if (!admit_path(machine, host_path)) {
+			machine.set_result(-EPERM);
+			SYSPRINT("SYSCALL openat(path: %s) => %d\n",
+				guest_path.c_str(), machine.template return_value<int>());
+			return;
+		}
+		static constexpr int GUEST_O_ACCMODE = 03;
+		static constexpr int GUEST_O_CREAT   = 0100;
+		static constexpr int GUEST_O_TRUNC   = 01000;
+		static constexpr int GUEST_O_APPEND  = 02000;
+		const bool wants_write = (flags & GUEST_O_ACCMODE) != 0
+			|| (flags & (GUEST_O_CREAT | GUEST_O_TRUNC | GUEST_O_APPEND)) != 0;
+		if (wants_write && !fds.proxy_mode) {
+			machine.set_result(-EACCES);
+			return;
+		}
 
-		if (machine.fds().filter_open != nullptr) {
-			// filter_open() can modify the path
-			if (!machine.fds().filter_open(machine.template get_userdata<void>(), path)) {
-				machine.set_result(-EPERM);
-				SYSPRINT("SYSCALL openat(path: %s) => %d\n",
-					path.c_str(), machine.template return_value<int>());
+		int host_flags = flags;
+		if (!fds.permit_special_files) {
+			struct stat st;
+			if (::stat(host_path.c_str(), &st) == 0 && !is_plain_file(st)) {
+				machine.set_result(-EACCES);
 				return;
 			}
+			host_flags |= O_NONBLOCK;
 		}
-		int real_fd = openat(machine.fds().translate(dir_fd), path.c_str(), flags, mode);
-		if (real_fd >= 0) {
-			const int vfd = machine.fds().assign_file(real_fd);
-			machine.set_result(vfd);
-		} else {
-			// Translate errno() into kernel API return value
+
+		int real_fd = ::openat(AT_FDCWD, host_path.c_str(), host_flags, mode);
+		if (real_fd < 0) {
 			machine.set_result(-errno);
+			return;
 		}
+		if (!fds.permit_special_files) {
+			struct stat st;
+			if (::fstat(real_fd, &st) != 0 || !is_plain_file(st)) {
+				::close(real_fd);
+				machine.set_result(-EACCES);
+				return;
+			}
+			if (!(flags & O_NONBLOCK))
+				::fcntl(real_fd, F_SETFL, ::fcntl(real_fd, F_GETFL) & ~O_NONBLOCK);
+		}
+		const int vfd = fds.assign_file(real_fd);
+		fds.guest_paths.emplace(vfd, std::move(guest_path));
+		machine.set_result(vfd);
 		SYSPRINT("SYSCALL openat(real_fd: %d) => %d\n",
 			real_fd, machine.template return_value<int>());
 		return;
@@ -659,7 +815,7 @@ static void syscall_dup3(Machine<W>& machine)
 	if (machine.has_file_descriptors()) {
 		int real_old_fd = machine.fds().translate(old_vfd);
 		int real_new_fd = machine.fds().translate(new_vfd);
-#if defined(__linux__) || defined(__FreeBSD__) || defined(__OpenBSD__)
+#if defined(__linux__) || (defined(__FreeBSD__) && !defined(__PROSPERO__)) || defined(__OpenBSD__)
 		int res = dup3(real_old_fd, real_new_fd, flags);
 		if (res > 0) {
 			res = machine.fds().assign_file(res);
@@ -812,9 +968,14 @@ void syscall_readlinkat(Machine<W>& machine)
 	}
 
 	if (machine.has_file_descriptors() && machine.fds().permit_filesystem) {
+		std::string path;
+		const int err = guest_full_path(machine, vfd, original_path, path);
+		if (err < 0) {
+			machine.set_result(err);
+			return;
+		}
 
 		if (machine.fds().filter_readlink != nullptr) {
-			std::string path = original_path;
 			if (!machine.fds().filter_readlink(machine.template get_userdata<void>(), path)) {
 				machine.set_result(-EPERM);
 				return;
@@ -824,9 +985,12 @@ void syscall_readlinkat(Machine<W>& machine)
 			machine.set_result(path.size());
 			return;
 		}
-		const int real_fd = machine.fds().translate(vfd);
+		if (!machine.fds().proxy_mode) {
+			machine.set_result(-EPERM);
+			return;
+		}
 
-		const int res = readlinkat(real_fd, original_path.c_str(), buffer, bufsize);
+		const int res = readlinkat(AT_FDCWD, path.c_str(), buffer, bufsize);
 		if (res > 0) {
 			// TODO: Only necessary if g_buf is not sequential.
 			machine.copy_to_guest(g_buf, buffer, res);
@@ -946,21 +1110,28 @@ static void syscall_fstatat(Machine<W>& machine)
 
 	if (machine.has_file_descriptors() && machine.fds().permit_filesystem) {
 
-		int real_fd = machine.fds().translate(vfd);
-
-		if (machine.fds().filter_stat != nullptr && !path.empty()) {
-			if (!machine.fds().filter_stat(machine.template get_userdata<void>(), path)) {
+		struct stat st;
+		int res = -1;
+		if (!path.empty()) {
+			std::string full;
+			const int err = guest_full_path(machine, vfd, path, full);
+			if (err < 0) {
+				machine.set_result(err);
+				return;
+			}
+			bool allowed;
+			if (machine.fds().filter_stat != nullptr)
+				allowed = machine.fds().filter_stat(machine.template get_userdata<void>(), full);
+			else
+				allowed = admit_path(machine, full);
+			if (!allowed) {
 				machine.set_result(-EPERM);
 				return;
 			}
+			res = ::fstatat(AT_FDCWD, full.c_str(), &st, flags);
+		} else {
+			res = ::fstat(machine.fds().translate(vfd), &st);
 		}
-
-		struct stat st;
-		int res = -1;
-		if (!path.empty())
-			res = ::fstatat(real_fd, path.c_str(), &st, flags);
-		else
-			res = ::fstat(real_fd, &st);
 		if (res == 0) {
 #ifndef __riscv
 			// Convert to RISC-V structure
@@ -997,16 +1168,18 @@ static void syscall_faccessat(Machine<W>& machine)
 		return;
 	}
 
-	if (machine.fds().filter_open != nullptr) {
-		std::string mpath = path;
-		if (!machine.fds().filter_open(machine.template get_userdata<void>(), mpath)) {
-			machine.set_result(-EACCES);
-			return;
-		}
+	std::string full;
+	const int err = guest_full_path(machine, vfd, path, full);
+	if (err < 0) {
+		machine.set_result(err);
+		return;
+	}
+	if (!admit_path(machine, full)) {
+		machine.set_result(-EACCES);
+		return;
 	}
 
-	const int real_fd = (vfd == AT_FDCWD) ? AT_FDCWD : machine.fds().translate(vfd);
-	const int res = faccessat(real_fd, path.c_str(), mode, flags);
+	const int res = faccessat(AT_FDCWD, full.c_str(), mode, flags);
 	machine.set_result_or_error(res);
 }
 
@@ -1298,6 +1471,9 @@ static void syscall_brk(Machine<W>& machine)
 #if defined(__APPLE__)
 	#include <Security/Security.h>
 #endif
+#if defined(__PROSPERO__)
+extern "C" int sceRandomGetRandomNumber(void* buffer, size_t size);
+#endif
 
 template <int W>
 static void syscall_getrandom(Machine<W>& machine)
@@ -1321,6 +1497,13 @@ static void syscall_getrandom(Machine<W>& machine)
 	const int sec_result = SecRandomCopyBytes(kSecRandomDefault, need, (uint8_t *)buffer);
 	const ssize_t result = (sec_result == errSecSuccess) ? need : -1;
 	#endif
+#elif defined(__SWITCH__)
+	const ssize_t result = need;
+	randomGet(buffer, need);
+#elif defined(__PROSPERO__)
+	ssize_t result = need;
+	for (size_t i = 0; i < need && result > 0; i += 64)
+		if (sceRandomGetRandomNumber(buffer + i, std::min<size_t>(64, need - i)) != 0) result = -1;
 #elif defined(__ANDROID__) || defined(__wasm__)
 	for (size_t i = 0; i < need; ++i) {
 		buffer[i] ^= rand() & 0xFF; // XXX: Not secure

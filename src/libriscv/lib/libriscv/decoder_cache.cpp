@@ -14,26 +14,30 @@
 //#define ENABLE_TIMINGS
 struct SegmentKey {
 	uint64_t pc;
+	uint64_t end;
 	uint32_t crc;
 	uint64_t arena_size = 0;
-	// The JIT bakes the arena boundaries into the generated code, so a segment
-	// may only be shared between machines that agree on all of them.
 	uint64_t arena_rdbound = 0;
 	uint64_t arena_wrbound = 0;
 	uint64_t arena_roend = 0;
 	bool unchecked_memory = false;
+	bool execute_only = false;
+	bool libc_fastpath = false;
 
 	template <int W>
 	static SegmentKey from(const riscv::Memory<W>& memory,
 		const riscv::DecodedExecuteSegment<W>& segment, uint32_t crc) {
 		SegmentKey key;
 		key.pc = uint64_t(segment.exec_begin());
+		key.end = uint64_t(segment.exec_end());
 		key.crc = crc;
 		key.arena_size = memory.memory_arena_size();
 		key.arena_rdbound = memory.memory_arena_read_boundary();
 		key.arena_wrbound = memory.memory_arena_write_boundary();
 		key.arena_roend = memory.initial_rodata_end();
 		key.unchecked_memory = segment.is_unchecked_memory();
+		key.execute_only = segment.is_execute_only();
+		key.libc_fastpath = segment.has_libc_fastpath();
 		return key;
 	}
 
@@ -44,8 +48,9 @@ struct SegmentKey {
 	}
 
 	auto as_tuple() const noexcept {
-		return std::tie(pc, crc, arena_size,
-			arena_rdbound, arena_wrbound, arena_roend, unchecked_memory);
+		return std::tie(pc, end, crc, arena_size,
+			arena_rdbound, arena_wrbound, arena_roend, unchecked_memory,
+			execute_only, libc_fastpath);
 	}
 	bool operator==(const SegmentKey& other) const {
 		return as_tuple() == other.as_tuple();
@@ -59,8 +64,10 @@ namespace std {
 	struct hash<SegmentKey> {
 		size_t operator()(const SegmentKey& key) const {
 			size_t h = key.pc ^ key.crc ^ key.arena_size
-				^ (key.unchecked_memory ? 0x9E3779B97F4A7C15ull : 0ull);
-			for (const uint64_t v : {key.arena_rdbound, key.arena_wrbound, key.arena_roend})
+				^ (key.unchecked_memory ? 0x9E3779B97F4A7C15ull : 0ull)
+				^ (key.execute_only ? 0x2545F4914F6CDD1Dull : 0ull)
+				^ (key.libc_fastpath ? 0xD6E8FEB86659FD93ull : 0ull);
+			for (const uint64_t v : {key.end, key.arena_rdbound, key.arena_wrbound, key.arena_roend})
 				h = (h * 0x100000001B3ull) ^ v;
 			return h;
 		}
@@ -355,6 +362,40 @@ namespace riscv
 		}
 	}
 
+	// Fused pairs (fused_pairs.inc): give each entry whose next instruction is
+	// in the same block, and whose bytecode and the next one form a pair, the
+	// bytecode of the pair. The dispatch then continues directly with the
+	// next entry, which is unchanged, as it may also be a jump target. This
+	// runs last, as the entries must not change afterwards (otherwise see
+	// unfuse_entry_before()). The instruction count of a block is added when
+	// the block is entered, so it does not depend on this.
+	template <int W>
+	static void fuse_bytecodes(address_type<W> begin, address_type<W> end,
+		DecoderData<W>* exec_decoder)
+	{
+		static const auto table = [] {
+			std::array<uint8_t, 256 * 256> t {};
+			for (unsigned i = 0; i < RV32I_BC_FUSED_COUNT; i++) {
+				const auto& pair = fused_pairs[i];
+				if (pair.width == 0 || pair.width == W)
+					t[pair.first * 256 + pair.second] = RV32I_BC_FUSED_FIRST + i;
+			}
+			return t;
+		}();
+		for (address_type<W> pc = begin; pc + 4 <= end; pc += DecoderData<W>::DIVISOR)
+		{
+			auto& entry = exec_decoder[pc / DecoderData<W>::DIVISOR];
+			if (entry.instruction_count() <= 1)
+				continue; // The last instruction in its block
+			const unsigned bc = entry.get_bytecode();
+			const unsigned len = (bc >= RV32C_BC_FIRST && bc <= RV32C_BC_LAST) ? 2 : 4;
+			const auto& next = exec_decoder[(pc + len) / DecoderData<W>::DIVISOR];
+			const uint8_t fused = table[bc * 256 + next.get_bytecode()];
+			if (fused != 0)
+				entry.set_bytecode(fused);
+		}
+	}
+
 	// The decoder cache is a sequential array of DecoderData<W> entries
 	// each of which (currently) serves a dual purpose of enabling
 	// threaded dispatch (m_bytecode) and fallback to callback function
@@ -596,10 +637,12 @@ namespace riscv
 		}
 
 		if constexpr (W <= 8) {
-			if (options.libc_fastpath && is_initial) {
+			if (exec.has_libc_fastpath()) {
 				machine().install_libc_fastpath(exec, options.verbose_loader);
 			}
 		}
+
+		fuse_bytecodes<W>(addr, dst, exec_decoder);
 
 		TIME_POINT(t4);
 #ifdef ENABLE_TIMINGS
@@ -644,7 +687,7 @@ namespace riscv
 	// no matter where you are in the segment, a whole instruction unchecked.
 	template <int W> RISCV_INTERNAL
 	DecodedExecuteSegment<W>& Memory<W>::create_execute_segment(
-		const MachineOptions<W>& options, const void *vdata, address_t vaddr, size_t exlen, bool is_initial, bool is_likely_jit)
+		const MachineOptions<W>& options, const void *vdata, address_t vaddr, size_t exlen, bool is_initial, bool is_likely_jit, bool is_execute_only)
 	{
 		if (UNLIKELY(exlen % (compressed_enabled ? 2 : 4)))
 			throw MachineException(INVALID_PROGRAM, "Misaligned execute segment length");
@@ -657,6 +700,9 @@ namespace riscv
 		if (UNLIKELY(__builtin_add_overflow(vaddr, exlen, &pbase2)))
 			throw MachineException(INVALID_PROGRAM, "Segment virtual overflowed");
 #endif
+		if (!is_initial)
+			this->check_execute_segment_memory(vaddr, exlen);
+
 		// Create the whole executable memory range
 		auto current_exec = std::make_shared<DecodedExecuteSegment<W>>(vaddr, exlen);
 		if (current_exec->empty())
@@ -672,57 +718,131 @@ namespace riscv
 		const uint32_t hash = crc32c(exec_data, current_exec->exec_end() - current_exec->exec_begin());
 
 		current_exec->set_unchecked_memory(options.translate_unsafe_remove_checks);
+		current_exec->set_execute_only(is_execute_only);
+		current_exec->set_libc_fastpath(W <= 8 && options.libc_fastpath && is_initial);
+		current_exec->set_likely_jit(is_likely_jit);
+#if defined(RISCV_BINARY_TRANSLATION) && defined(RISCV_DEBUG)
+		current_exec->set_record_slowpaths(options.record_slowpaths_to_jump_hints && !is_likely_jit);
+#endif
+		current_exec->set_crc32c_hash(hash);
 
 		// Get a free slot to reference the execute segment
 		auto& free_slot = this->next_execute_segment();
 
-
-		if (options.use_shared_execute_segments)
+		// Breakpoints patch the decoder cache per machine, so those segments are never shared
+		if (options.use_shared_execute_segments && options.ebreak_locations.empty())
 		{
-			// We have to key on the base address of the execute segment as well as the hash
 			const SegmentKey key = SegmentKey::from(*this, *current_exec, hash);
 
+			std::shared_ptr<DecodedExecuteSegment<W>> doomed;
 			// In order to prevent others from creating the same execute segment
 			// we need to lock the shared execute segments mutex.
 			auto& segment = shared_execute_segments<W>.get_segment(key);
 			std::scoped_lock lock(segment.mutex);
 
-			if (segment.segment != nullptr) {
-				free_slot = segment.segment;
-				return *free_slot;
+			auto& existing = segment.segment;
+			if (existing != nullptr && !existing->is_stale()
+				&& existing->has_same_code(*current_exec)) {
+				free_slot = existing;
+			} else {
+				free_slot = std::move(current_exec);
+				this->generate_decoder_cache(options, free_slot, is_initial);
+
+				// A CRC32-C collision keeps the existing segment and leaves ours private
+				if (existing == nullptr || existing->is_stale()) {
+					// NOTE: We already hold segment.mutex, and we must not take the
+					// global mutex here (which get_segment() does), as that is the
+					// reverse lock order of remove_if_unique().
+					doomed = std::move(existing);
+					segment.unlocked_set(free_slot);
+				}
 			}
-
-			// We need to create a new execute segment, as there is no shared
-			// execute segment with the same hash.
-			free_slot = std::move(current_exec);
-			free_slot->set_likely_jit(is_likely_jit);
-#if defined(RISCV_BINARY_TRANSLATION) && defined(RISCV_DEBUG)
-			free_slot->set_record_slowpaths(options.record_slowpaths_to_jump_hints && !is_likely_jit);
-#endif
-			// Store the hash in the decoder cache
-			free_slot->set_crc32c_hash(hash);
-
-			this->generate_decoder_cache(options, free_slot, is_initial);
-
-			// Share the execute segment. NOTE: We already hold segment.mutex,
-			// and we must not take the global mutex here (which get_segment()
-			// does), as that is the reverse lock order of remove_if_unique().
-			segment.unlocked_set(free_slot);
 		}
 		else
 		{
 			free_slot = std::move(current_exec);
-			free_slot->set_likely_jit(is_likely_jit);
-#if defined(RISCV_BINARY_TRANSLATION) && defined(RISCV_DEBUG)
-			free_slot->set_record_slowpaths(options.record_slowpaths_to_jump_hints && !is_likely_jit);
-#endif
-			// Store the hash in the decoder cache
-			free_slot->set_crc32c_hash(hash);
-
 			this->generate_decoder_cache(options, free_slot, is_initial);
 		}
 
+		if (!is_initial)
+			this->evict_superseded_execute_segments(*free_slot);
 		return *free_slot;
+	}
+
+	template <int W>
+	uint64_t Memory<W>::default_execute_segment_memory_max(const MachineOptions<W>& options) noexcept
+	{
+		if (options.execute_segment_memory_max != 0)
+			return options.execute_segment_memory_max;
+		return std::max(options.memory_max, uint64_t(256) << 20);
+	}
+
+	template <int W>
+	uint64_t Memory<W>::execute_segments_memory() const noexcept
+	{
+		uint64_t total = 0;
+		if (m_main_exec_segment)
+			total += m_main_exec_segment->size_bytes();
+		for (const auto& segment : m_exec) {
+			if (segment)
+				total += segment->size_bytes();
+		}
+		return total;
+	}
+
+	template <int W>
+	bool Memory<W>::is_superseded_execute_segment(const DecodedExecuteSegment<W>& segment,
+		address_t begin, address_t end) const noexcept
+	{
+		// A dispatch loop further up the stack may still be executing
+		// the current segment, or any segment when preempted
+		auto& exec = machine().cpu.current_execute_segment();
+		if (&segment == &exec || segment.preemptive_executors() != 0)
+			return false;
+		return segment.exec_begin() >= begin && segment.exec_end() <= end;
+	}
+
+	template <int W>
+	void Memory<W>::check_execute_segment_memory(address_t addr, size_t len) const
+	{
+		const address_t end = addr + len;
+		const uint64_t entries = (len + sizeof(DecoderData<W>)) / DecoderData<W>::DIVISOR;
+		uint64_t total = sizeof(DecodedExecuteSegment<W>) + len + 8
+			+ entries * sizeof(DecoderData<W>);
+		if (m_main_exec_segment)
+			total += m_main_exec_segment->size_bytes();
+		for (const auto& segment : m_exec) {
+			if (segment && !is_superseded_execute_segment(*segment, addr, end))
+				total += segment->size_bytes();
+		}
+		if (UNLIKELY(total > m_exec_memory_max))
+			throw MachineException(OUT_OF_MEMORY, "Execute segments would exceed their memory limit", total);
+	}
+
+	template <int W>
+	void Memory<W>::evict_superseded_execute_segments(const DecodedExecuteSegment<W>& new_segment)
+	{
+		if (!m_main_exec_segment || m_main_exec_segment.get() == &new_segment)
+			return;
+		const address_t begin = new_segment.exec_begin();
+		const address_t end = new_segment.exec_end();
+		for (auto& segment : m_exec) {
+			if (!segment || segment.get() == &new_segment
+				|| !is_superseded_execute_segment(*segment, begin, end))
+				continue;
+#if defined(RISCV_BINARY_TRANSLATION) || defined(RISCV_ASMJIT)
+			segment->wait_for_compilation_complete();
+#endif
+			const SegmentKey key = SegmentKey::from(*this, *segment);
+			segment = nullptr;
+			shared_execute_segments<W>.remove_if_unique(key);
+		}
+	}
+
+	template <int W>
+	uint64_t Memory<W>::penalize_execute_segment_decode(size_t len) noexcept
+	{
+		return std::max(uint64_t(len / 4), uint64_t(1));
 	}
 
 	template <int W>

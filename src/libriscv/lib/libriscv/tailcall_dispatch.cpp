@@ -5,6 +5,7 @@
 #include "threaded_bytecodes.hpp"
 #include "rv32i_instr.hpp"
 #include "rvfd.hpp"
+#include "bytecode_bodies.hpp"
 #ifdef RISCV_EXT_COMPRESSED
 #include "rvc.hpp"
 #endif
@@ -36,6 +37,12 @@
 #define NEXT_C_INSTR() \
 	d += 1;            \
 	EXECUTE_CURRENT()
+#define NEXT_INSTR_TO(bc)              \
+	d += (compressed_enabled ? 2 : 1); \
+	MUSTTAIL return computed_opcode<W>[bc](d, exec, cpu, pc, counter);
+#define NEXT_C_INSTR_TO(bc) \
+	d += 1;                 \
+	MUSTTAIL return computed_opcode<W>[bc](d, exec, cpu, pc, counter);
 
 #define RETURN_VALUES()   \
 	pc
@@ -102,12 +109,13 @@ namespace riscv
 #endif
 
 	template <int W> static inline
-	DecodedExecuteSegment<W>* resolve_execute_segment(CPU<W>& cpu, address_type<W>& pc)
+	DecodedExecuteSegment<W>* resolve_execute_segment(CPU<W>& cpu, address_type<W>& pc, InstrCounter& counter)
 	{
 		// Change execute segment
 		auto results = cpu.next_execute_segment(pc);
 		// Restore PC
 		pc = results.pc;
+		counter.increment_counter(results.penalty);
 		return results.exec;
 	}
 
@@ -129,7 +137,8 @@ namespace riscv
 #define MACHINE()   cpu.machine()
 #define RECONSTRUCT_PC() ((d - exec->decoder_cache()) << DecoderData<W>::SHIFT)
 #define ENTER_NEW_EXECUTE_SEGMENT()                            \
-	exec = resolve_execute_segment<W>(cpu, pc);                \
+	exec = resolve_execute_segment<W>(cpu, pc, counter);       \
+	OVERFLOW_CHECK();                                          \
 	d = &exec->decoder_cache()[pc >> DecoderData<W>::SHIFT];   \
 	BEGIN_BLOCK();                                             \
 	EXECUTE_CURRENT();
@@ -149,20 +158,29 @@ namespace riscv
 	{
 		// Make the current PC visible
 		cpu.registers().pc = pc;
-		// Make the instruction counter(s) visible
+		// Make the instruction counters visible
 		counter.apply(MACHINE());
 		// Invoke system call
 		cpu.machine().system_call(cpu.reg(REG_ECALL));
-		// Restore max counter
+		// Restore both counters
 		counter.retrieve_counters(MACHINE());
-		// Clone-like system calls can change PC
-		if (UNLIKELY(pc != cpu.registers().pc))
+		// Check for signs of stopping/overflow or PC diverging
+		if (UNLIKELY(counter.overflowed() || pc != cpu.registers().pc))
 		{
-			pc = cpu.registers().pc;
-			QUICK_EXEC_CHECK();
-			d = &exec->decoder_cache()[pc >> DecoderData<W>::SHIFT];
+			pc = cpu.registers().pc + 4;
+			OVERFLOW_CHECKED_JUMP();
 		}
-		NEXT_BLOCK(4, true);
+		NEXT_BLOCK(4, false);
+	}
+
+	INSTRUCTION(RV32I_BC_DYNCALL, rv32i_dyncall)
+	{
+		counter.apply(MACHINE());
+		cpu.execute(d->m_handler, d->instr);
+		counter.retrieve_counters(MACHINE());
+		if (UNLIKELY(counter.overflowed()))
+			return RECONSTRUCT_PC() + 4;
+		NEXT_INSTR();
 	}
 
 #ifdef RISCV_BINARY_TRANSLATION
@@ -178,9 +196,6 @@ namespace riscv
 		}
 #endif
 		counter.set_counters(new_values.counter, new_values.max_counter);
-		if (new_values.max_counter == 0) {
-			return RETURN_VALUES();
-		}
 		pc = REGISTERS().pc;
 		OVERFLOW_CHECK();
 		UNCHECKED_JUMP();
@@ -216,20 +231,22 @@ namespace riscv
 		counter.apply(MACHINE());
 		// Invoke SYSTEM
 		cpu.machine().system(instr);
-		// Restore counters
-		counter.retrieve_max_counter(MACHINE());
-		if (UNLIKELY(pc != cpu.registers().pc))
+		// Restore counters (EBREAK handlers and the libc fast-path penalize)
+		counter.retrieve_counters(MACHINE());
+		// Stopping, or a changed PC, continues at the current PC,
+		// like cpu_dispatch.cpp
+		if (UNLIKELY(counter.overflowed() || pc != cpu.registers().pc))
 		{
 			pc = cpu.registers().pc;
 			OVERFLOW_CHECKED_JUMP();
 		}
-		// Overflow-check, next block
-		NEXT_BLOCK(4, true);
+		NEXT_BLOCK(4, false);
 	}
 
 	INSTRUCTION(0, next_execute_segment) {
 		// A helper function to change execute segment
-		exec = resolve_execute_segment<W>(cpu, pc);
+		exec = resolve_execute_segment<W>(cpu, pc, counter);
+		OVERFLOW_CHECK();
 		d = &exec->decoder_cache()[pc >> DecoderData<W>::SHIFT];
 		BEGIN_BLOCK();
 		EXECUTE_CURRENT();
@@ -245,10 +262,13 @@ namespace riscv
 			pc = cpu.simulate_undecoded(pc);
 			counter.retrieve_counters(MACHINE());
 			OVERFLOW_CHECK();
-			if (UNLIKELY(exec->is_stale()))
-				exec = resolve_execute_segment<W>(cpu, pc);
+			if (UNLIKELY(exec->is_stale())) {
+				exec = resolve_execute_segment<W>(cpu, pc, counter);
+				OVERFLOW_CHECK();
+			}
 			UNCHECKED_JUMP();
 		}
+		MACHINE().set_instruction_counter(counter.value());
 		cpu.registers().pc = pc;
 		cpu.trigger_exception(ILLEGAL_OPCODE, d->instr);
 	}
@@ -361,10 +381,21 @@ namespace riscv
 		[RV32C_BC_ADD]      = rv32c_add,
 		[RV32C_BC_XOR]      = rv32c_xor,
 		[RV32C_BC_OR]       = rv32c_or,
+		[RV32C_BC_LUI]      = rv32c_lui,
+		[RV32C_BC_FLD]      = rv32c_fld,
+		[RV32C_BC_FSD]      = rv32c_fsd,
+		[RV32C_BC_FLW]      = rv32c_flw,
+		[RV32C_BC_FSW]      = rv32c_fsw,
+		[RV32C_BC_SRAI]     = rv32c_srai,
+		[RV32C_BC_SUB]      = rv32c_sub,
+		[RV32C_BC_AND]      = rv32c_and,
+		[RV32C_BC_SUBW]     = rv32c_subw,
+		[RV32C_BC_ADDW]     = rv32c_addw,
 		[RV32C_BC_FUNCTION] = rv32c_func,
 #endif
 
 		[RV32I_BC_SYSCALL] = rv32i_syscall,
+		[RV32I_BC_DYNCALL] = rv32i_dyncall,
 		[RV32I_BC_STOP]    = rv32i_stop,
 
 		[RV32F_BC_FLW]     = rv32i_flw,
@@ -386,6 +417,9 @@ namespace riscv
 #endif
 		[RV32I_BC_LIVEPATCH] = execute_livepatch,
 		[RV32I_BC_SYSTEM]  = rv32i_system,
+#define FUSED_PAIR(name, a, b, A, B, G) RISCV_FUSED_IF_ ## G([RV32I_BC_F_ ## name] = rv_fused_ ## name,)
+#include "fused_pairs.inc"
+#undef FUSED_PAIR
 		};
 	}
 
@@ -397,11 +431,17 @@ namespace riscv
 		auto* exec = this->m_exec;
 
 		// We need an execute segment matching current PC
-		if (UNLIKELY(!exec->is_within(pc)))
+		if (UNLIKELY(!(pc >= exec->exec_begin() && pc < exec->exec_end())))
 		{
 			auto results = this->next_execute_segment(pc);
 			exec = results.exec;
 			pc   = results.pc;
+			counter.increment_counter(results.penalty);
+			if (UNLIKELY(counter.overflowed())) {
+				this->registers().pc = pc;
+				machine().set_instruction_counter(counter.value());
+				return counter.max() == 0;
+			}
 		}
 
 		DecoderData<W>* exec_decoder = exec->decoder_cache();
@@ -430,7 +470,7 @@ namespace riscv
 		auto* exec = this->m_exec;
 
 		// We need an execute segment matching current PC
-		if (UNLIKELY(!exec->is_within(pc)))
+		if (UNLIKELY(!(pc >= exec->exec_begin() && pc < exec->exec_end())))
 		{
 			auto results = this->next_execute_segment(pc);
 			exec = results.exec;
