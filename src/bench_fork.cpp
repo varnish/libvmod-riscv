@@ -6,9 +6,25 @@
 #include "varnish.hpp"
 #include <algorithm>
 #include <chrono>
+#if defined(__x86_64__) || defined(__i386__)
 #include <x86intrin.h>
+#endif
 extern "C" {
 #include "update_result.h"
+}
+
+static inline uint64_t bench_ticks()
+{
+#if defined(__x86_64__) || defined(__i386__)
+	return __rdtsc();
+#elif defined(__aarch64__)
+	uint64_t v;
+	asm volatile("isb; mrs %0, cntvct_el0" : "=r"(v) :: "memory");
+	return v;
+#else
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
 }
 extern "C" long riscv_call_idx(rvs::Script*, VRT_CTX, vcall_info, const char*);
 extern "C" rvs::SandboxTenant* tenant_find(struct vmod_priv*, const char* name, size_t namelen);
@@ -81,12 +97,12 @@ const char* riscv_bench_fork(VRT_CTX, struct vmod_priv* priv,
 	size_t pages_total = 0, pages_written = 0;
 
 	const auto wall0 = std::chrono::steady_clock::now();
-	const uint64_t tsc0 = __rdtsc();
+	const uint64_t tsc0 = bench_ticks();
 	try {
 	for (long i = 0; i < iterations; i++)
 	{
 		const auto ws_snap = WS_Snapshot(ctx->ws);
-		const uint64_t t0 = __rdtsc();
+		const uint64_t t0 = bench_ticks();
 		Script* script;
 		if (m_fork) {
 			uintptr_t saddr = (uintptr_t)WS_Alloc(ctx->ws, sizeof(Script) + 0x20);
@@ -101,9 +117,9 @@ const char* riscv_bench_fork(VRT_CTX, struct vmod_priv* priv,
 		} else {
 			script = tenant->pool_acquire(ctx, prog);
 		}
-		const uint64_t t1 = __rdtsc();
+		const uint64_t t1 = bench_ticks();
 		riscv_call_idx(script, ctx, on_request, nullptr);
-		const uint64_t t2 = __rdtsc();
+		const uint64_t t2 = bench_ticks();
 		if (i == iterations - 1) {
 			for (auto& [pageno, page] : script->machine().memory.pages()) {
 				pages_total++;
@@ -114,11 +130,11 @@ const char* riscv_bench_fork(VRT_CTX, struct vmod_priv* priv,
 			script->~Script();
 		else if (!m_warm)
 			SandboxTenant::pool_release(script, m_restore);
-		const uint64_t t3 = __rdtsc();
+		const uint64_t t3 = bench_ticks();
 
 		http_snap.restore();
 		WS_Reset(ctx->ws, ws_snap);
-		const uint64_t t4 = __rdtsc();
+		const uint64_t t4 = bench_ticks();
 		phases[4].ticks.push_back(t4 - t3);
 		phases[0].ticks.push_back(t1 - t0);
 		phases[1].ticks.push_back(t2 - t1);
@@ -129,7 +145,7 @@ const char* riscv_bench_fork(VRT_CTX, struct vmod_priv* priv,
 		VRT_fail(ctx, "bench_fork: %s", e.what());
 		return nullptr;
 	}
-	const uint64_t tsc1 = __rdtsc();
+	const uint64_t tsc1 = bench_ticks();
 	const auto wall1 = std::chrono::steady_clock::now();
 	if (warm)
 		SandboxTenant::pool_release(warm);
